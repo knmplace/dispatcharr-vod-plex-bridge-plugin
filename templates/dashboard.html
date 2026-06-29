@@ -194,7 +194,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </div>
 
 <div class="header">
-  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.1</span></h1>
+  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.2</span></h1>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
@@ -236,6 +236,9 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       <div class="panel-body">
         <div class="search-bar">
           <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
+          <select class="search-input" id="provFilter" onchange="onProviderChange()">
+            <option value="">All Providers</option>
+          </select>
           <select class="search-input" id="catFilter" onchange="searchMovies()">
             <option value="">All Categories</option>
           </select>
@@ -356,14 +359,40 @@ async function loadSummary() {
     catList.innerHTML = '<span class="empty">No categories</span>';
   }
 
-  // Category dropdown
+  loadCategories();
+}
+
+// Providers
+async function loadProviders() {
+  const data = await api('/api/providers');
+  const sel = document.getElementById('provFilter');
+  sel.innerHTML = '<option value="">All Providers</option>';
+  (data.providers || []).forEach(p => {
+    sel.innerHTML += `<option value="${p.id}">${p.name} (${p.count})</option>`;
+  });
+}
+
+function onProviderChange() {
+  document.getElementById('catFilter').value = '';
+  loadCategories();
+  searchMovies();
+}
+
+// Categories (filtered by provider)
+async function loadCategories() {
+  const prov = document.getElementById('provFilter').value;
+  let url = '/api/categories?';
+  if (prov) url += `provider_id=${prov}&`;
+  const data = await api(url);
   const sel = document.getElementById('catFilter');
   const current = sel.value;
   sel.innerHTML = '<option value="">All Categories</option>';
   (data.categories || []).forEach(c => {
     sel.innerHTML += `<option value="${c.id}">${c.name} (${c.count})</option>`;
   });
-  sel.value = current;
+  if (current && sel.querySelector(`option[value="${current}"]`)) {
+    sel.value = current;
+  }
 }
 
 function filterByCategory(catId) {
@@ -376,10 +405,12 @@ async function loadMovies(page) {
   currentPage = page || 1;
   const search = document.getElementById('searchInput').value;
   const cat = document.getElementById('catFilter').value;
+  const prov = document.getElementById('provFilter').value;
 
   const activatedOnly = document.getElementById('activatedFilter').checked;
   let url = `/api/movies?page=${currentPage}&per_page=50`;
   if (search) url += `&search=${encodeURIComponent(search)}`;
+  if (prov) url += `&provider_id=${prov}`;
   if (cat) url += `&category_id=${cat}`;
   if (activatedOnly) url += `&activated_only=1`;
 
@@ -453,8 +484,10 @@ function updateSelectionUI() {
 async function selectAllMovies() {
   const search = document.getElementById('searchInput').value;
   const cat = document.getElementById('catFilter').value;
+  const prov = document.getElementById('provFilter').value;
   let url = '/api/movies/all-ids?';
   if (search) url += `search=${encodeURIComponent(search)}&`;
+  if (prov) url += `provider_id=${prov}&`;
   if (cat) url += `category_id=${cat}&`;
   const data = await api(url);
   if (data.movie_ids) {
@@ -602,6 +635,7 @@ function formatTime(ms) {
 }
 
 // Init
+loadProviders();
 loadSummary();
 loadMovies(1);
 </script>

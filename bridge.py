@@ -101,12 +101,16 @@ class BridgeCore:
             per_page = int(query.get("per_page", [50])[0])
             search = query.get("search", [""])[0]
             category_id = query.get("category_id", [None])[0]
+            provider_id = query.get("provider_id", [None])[0]
             activated_only = query.get("activated_only", [""])[0]
 
             qs = Movie.objects.all()
 
             if search:
                 qs = qs.filter(name__icontains=search)
+
+            if provider_id:
+                qs = qs.filter(m3u_relations__m3u_account_id=int(provider_id)).distinct()
 
             if category_id:
                 qs = qs.filter(m3u_relations__category_id=int(category_id)).distinct()
@@ -180,10 +184,13 @@ class BridgeCore:
 
             search = query.get("search", [""])[0]
             category_id = query.get("category_id", [None])[0]
+            provider_id = query.get("provider_id", [None])[0]
 
             qs = Movie.objects.all()
             if search:
                 qs = qs.filter(name__icontains=search)
+            if provider_id:
+                qs = qs.filter(m3u_relations__m3u_account_id=int(provider_id)).distinct()
             if category_id:
                 qs = qs.filter(m3u_relations__category_id=int(category_id)).distinct()
 
@@ -194,13 +201,24 @@ class BridgeCore:
 
     def list_categories(self, query):
         try:
-            from apps.vod.models import VODCategory
-            from django.db.models import Count
+            from apps.vod.models import VODCategory, M3UMovieRelation
+            from django.db.models import Count, Q
+
+            provider_id = query.get("provider_id", [None])[0]
+
+            qs = VODCategory.objects.all()
+            if provider_id:
+                qs = qs.annotate(
+                    movie_count=Count(
+                        "m3umovierelation",
+                        filter=Q(m3umovierelation__m3u_account_id=int(provider_id)),
+                    )
+                )
+            else:
+                qs = qs.annotate(movie_count=Count("m3umovierelation"))
 
             cats = []
-            for cat in VODCategory.objects.annotate(
-                movie_count=Count("m3umovierelation")
-            ).filter(movie_count__gt=0).order_by("name"):
+            for cat in qs.filter(movie_count__gt=0).order_by("name"):
                 cats.append(
                     {"id": cat.id, "name": cat.name, "count": cat.movie_count}
                 )
@@ -211,10 +229,19 @@ class BridgeCore:
     def list_providers(self, query):
         try:
             from apps.m3u.models import M3UAccount
+            from apps.vod.models import M3UMovieRelation
+            from django.db.models import Count
 
             providers = []
-            for acc in M3UAccount.objects.filter(is_active=True):
-                providers.append({"id": acc.id, "name": acc.name})
+            for acc in (
+                M3UAccount.objects.filter(is_active=True)
+                .annotate(movie_count=Count("m3umovierelation"))
+                .filter(movie_count__gt=0)
+                .order_by("name")
+            ):
+                providers.append(
+                    {"id": acc.id, "name": acc.name, "count": acc.movie_count}
+                )
             return {"providers": providers}
         except Exception as e:
             return {"providers": [], "error": str(e)}
