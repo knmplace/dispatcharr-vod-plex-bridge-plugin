@@ -232,15 +232,20 @@ class BridgeCore:
             from apps.vod.models import M3UMovieRelation
             from django.db.models import Count
 
-            providers = []
-            for acc in (
-                M3UAccount.objects.filter(is_active=True)
-                .annotate(movie_count=Count("m3umovierelation"))
-                .filter(movie_count__gt=0)
-                .order_by("name")
+            account_counts = {}
+            for row in (
+                M3UMovieRelation.objects
+                .values("m3u_account_id")
+                .annotate(cnt=Count("id"))
             ):
+                account_counts[row["m3u_account_id"]] = row["cnt"]
+
+            providers = []
+            for acc in M3UAccount.objects.filter(
+                is_active=True, id__in=account_counts.keys()
+            ).order_by("name"):
                 providers.append(
-                    {"id": acc.id, "name": acc.name, "count": acc.movie_count}
+                    {"id": acc.id, "name": acc.name, "count": account_counts.get(acc.id, 0)}
                 )
             return {"providers": providers}
         except Exception as e:
