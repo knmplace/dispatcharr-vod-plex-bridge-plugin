@@ -33,14 +33,17 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 
 ## Features
 
-- **Web Dashboard** — Browse, search, filter, activate/deactivate movies
-- **Selective Activation** — Choose which movies appear in Plex
+- **Web Dashboard** — Browse, search, filter, activate/deactivate movies with a dark-themed UI
+- **Provider & Category Filtering** — Filter movies by provider, then by category. Selecting a provider dynamically shows only that provider's categories
+- **Selective Activation** — Choose which movies appear in Plex, individually or in bulk
+- **Select All / Clear All** — Bulk select all movies matching current search, provider, and category filters
+- **Trailer Previews** — Watch YouTube trailers directly from movie cards (when available from provider metadata)
 - **302 Redirect Playback** — Zero overhead, Dispatcharr handles streaming natively
 - **NFO Metadata** — Title, year, rating, TMDB ID, genre, plot for Plex matching
 - **TMDB Posters** — Movie artwork via TMDB poster URLs in NFO files
-- **Plex Now Playing** — Monitor active Plex sessions from the dashboard
+- **Plex Now Playing** — Monitor active Plex sessions from the dashboard (bridge vs local content)
 - **Health Checks** — Dispatcharr DB and Plex connectivity status
-- **Category Filtering** — Browse by VOD category
+- **Catalog Summary** — Category chips with movie counts, quick-filter on click
 - **Auto Plex Scan** — Triggers library scan after activation/deactivation
 - **Zero Dependencies** — Uses Python stdlib only (no pip installs needed)
 
@@ -172,11 +175,14 @@ In Dispatcharr's plugin panel, click **Start Server**. Open the dashboard at `ht
 ## Usage
 
 1. Open the dashboard at `http://<host-ip>:<port>/`
-2. Browse movies using search, category filters
-3. Click the activate button on movies you want in Plex
-4. The plugin generates STRM + NFO files and triggers a Plex library scan
-5. Movies appear in Plex with posters and metadata
-6. Hit Play in Plex — the plugin redirects to Dispatcharr for streaming
+2. Optionally select a **provider** to narrow the catalog to one M3U account
+3. Optionally select a **category** — the dropdown updates to show only categories from the selected provider
+4. Browse, search, and filter movies. Click **Select All** to select every movie matching the current filters
+5. Click the activate button (lightning bolt) on individual movies, or use **Activate Selected** for bulk
+6. Watch trailers by clicking the play button on movie cards (when available)
+7. The plugin generates STRM + NFO files and triggers a Plex library scan
+8. Movies appear in Plex with posters and metadata
+9. Hit Play in Plex — the plugin redirects to Dispatcharr for streaming
 
 ## Architecture
 
@@ -216,17 +222,32 @@ vod_plex_bridge/
 ├── server.py           # WSGI HTTP server (stdlib wsgiref, threaded)
 ├── bridge.py           # Django ORM queries, 302 URL builder, STRM/NFO generation
 ├── streaming.py        # Stub (302 redirect replaces streaming proxy)
+├── logo.jpg            # Plugin logo for Dispatcharr UI
 └── templates/
     └── dashboard.html  # Web dashboard (Browse, Streams, Health tabs)
 ```
 
 ## Known Limitations
 
-- **Manual server restart required** after Dispatcharr container restarts
+- **Manual server restart required** after Dispatcharr container restarts (auto-start planned)
 - **No connection gating** — bulk activation + Plex scan can trigger many provider connections. Recommend setting Plex library analysis to Manual.
 - **Movies only** — series support is planned
 - **No provider fallback** — uses the first available stream per movie
 - **No error screens** — provider errors return HTTP status codes, not user-friendly video messages
+
+## Changelog
+
+### v0.1.2 (2026-06-29)
+- **Provider filtering** — new dropdown filters movies and categories by M3U account. Only providers with VOD movies are shown.
+- **Select All / Clear All** — bulk select all movies matching current search, provider, and category filters
+- **Trailer previews** — YouTube trailer button on movie cards (from provider custom_properties)
+- **Renamed** from "VOD Plex Bridge" to "VOD To Plex"
+- **Plugin logo** added for Dispatcharr UI
+
+### v0.1.1 (2026-06-29)
+- Initial release — 302 redirect playback, web dashboard, STRM/NFO generation
+- Plex Now Playing panel, health checks, category filtering
+- File size estimation for rclone HEAD requests
 
 ## License
 
