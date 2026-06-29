@@ -214,6 +214,16 @@ vod_plex_bridge/
 - **No provider fallback** — uses the first available stream per movie
 - **No error screens** — provider errors return HTTP status codes, not user-friendly video messages
 
+## Acknowledgments
+
+This plugin was inspired by and references approaches from these Dispatcharr VOD plugins:
+
+- **[vod2strm](https://github.com/cmc0619/vod2strm)** by [cmc0619](https://github.com/cmc0619) — High-performance Dispatcharr plugin that exports VOD libraries into .strm/.nfo files. Our file size estimation approach (`duration * bitrate` with 2 GiB fallback) and 302 redirect playback pattern were adapted from this plugin's implementation.
+
+- **[VOD2MLIB](https://github.com/shedunraid/VOD2MLIB)** by [shedunraid](https://github.com/shedunraid) — Dispatcharr plugin that scans the VOD library and creates STRM files and folder structures for media server import. Referenced for STRM generation patterns and Dispatcharr plugin architecture.
+
+- **[Dispatcharr](https://github.com/Dispatcharr/Dispatcharr)** — The platform this plugin runs on. Its native `/proxy/vod/` endpoint handles all the heavy lifting for streaming — persistent connections, Range requests, Redis sessions, and stop detection.
+
 ## License
 
 MIT
