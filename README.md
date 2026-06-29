@@ -1,4 +1,4 @@
-# VOD Plex Bridge — Dispatcharr Plugin
+# VOD To Plex — Dispatcharr Plugin
 
 A [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr) plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming.
 
@@ -98,7 +98,7 @@ The plugin's HTTP port must be exposed through Docker. If Dispatcharr runs behin
 ```yaml
 # In your gluetun or Dispatcharr docker-compose:
 ports:
-  - "8888:8888"  # VOD Plex Bridge plugin
+  - "8888:8888"  # VOD To Plex plugin
 ```
 
 > **Running multiple instances?** Each instance needs a unique port. If you run this plugin alongside other HTTP-serving plugins (like VODFS on port 8888), change one of them to a different port (e.g., 8889, 8890). Configure both the plugin setting and the Docker port mapping to match.

@@ -32,7 +32,7 @@ class Plugin:
     def start(self, context):
         settings = context.get("settings", {})
         log = context.get("logger", logger)
-        log.info("VOD Plex Bridge plugin starting (auto-start)...")
+        log.info("VOD To Plex plugin starting (auto-start)...")
         self._start_server(settings, log)
 
     def run(self, action, params, context):
@@ -60,7 +60,7 @@ class Plugin:
 
     def stop(self, context):
         log = context.get("logger", logger)
-        log.info("VOD Plex Bridge plugin stopping...")
+        log.info("VOD To Plex plugin stopping...")
         self._do_stop_server(log)
 
     def _start_server(self, settings, log):
@@ -84,7 +84,7 @@ class Plugin:
                 name="vod-bridge-http",
             )
             _server_thread.start()
-            log.info(f"VOD Plex Bridge server started on port {port}")
+            log.info(f"VOD To Plex server started on port {port}")
             return {
                 "status": "ok",
                 "message": f"Server started on port {port}. Dashboard: http://{settings.get('dashboard_host', 'localhost')}:{port}/",
@@ -100,7 +100,7 @@ class Plugin:
                 _server_instance.shutdown()
                 _server_instance = None
                 _server_thread = None
-                log.info("VOD Plex Bridge server stopped")
+                log.info("VOD To Plex server stopped")
                 return {"status": "ok", "message": "Server stopped."}
             return {"status": "ok", "message": "Server was not running."}
 

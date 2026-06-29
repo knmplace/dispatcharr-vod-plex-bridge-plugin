@@ -1,4 +1,4 @@
-"""WSGI HTTP server for VOD Plex Bridge — dashboard + 302 redirect playback.
+"""WSGI HTTP server for VOD To Plex — dashboard + 302 redirect playback.
 
 Uses stdlib wsgiref (threaded) to avoid async event loop conflicts with Django.
 """
@@ -40,7 +40,7 @@ class BridgeServer:
         self._server = make_server("0.0.0.0", self.port, app,
                                    server_class=_ThreadedWSGIServer)
         self._running = True
-        logger.info(f"VOD Plex Bridge WSGI server on :{self.port}")
+        logger.info(f"VOD To Plex WSGI server on :{self.port}")
         self._server.serve_forever()
         self._running = False
 

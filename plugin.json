@@ -1,7 +1,7 @@
 {
-  "name": "VOD Plex Bridge",
+  "name": "VOD To Plex",
   "version": "0.1.1",
-  "description": "Bridge VOD movies from Dispatcharr into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
+  "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
   "repo_url": "https://github.com/knmplace/dispatcharr-vod-plex-bridge-plugin",
@@ -95,7 +95,7 @@
     {
       "id": "open_dashboard",
       "label": "Open Dashboard",
-      "description": "Open the VOD Plex Bridge web dashboard in a new tab.",
+      "description": "Open the VOD To Plex web dashboard in a new tab.",
       "button_label": "Open Dashboard",
       "button_variant": "filled",
       "button_color": "blue"
