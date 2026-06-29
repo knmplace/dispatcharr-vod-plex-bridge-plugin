@@ -100,8 +100,8 @@ class BridgeCore:
             page = int(query.get("page", [1])[0])
             per_page = int(query.get("per_page", [50])[0])
             search = query.get("search", [""])[0]
-            category_id = query.get("category_id", [None])[0]
-            provider_id = query.get("provider_id", [None])[0]
+            provider_ids = [v for v in query.get("provider_id", []) if v]
+            category_ids = [v for v in query.get("category_id", []) if v]
             activated_only = query.get("activated_only", [""])[0]
 
             qs = Movie.objects.all()
@@ -109,11 +109,11 @@ class BridgeCore:
             if search:
                 qs = qs.filter(name__icontains=search)
 
-            if provider_id:
-                qs = qs.filter(m3u_relations__m3u_account_id=int(provider_id)).distinct()
+            if provider_ids:
+                qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
 
-            if category_id:
-                qs = qs.filter(m3u_relations__category_id=int(category_id)).distinct()
+            if category_ids:
+                qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
             if activated_only:
                 activated_ids = [int(mid) for mid in self._activated.keys() if mid.isdigit()]
@@ -183,16 +183,16 @@ class BridgeCore:
             from apps.vod.models import Movie
 
             search = query.get("search", [""])[0]
-            category_id = query.get("category_id", [None])[0]
-            provider_id = query.get("provider_id", [None])[0]
+            provider_ids = [v for v in query.get("provider_id", []) if v]
+            category_ids = [v for v in query.get("category_id", []) if v]
 
             qs = Movie.objects.all()
             if search:
                 qs = qs.filter(name__icontains=search)
-            if provider_id:
-                qs = qs.filter(m3u_relations__m3u_account_id=int(provider_id)).distinct()
-            if category_id:
-                qs = qs.filter(m3u_relations__category_id=int(category_id)).distinct()
+            if provider_ids:
+                qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
+            if category_ids:
+                qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
             ids = list(qs.values_list("id", flat=True))
             return {"movie_ids": [str(i) for i in ids], "count": len(ids)}
@@ -204,14 +204,14 @@ class BridgeCore:
             from apps.vod.models import VODCategory, M3UMovieRelation
             from django.db.models import Count, Q
 
-            provider_id = query.get("provider_id", [None])[0]
+            provider_ids = [v for v in query.get("provider_id", []) if v]
 
             qs = VODCategory.objects.all()
-            if provider_id:
+            if provider_ids:
                 qs = qs.annotate(
                     movie_count=Count(
                         "m3umovierelation",
-                        filter=Q(m3umovierelation__m3u_account_id=int(provider_id)),
+                        filter=Q(m3umovierelation__m3u_account_id__in=[int(p) for p in provider_ids]),
                     )
                 )
             else:
@@ -373,11 +373,12 @@ class BridgeCore:
 
         self._save_state()
 
+        plex_removed = 0
         if deactivated:
             self._remove_strm_for_movies(deactivated)
-            self._trigger_plex_scan()
+            plex_removed = self._plex_delete_movies(deactivated)
 
-        return {"status": "ok", "deactivated": len(deactivated)}
+        return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
 
     def _generate_strm_for_movies(self, movie_ids):
         strm_dir = self.settings.get("strm_output_dir", "/data/strm")
@@ -449,6 +450,56 @@ class BridgeCore:
             logger.info("Plex library scan triggered")
         except Exception as e:
             logger.error(f"Plex scan failed: {e}")
+
+    def _plex_delete_movies(self, movie_ids):
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        section = self.settings.get("plex_library_section", 7)
+        if not plex_url or not plex_token:
+            return 0
+        try:
+            import requests
+            resp = requests.get(
+                f"{plex_url}/library/sections/{section}/all",
+                params={"X-Plex-Token": plex_token},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Plex library query failed: {resp.status_code}")
+                return 0
+
+            items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+            id_set = {str(mid) for mid in movie_ids}
+            removed = 0
+
+            for item in items:
+                parts = item.get("Media", [{}])[0].get("Part", [])
+                for part in parts:
+                    filename = part.get("file", "")
+                    m = re.search(r'[/\\](\d+)\.(mkv|mp4)$', filename)
+                    if not m:
+                        m = re.search(r'\[(\d+)\]\.(mkv|mp4)$', filename)
+                    if m and m.group(1) in id_set:
+                        rating_key = item.get("ratingKey")
+                        title = item.get("title", "?")
+                        del_resp = requests.delete(
+                            f"{plex_url}/library/metadata/{rating_key}",
+                            params={"X-Plex-Token": plex_token},
+                            timeout=10,
+                        )
+                        if del_resp.status_code in (200, 204):
+                            removed += 1
+                            logger.info(f"Plex: deleted {title} (key {rating_key})")
+                        else:
+                            logger.warning(f"Plex delete {title} returned {del_resp.status_code}")
+                        break
+
+            logger.info(f"Plex cleanup: removed {removed} items")
+            return removed
+        except Exception as e:
+            logger.error(f"Plex removal failed: {e}")
+            return 0
 
     def generate_strm_files(self, settings, log):
         strm_dir = settings.get("strm_output_dir", "/data/strm")

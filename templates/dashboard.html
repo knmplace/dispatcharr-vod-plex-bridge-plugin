@@ -57,10 +57,24 @@ a { color: var(--accent); text-decoration: none; }
 .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
 
 /* Search */
-.search-bar { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; align-items: center; }
+.search-bar { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; align-items: center; flex-wrap: wrap; }
 .search-input { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; color: var(--text); font-size: 0.85rem; flex: 1; outline: none; }
 .search-input:focus { border-color: var(--accent); }
 select.search-input { flex: 0 0 auto; min-width: 140px; }
+
+/* Multi-select dropdown */
+.ms-dropdown { position: relative; flex: 0 0 auto; min-width: 160px; }
+.ms-toggle { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; color: var(--text); font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; white-space: nowrap; user-select: none; }
+.ms-toggle:hover { border-color: var(--accent); }
+.ms-toggle.active { border-color: var(--accent); }
+.ms-toggle .ms-arrow { font-size: 0.6rem; color: var(--text2); }
+.ms-toggle .ms-count { background: var(--accent); color: #fff; font-size: 0.6rem; padding: 0 4px; border-radius: 6px; margin-left: 2px; }
+.ms-panel { display: none; position: absolute; top: 100%; left: 0; right: 0; min-width: 220px; max-height: 300px; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-top: 2px; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+.ms-panel.open { display: block; }
+.ms-item { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.6rem; cursor: pointer; font-size: 0.8rem; transition: background 0.1s; }
+.ms-item:hover { background: var(--surface2); }
+.ms-item input[type="checkbox"] { accent-color: var(--accent); }
+.ms-item .ms-item-count { color: var(--text2); margin-left: auto; font-size: 0.7rem; }
 
 /* Movie Grid */
 .movie-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.8rem; }
@@ -194,7 +208,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </div>
 
 <div class="header">
-  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.2</span></h1>
+  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.3</span></h1>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
@@ -236,11 +250,26 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       <div class="panel-body">
         <div class="search-bar">
           <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
-          <select class="search-input" id="provFilter" onchange="onProviderChange()">
-            <option value="">All Providers</option>
-          </select>
-          <select class="search-input" id="catFilter" onchange="searchMovies()">
-            <option value="">All Categories</option>
+          <div class="ms-dropdown" id="provDropdown">
+            <div class="ms-toggle" onclick="toggleMsPanel('prov')">
+              <span id="provLabel">All Providers</span>
+              <span class="ms-arrow">&#9662;</span>
+            </div>
+            <div class="ms-panel" id="provPanel"></div>
+          </div>
+          <div class="ms-dropdown" id="catDropdown">
+            <div class="ms-toggle" onclick="toggleMsPanel('cat')">
+              <span id="catLabel">All Categories</span>
+              <span class="ms-arrow">&#9662;</span>
+            </div>
+            <div class="ms-panel" id="catPanel2"></div>
+          </div>
+          <select class="search-input" id="perPageSel" onchange="searchMovies()" style="min-width:90px;">
+            <option value="300">300</option>
+            <option value="800">800</option>
+            <option value="1300">1300</option>
+            <option value="1800">1800</option>
+            <option value="0">All</option>
           </select>
           <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
             <input type="checkbox" id="activatedFilter" onchange="searchMovies()"> Activated Only
@@ -318,6 +347,12 @@ let currentPage = 1;
 let selectedMovies = new Set();
 let streamRefreshTimer = null;
 
+// Multi-select state
+const msState = {
+  msProv: new Set(),
+  msCat: new Set()
+};
+
 function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
@@ -332,6 +367,84 @@ function switchTab(tab) {
 async function api(path, opts) {
   const resp = await fetch(BASE + path, opts);
   return resp.json();
+}
+
+// Multi-select dropdown logic
+function toggleMsPanel(type) {
+  const panelId = type === 'prov' ? 'provPanel' : 'catPanel2';
+  const panel = document.getElementById(panelId);
+  const toggle = panel.parentElement.querySelector('.ms-toggle');
+  const wasOpen = panel.classList.contains('open');
+
+  // Close all panels first
+  document.querySelectorAll('.ms-panel').forEach(p => p.classList.remove('open'));
+  document.querySelectorAll('.ms-toggle').forEach(t => t.classList.remove('active'));
+
+  if (!wasOpen) {
+    panel.classList.add('open');
+    toggle.classList.add('active');
+  }
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('.ms-dropdown')) {
+    document.querySelectorAll('.ms-panel').forEach(p => p.classList.remove('open'));
+    document.querySelectorAll('.ms-toggle').forEach(t => t.classList.remove('active'));
+  }
+});
+
+function onMsChange(type, id) {
+  const set = type === 'prov' ? msState.msProv : msState.msCat;
+  if (set.has(id)) set.delete(id);
+  else set.add(id);
+  updateMsLabel(type);
+
+  if (type === 'prov') {
+    msState.msCat.clear();
+    loadCategories();
+  }
+  searchMovies();
+}
+
+function updateMsLabel(type) {
+  const set = type === 'prov' ? msState.msProv : msState.msCat;
+  const labelEl = document.getElementById(type === 'prov' ? 'provLabel' : 'catLabel');
+  const allLabel = type === 'prov' ? 'All Providers' : 'All Categories';
+
+  if (set.size === 0) {
+    labelEl.innerHTML = allLabel;
+  } else if (set.size === 1) {
+    const panel = document.getElementById(type === 'prov' ? 'provPanel' : 'catPanel2');
+    const item = panel.querySelector(`input[value="${[...set][0]}"]`);
+    const name = item ? item.parentElement.querySelector('.ms-item-name').textContent : '1 selected';
+    labelEl.innerHTML = name;
+  } else {
+    labelEl.innerHTML = `${set.size} selected <span class="ms-count">${set.size}</span>`;
+  }
+}
+
+function buildMsPanel(type, items) {
+  const panelId = type === 'prov' ? 'provPanel' : 'catPanel2';
+  const panel = document.getElementById(panelId);
+  const set = type === 'prov' ? msState.msProv : msState.msCat;
+
+  panel.innerHTML = items.map(item => {
+    const checked = set.has(String(item.id)) ? 'checked' : '';
+    return `<label class="ms-item" onclick="event.stopPropagation()">
+      <input type="checkbox" value="${item.id}" ${checked} onchange="onMsChange('${type}','${item.id}')">
+      <span class="ms-item-name">${item.name}</span>
+      <span class="ms-item-count">(${item.count})</span>
+    </label>`;
+  }).join('');
+
+  updateMsLabel(type);
+}
+
+// Build query params from multi-select
+function msParams(type) {
+  const set = type === 'prov' ? msState.msProv : msState.msCat;
+  const key = type === 'prov' ? 'provider_id' : 'category_id';
+  return [...set].map(v => `${key}=${v}`).join('&');
 }
 
 // Summary
@@ -365,38 +478,22 @@ async function loadSummary() {
 // Providers
 async function loadProviders() {
   const data = await api('/api/providers');
-  const sel = document.getElementById('provFilter');
-  sel.innerHTML = '<option value="">All Providers</option>';
-  (data.providers || []).forEach(p => {
-    sel.innerHTML += `<option value="${p.id}">${p.name} (${p.count})</option>`;
-  });
+  buildMsPanel('prov', data.providers || []);
 }
 
-function onProviderChange() {
-  document.getElementById('catFilter').value = '';
-  loadCategories();
-  searchMovies();
-}
-
-// Categories (filtered by provider)
+// Categories (filtered by selected providers)
 async function loadCategories() {
-  const prov = document.getElementById('provFilter').value;
   let url = '/api/categories?';
-  if (prov) url += `provider_id=${prov}&`;
+  const provParams = msParams('prov');
+  if (provParams) url += provParams + '&';
   const data = await api(url);
-  const sel = document.getElementById('catFilter');
-  const current = sel.value;
-  sel.innerHTML = '<option value="">All Categories</option>';
-  (data.categories || []).forEach(c => {
-    sel.innerHTML += `<option value="${c.id}">${c.name} (${c.count})</option>`;
-  });
-  if (current && sel.querySelector(`option[value="${current}"]`)) {
-    sel.value = current;
-  }
+  buildMsPanel('cat', data.categories || []);
 }
 
 function filterByCategory(catId) {
-  document.getElementById('catFilter').value = catId;
+  msState.msCat.clear();
+  msState.msCat.add(String(catId));
+  updateMsLabel('cat');
   searchMovies();
 }
 
@@ -404,15 +501,19 @@ function filterByCategory(catId) {
 async function loadMovies(page) {
   currentPage = page || 1;
   const search = document.getElementById('searchInput').value;
-  const cat = document.getElementById('catFilter').value;
-  const prov = document.getElementById('provFilter').value;
-
+  const ppSel = document.getElementById('perPageSel');
+  const perPage = parseInt(ppSel.value) || 0;
   const activatedOnly = document.getElementById('activatedFilter').checked;
-  let url = `/api/movies?page=${currentPage}&per_page=50`;
+
+  let url = `/api/movies?page=${currentPage}`;
+  if (perPage > 0) url += `&per_page=${perPage}`;
+  else url += '&per_page=999999';
   if (search) url += `&search=${encodeURIComponent(search)}`;
-  if (prov) url += `&provider_id=${prov}`;
-  if (cat) url += `&category_id=${cat}`;
-  if (activatedOnly) url += `&activated_only=1`;
+  const provP = msParams('prov');
+  if (provP) url += '&' + provP;
+  const catP = msParams('cat');
+  if (catP) url += '&' + catP;
+  if (activatedOnly) url += '&activated_only=1';
 
   const data = await api(url);
   const grid = document.getElementById('movieGrid');
@@ -483,12 +584,12 @@ function updateSelectionUI() {
 
 async function selectAllMovies() {
   const search = document.getElementById('searchInput').value;
-  const cat = document.getElementById('catFilter').value;
-  const prov = document.getElementById('provFilter').value;
   let url = '/api/movies/all-ids?';
   if (search) url += `search=${encodeURIComponent(search)}&`;
-  if (prov) url += `provider_id=${prov}&`;
-  if (cat) url += `category_id=${cat}&`;
+  const provP = msParams('prov');
+  if (provP) url += provP + '&';
+  const catP = msParams('cat');
+  if (catP) url += catP + '&';
   const data = await api(url);
   if (data.movie_ids) {
     data.movie_ids.forEach(id => selectedMovies.add(id));
