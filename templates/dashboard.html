@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VOD Plex Bridge</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2a2e42;
+  --text: #e0e0e0;
+  --text2: #888;
+  --accent: #4f8cff;
+  --green: #34c759;
+  --red: #e74c3c;
+  --amber: #f0a500;
+  --radius: 8px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; }
+a { color: var(--accent); text-decoration: none; }
+
+/* Header */
+.header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0.6rem 1.2rem; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; }
+.header h1 { font-size: 1.1rem; font-weight: 600; }
+.header h1 span { color: var(--accent); }
+.header-stats { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text2); }
+.header-stats .stat-val { color: var(--text); font-weight: 600; }
+
+/* Tabs */
+.tabs { display: flex; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); }
+.tab { padding: 0.6rem 1.2rem; cursor: pointer; color: var(--text2); font-size: 0.85rem; border-bottom: 2px solid transparent; transition: all 0.15s; position: relative; }
+.tab:hover { color: var(--text); background: var(--surface2); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab .badge { background: var(--accent); color: #fff; font-size: 0.65rem; padding: 1px 5px; border-radius: 8px; margin-left: 4px; }
+
+/* Content */
+.content { padding: 1rem 1.2rem; max-width: 1400px; margin: 0 auto; }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* Panels */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1rem; overflow: hidden; }
+.panel-header { padding: 0.5rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.panel-body { padding: 0.8rem; }
+
+/* Buttons */
+.btn { padding: 0.35rem 0.8rem; border-radius: 6px; border: 1px solid transparent; cursor: pointer; font-size: 0.8rem; font-weight: 500; transition: all 0.15s; }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary:hover { opacity: 0.85; }
+.btn-green { background: var(--green); color: #fff; }
+.btn-red { background: var(--red); color: #fff; }
+.btn-outline { background: transparent; border-color: var(--border); color: var(--text); }
+.btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+.btn-sm { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
+
+/* Search */
+.search-bar { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; align-items: center; }
+.search-input { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; color: var(--text); font-size: 0.85rem; flex: 1; outline: none; }
+.search-input:focus { border-color: var(--accent); }
+select.search-input { flex: 0 0 auto; min-width: 140px; }
+
+/* Movie Grid */
+.movie-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.8rem; }
+.movie-card { background: var(--surface2); border-radius: var(--radius); overflow: hidden; position: relative; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s; }
+.movie-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+.movie-card.activated { box-shadow: 0 0 0 2px var(--green); }
+.movie-poster { width: 100%; aspect-ratio: 2/3; background: var(--border); object-fit: cover; display: block; }
+.movie-poster.no-poster { display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--text2); }
+.movie-info { padding: 0.4rem 0.5rem; }
+.movie-title { font-size: 0.75rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.movie-year { font-size: 0.65rem; color: var(--text2); }
+.movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #fff; font-size: 0.55rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
+.movie-card:hover .activate-btn { opacity: 1; }
+
+/* Trailer button */
+.movie-card .trailer-btn {
+  position: absolute;
+  bottom: 52px;
+  right: 4px;
+  background: rgba(0,0,0,0.7);
+  border: none;
+  color: var(--red);
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.movie-card:hover .trailer-btn { opacity: 1; }
+
+/* Trailer modal */
+.trailer-modal {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.9);
+  z-index: 10000;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+.trailer-modal.active { display: flex; }
+.trailer-modal .trailer-close {
+  position: absolute;
+  top: 1rem; right: 1.5rem;
+  font-size: 2rem;
+  color: #fff;
+  cursor: pointer;
+  z-index: 10001;
+}
+.trailer-modal iframe {
+  width: 80vw;
+  height: 45vw;
+  max-width: 960px;
+  max-height: 540px;
+  border: none;
+  border-radius: 8px;
+}
+
+/* Selection bar */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.8rem;
+}
+.selection-bar .count { font-weight: 700; color: var(--accent); }
+
+/* Pagination */
+.pagination { display: flex; gap: 0.3rem; justify-content: center; margin-top: 0.8rem; align-items: center; }
+.pagination button { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 0.3rem 0.6rem; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+.pagination button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+.page-info { font-size: 0.75rem; color: var(--text2); }
+
+/* Streams */
+.stream-card { background: var(--surface2); border-radius: var(--radius); padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid var(--green); }
+.stream-card .stream-title { font-weight: 600; font-size: 0.85rem; }
+.stream-card .stream-meta { font-size: 0.75rem; color: var(--text2); }
+
+/* Plex session cards */
+.plex-session { background: var(--surface2); border-radius: var(--radius); padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; border-left: 3px solid var(--accent); }
+.plex-session.bridge { border-left-color: var(--green); }
+.plex-title { font-weight: 600; font-size: 0.85rem; }
+.plex-meta { font-size: 0.75rem; color: var(--text2); margin-top: 0.2rem; }
+.plex-progress { background: var(--border); height: 4px; border-radius: 2px; margin-top: 0.3rem; overflow: hidden; }
+.plex-progress-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.5s; }
+
+/* Health */
+.health-item { display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid var(--border); }
+.health-item:last-child { border-bottom: none; }
+.health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.health-dot.ok { background: var(--green); }
+.health-dot.error { background: var(--red); }
+.health-dot.unconfigured { background: var(--text2); }
+
+/* Summary grid */
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.5rem; }
+.summary-card { background: var(--surface2); border-radius: var(--radius); padding: 0.6rem; text-align: center; }
+.summary-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+.summary-label { font-size: 0.7rem; color: var(--text2); margin-top: 0.2rem; }
+
+/* Category chips */
+.cat-list { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.cat-chip { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 0.2rem 0.6rem; font-size: 0.7rem; cursor: pointer; transition: all 0.15s; }
+.cat-chip:hover { border-color: var(--accent); color: var(--accent); }
+.cat-chip .cat-count { color: var(--text2); margin-left: 3px; }
+
+/* Empty state */
+.empty { text-align: center; padding: 2rem; color: var(--text2); }
+
+/* Status text */
+.status-text { font-size: 0.8rem; color: var(--text2); padding: 0.5rem 0; }
+.status-text.ok { color: var(--green); }
+.status-text.error { color: var(--red); }
+
+/* Loading */
+.loading { text-align: center; padding: 2rem; color: var(--text2); }
+.spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 6px; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="trailer-modal" id="trailerModal" onclick="closeTrailer(event)">
+  <span class="trailer-close" onclick="closeTrailer()">&times;</span>
+  <iframe id="trailerFrame" src="" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+</div>
+
+<div class="header">
+  <h1><span>VOD</span> Plex Bridge <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.1</span></h1>
+  <div class="header-stats">
+    <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
+    <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
+    <span>Streams: <span class="stat-val" id="hdrStreams">-</span></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="browse" onclick="switchTab('browse')">Browse</div>
+  <div class="tab" data-tab="streams" onclick="switchTab('streams')">Streams <span class="badge" id="streamBadge" style="display:none">0</span></div>
+  <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
+</div>
+
+<div class="content">
+  <!-- Browse Tab -->
+  <div class="tab-pane active" id="pane-browse">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Catalog Summary</span>
+        <button class="btn btn-outline btn-sm" onclick="loadSummary()">Refresh</button>
+      </div>
+      <div class="panel-body">
+        <div class="summary-grid" id="summaryGrid">
+          <div class="loading"><span class="spinner"></span> Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span>Movies</span>
+        <div style="display:flex;gap:0.3rem;align-items:center;">
+          <button class="btn btn-primary btn-sm" onclick="selectAllMovies()">Select All</button>
+          <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear All</button>
+          <button class="btn btn-green btn-sm" onclick="activateSelected()">Activate Selected</button>
+          <button class="btn btn-outline btn-sm" onclick="deactivateSelected()">Deactivate Selected</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="search-bar">
+          <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
+          <select class="search-input" id="catFilter" onchange="searchMovies()">
+            <option value="">All Categories</option>
+          </select>
+          <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+            <input type="checkbox" id="activatedFilter" onchange="searchMovies()"> Activated Only
+          </label>
+          <button class="btn btn-primary btn-sm" onclick="searchMovies()">Search</button>
+        </div>
+        <div class="selection-bar" id="selectionBar" style="display:none;">
+          <span>Selected: <span class="count" id="selCount">0</span></span>
+          <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear Selection</button>
+        </div>
+        <div id="movieGrid" class="movie-grid">
+          <div class="loading"><span class="spinner"></span> Loading movies...</div>
+        </div>
+        <div class="pagination" id="pagination"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="catPanel">
+      <div class="panel-header">By Category</div>
+      <div class="panel-body">
+        <div class="cat-list" id="catList">
+          <div class="loading"><span class="spinner"></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Streams Tab -->
+  <div class="tab-pane" id="pane-streams">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Active Streams</span>
+        <label style="font-size:0.7rem;color:var(--text2);"><input type="checkbox" id="autoRefreshStreams" checked> Auto-refresh</label>
+      </div>
+      <div class="panel-body" id="streamsBody">
+        <div class="empty">No active streams</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span>Plex Now Playing</span>
+      </div>
+      <div class="panel-body" id="plexBody">
+        <div class="empty">No Plex sessions</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Health Tab -->
+  <div class="tab-pane" id="pane-health">
+    <div class="panel">
+      <div class="panel-header">
+        <span>System Health</span>
+        <button class="btn btn-outline btn-sm" onclick="loadHealth()">Refresh</button>
+      </div>
+      <div class="panel-body" id="healthBody">
+        <div class="loading"><span class="spinner"></span> Checking...</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">Actions</div>
+      <div class="panel-body" style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <button class="btn btn-green" onclick="generateStrm()">Generate STRMs</button>
+        <button class="btn btn-primary" onclick="scanPlex()">Scan Plex Library</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = '';
+let currentPage = 1;
+let selectedMovies = new Set();
+let streamRefreshTimer = null;
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelector(`.tab[data-tab="${tab}"]`).classList.add('active');
+  document.getElementById(`pane-${tab}`).classList.add('active');
+
+  if (tab === 'streams') startStreamRefresh();
+  else stopStreamRefresh();
+  if (tab === 'health') loadHealth();
+}
+
+async function api(path, opts) {
+  const resp = await fetch(BASE + path, opts);
+  return resp.json();
+}
+
+// Summary
+async function loadSummary() {
+  const data = await api('/api/catalog/summary');
+  document.getElementById('hdrTotal').textContent = data.total || 0;
+  document.getElementById('hdrActivated').textContent = data.activated || 0;
+  document.getElementById('hdrStreams').textContent = data.active_streams || 0;
+
+  const grid = document.getElementById('summaryGrid');
+  grid.innerHTML = `
+    <div class="summary-card"><div class="summary-val">${data.total||0}</div><div class="summary-label">Total Movies</div></div>
+    <div class="summary-card"><div class="summary-val">${data.activated||0}</div><div class="summary-label">Activated</div></div>
+    <div class="summary-card"><div class="summary-val">${data.active_streams||0}</div><div class="summary-label">Active Streams</div></div>
+    <div class="summary-card"><div class="summary-val">${(data.categories||[]).length}</div><div class="summary-label">Categories</div></div>
+  `;
+
+  // Category chips
+  const catList = document.getElementById('catList');
+  if (data.categories && data.categories.length > 0) {
+    catList.innerHTML = data.categories.map(c =>
+      `<span class="cat-chip" onclick="filterByCategory(${c.id})">${c.name}<span class="cat-count">(${c.count})</span></span>`
+    ).join('');
+  } else {
+    catList.innerHTML = '<span class="empty">No categories</span>';
+  }
+
+  // Category dropdown
+  const sel = document.getElementById('catFilter');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All Categories</option>';
+  (data.categories || []).forEach(c => {
+    sel.innerHTML += `<option value="${c.id}">${c.name} (${c.count})</option>`;
+  });
+  sel.value = current;
+}
+
+function filterByCategory(catId) {
+  document.getElementById('catFilter').value = catId;
+  searchMovies();
+}
+
+// Movies
+async function loadMovies(page) {
+  currentPage = page || 1;
+  const search = document.getElementById('searchInput').value;
+  const cat = document.getElementById('catFilter').value;
+
+  const activatedOnly = document.getElementById('activatedFilter').checked;
+  let url = `/api/movies?page=${currentPage}&per_page=50`;
+  if (search) url += `&search=${encodeURIComponent(search)}`;
+  if (cat) url += `&category_id=${cat}`;
+  if (activatedOnly) url += `&activated_only=1`;
+
+  const data = await api(url);
+  const grid = document.getElementById('movieGrid');
+
+  if (!data.movies || data.movies.length === 0) {
+    grid.innerHTML = '<div class="empty">No movies found</div>';
+    document.getElementById('pagination').innerHTML = '';
+    return;
+  }
+
+  grid.innerHTML = data.movies.map(m => {
+    const sel = selectedMovies.has(m.id) ? 'activated' : '';
+    const actBadge = m.activated ? '<span class="movie-badge">Active</span>' : '';
+    const poster = m.poster
+      ? `<img class="movie-poster" src="${m.poster}" loading="lazy" onerror="this.outerHTML='<div class=\\'movie-poster no-poster\\'>No Poster</div>'">`
+      : '<div class="movie-poster no-poster">No Poster</div>';
+
+    const trailerBtn = m.trailer_key
+      ? `<button class="trailer-btn" onclick="event.stopPropagation();playTrailer('${m.trailer_key}')" title="Watch trailer">&#9654;</button>`
+      : '';
+
+    return `<div class="movie-card ${sel}" onclick="toggleSelect('${m.id}')" title="${m.name}${m.year ? ' ('+m.year+')' : ''}">
+      ${actBadge}
+      <button class="activate-btn" onclick="event.stopPropagation();quickActivate('${m.id}',${m.activated})" title="${m.activated?'Deactivate':'Activate'}">${m.activated?'⚡':'⚡'}</button>
+      ${trailerBtn}
+      ${poster}
+      <div class="movie-info">
+        <div class="movie-title">${m.name}</div>
+        <div class="movie-year">${m.year||''}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Pagination
+  const pag = document.getElementById('pagination');
+  if (data.pages > 1) {
+    let html = `<button ${currentPage<=1?'disabled':''} onclick="loadMovies(${currentPage-1})">Prev</button>`;
+    html += `<span class="page-info">${currentPage} / ${data.pages} (${data.total} movies)</span>`;
+    html += `<button ${currentPage>=data.pages?'disabled':''} onclick="loadMovies(${currentPage+1})">Next</button>`;
+    pag.innerHTML = html;
+  } else {
+    pag.innerHTML = data.total ? `<span class="page-info">${data.total} movies</span>` : '';
+  }
+}
+
+function searchMovies() { loadMovies(1); }
+
+function toggleSelect(id) {
+  if (selectedMovies.has(id)) selectedMovies.delete(id);
+  else selectedMovies.add(id);
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
+  document.querySelectorAll('.movie-card').forEach(card => {
+    const cid = card.getAttribute('onclick').match(/'([^']+)'/)?.[1];
+    if (cid) card.classList.toggle('activated', selectedMovies.has(cid));
+  });
+  const bar = document.getElementById('selectionBar');
+  const count = document.getElementById('selCount');
+  if (selectedMovies.size > 0) {
+    bar.style.display = '';
+    count.textContent = selectedMovies.size;
+  } else {
+    bar.style.display = 'none';
+  }
+}
+
+async function selectAllMovies() {
+  const search = document.getElementById('searchInput').value;
+  const cat = document.getElementById('catFilter').value;
+  let url = '/api/movies/all-ids?';
+  if (search) url += `search=${encodeURIComponent(search)}&`;
+  if (cat) url += `category_id=${cat}&`;
+  const data = await api(url);
+  if (data.movie_ids) {
+    data.movie_ids.forEach(id => selectedMovies.add(id));
+    updateSelectionUI();
+  }
+}
+
+function clearAllSelections() {
+  selectedMovies.clear();
+  updateSelectionUI();
+}
+
+function playTrailer(key) {
+  document.getElementById('trailerFrame').src = 'https://www.youtube.com/embed/' + key + '?autoplay=1';
+  document.getElementById('trailerModal').classList.add('active');
+}
+
+function closeTrailer(e) {
+  if (e && e.target !== e.currentTarget && !e.target.classList.contains('trailer-close')) return;
+  document.getElementById('trailerFrame').src = '';
+  document.getElementById('trailerModal').classList.remove('active');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTrailer(); });
+
+async function quickActivate(id, isActive) {
+  if (isActive) {
+    await api('/api/movies/deactivate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[id]}) });
+  } else {
+    await api('/api/movies/activate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[id]}) });
+  }
+  loadMovies(currentPage);
+  loadSummary();
+}
+
+async function activateSelected() {
+  if (selectedMovies.size === 0) return;
+  await api('/api/movies/activate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[...selectedMovies]}) });
+  selectedMovies.clear();
+  loadMovies(currentPage);
+  loadSummary();
+}
+
+async function deactivateSelected() {
+  if (selectedMovies.size === 0) return;
+  await api('/api/movies/deactivate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[...selectedMovies]}) });
+  selectedMovies.clear();
+  loadMovies(currentPage);
+  loadSummary();
+}
+
+// Streams
+async function loadStreams() {
+  const [streams, plex] = await Promise.all([
+    api('/api/streams'),
+    api('/api/plex/sessions')
+  ]);
+
+  const sBody = document.getElementById('streamsBody');
+  if (streams.streams && streams.streams.length > 0) {
+    sBody.innerHTML = streams.streams.map(s => `
+      <div class="stream-card">
+        <div>
+          <div class="stream-title">${s.movie_name}</div>
+          <div class="stream-meta">${formatBytes(s.bytes_downloaded)} downloaded | ${s.bitrate_kbps} KB/s</div>
+        </div>
+      </div>
+    `).join('');
+  } else {
+    sBody.innerHTML = '<div class="empty">No active streams</div>';
+  }
+
+  const pBody = document.getElementById('plexBody');
+  if (plex.sessions && plex.sessions.length > 0) {
+    pBody.innerHTML = plex.sessions.map(s => {
+      const pct = s.duration > 0 ? (s.view_offset / s.duration * 100).toFixed(1) : 0;
+      const pos = formatTime(s.view_offset);
+      const dur = formatTime(s.duration);
+      return `<div class="plex-session ${s.is_bridge?'bridge':''}">
+        <div class="plex-title">${s.title} ${s.year?'('+s.year+')':''}</div>
+        <div class="plex-meta">${s.state} | ${s.player||'Unknown player'} | ${s.video_resolution||''}${s.video_codec?' '+s.video_codec:''} | ${s.local?'Local':'Remote'}</div>
+        <div class="plex-progress"><div class="plex-progress-bar" style="width:${pct}%"></div></div>
+        <div class="plex-meta">${pos} / ${dur}</div>
+      </div>`;
+    }).join('');
+  } else {
+    pBody.innerHTML = '<div class="empty">No Plex sessions</div>';
+  }
+
+  const badge = document.getElementById('streamBadge');
+  const count = Math.max((streams.streams||[]).length, (plex.sessions||[]).length);
+  if (count > 0) { badge.textContent = count; badge.style.display = ''; }
+  else { badge.style.display = 'none'; }
+}
+
+function startStreamRefresh() {
+  loadStreams();
+  streamRefreshTimer = setInterval(() => {
+    if (document.getElementById('autoRefreshStreams').checked) loadStreams();
+  }, 3000);
+}
+function stopStreamRefresh() {
+  if (streamRefreshTimer) { clearInterval(streamRefreshTimer); streamRefreshTimer = null; }
+}
+
+// Health
+async function loadHealth() {
+  const data = await api('/api/health');
+  const body = document.getElementById('healthBody');
+  const h = data.health || {};
+  body.innerHTML = Object.entries(h).map(([k, v]) => {
+    const cls = v.status || 'error';
+    const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const msg = v.message ? ` — ${v.message}` : v.http_status ? ` — HTTP ${v.http_status}` : '';
+    return `<div class="health-item"><span><span class="health-dot ${cls}"></span>${label}</span><span style="font-size:0.75rem;color:var(--text2)">${v.status}${msg}</span></div>`;
+  }).join('');
+}
+
+// Actions
+async function generateStrm() {
+  const data = await api('/api/strm/generate', { method: 'POST' });
+  alert(data.count !== undefined ? `Generated ${data.count} STRM files` : data.message || data.error);
+}
+
+async function scanPlex() {
+  const data = await api('/api/plex/scan', { method: 'POST' });
+  alert(data.message || data.error || 'Done');
+}
+
+// Utils
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+function formatTime(ms) {
+  const s = Math.floor(ms/1000);
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const sec = s%60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  return `${m}:${String(sec).padStart(2,'0')}`;
+}
+
+// Init
+loadSummary();
+loadMovies(1);
+</script>
+</body>
+</html>

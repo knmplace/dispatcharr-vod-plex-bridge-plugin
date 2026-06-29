@@ -1,0 +1,147 @@
+{
+  "name": "VOD Plex Bridge",
+  "version": "0.1.1",
+  "description": "Bridge VOD movies from Dispatcharr into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
+  "author": "knmplace",
+  "license": "MIT",
+  "repo_url": "https://github.com/knmplace/dispatcharr-vod-plex-bridge-plugin",
+  "help_url": "https://github.com/knmplace/dispatcharr-vod-plex-bridge-plugin",
+  "min_dispatcharr_version": "0.24.0",
+  "fields": [
+    {
+      "id": "_section_dispatcharr",
+      "label": "Dispatcharr",
+      "type": "info",
+      "description": "Connection to Dispatcharr for VOD proxy streaming."
+    },
+    {
+      "id": "dispatcharr_url",
+      "label": "Dispatcharr URL",
+      "type": "string",
+      "default": "http://127.0.0.1:9191",
+      "help_text": "Full URL of Dispatcharr reachable by Plex (LAN IP, not localhost). Used for 302 redirect playback. Use 127.0.0.1 if running on same host."
+    },
+    {
+      "id": "_section_server",
+      "label": "HTTP Server",
+      "type": "info",
+      "description": "The plugin runs its own HTTP server for the dashboard UI and rclone/Plex streaming endpoint."
+    },
+    {
+      "id": "http_port",
+      "label": "Dashboard / Streaming Port",
+      "type": "number",
+      "default": 8888,
+      "help_text": "Port for the web dashboard and VOD streaming endpoint. Must be exposed in Docker.",
+      "min": 1024,
+      "max": 65535
+    },
+    {
+      "id": "dashboard_host",
+      "label": "Dashboard Host IP",
+      "type": "string",
+      "default": "",
+      "help_text": "LAN IP of the Docker host (not the container). Used for dashboard URL and STRM file URLs."
+    },
+    {
+      "id": "_section_plex",
+      "label": "Plex Integration",
+      "type": "info",
+      "description": "Connect to your Plex server to manage the VOD library and monitor playback."
+    },
+    {
+      "id": "plex_url",
+      "label": "Plex URL",
+      "type": "string",
+      "default": "",
+      "help_text": "Full URL of your Plex server (e.g. http://192.168.1.100:32400)"
+    },
+    {
+      "id": "plex_token",
+      "label": "Plex Token",
+      "type": "string",
+      "default": "",
+      "help_text": "X-Plex-Token for authenticating with Plex API",
+      "input_type": "password"
+    },
+    {
+      "id": "plex_library_section",
+      "label": "Plex Library Section ID",
+      "type": "number",
+      "default": 7,
+      "help_text": "The Plex library section number for VOD movies (find via Plex API /library/sections)"
+    },
+    {
+      "id": "_section_strm",
+      "label": "STRM Files",
+      "type": "info",
+      "description": "Configure where STRM and NFO files are written for Plex to discover."
+    },
+    {
+      "id": "strm_output_dir",
+      "label": "STRM Output Directory",
+      "type": "string",
+      "default": "/data/plugin-strm",
+      "help_text": "Directory where .strm and .nfo files are written. Should be accessible to Plex via rclone mount or shared volume."
+    },
+    {
+      "id": "_section_streaming",
+      "label": "Streaming",
+      "type": "info",
+      "description": "Playback uses 302 redirect to Dispatcharr's native VOD proxy. No streaming configuration needed — Dispatcharr handles connections, Range requests, and session management."
+    }
+  ],
+  "actions": [
+    {
+      "id": "open_dashboard",
+      "label": "Open Dashboard",
+      "description": "Open the VOD Plex Bridge web dashboard in a new tab.",
+      "button_label": "Open Dashboard",
+      "button_variant": "filled",
+      "button_color": "blue"
+    },
+    {
+      "id": "start_server",
+      "label": "Start Server",
+      "description": "Start the HTTP server for the dashboard and streaming endpoint.",
+      "button_label": "Start Server",
+      "button_variant": "filled",
+      "button_color": "green"
+    },
+    {
+      "id": "stop_server",
+      "label": "Stop Server",
+      "description": "Stop the HTTP server.",
+      "confirm": {
+        "message": "This will stop the dashboard and streaming endpoint. Active streams will be interrupted. Continue?"
+      },
+      "button_label": "Stop Server",
+      "button_variant": "outline",
+      "button_color": "red"
+    },
+    {
+      "id": "server_status",
+      "label": "Server Status",
+      "description": "Check the current status of the HTTP server.",
+      "button_label": "Status",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "generate_strm",
+      "label": "Generate STRM Files",
+      "description": "Generate .strm and .nfo files for all activated movies.",
+      "button_label": "Generate STRMs",
+      "button_variant": "filled",
+      "button_color": "green"
+    },
+    {
+      "id": "scan_plex",
+      "label": "Scan Plex Library",
+      "description": "Trigger a Plex library scan to pick up new STRM files.",
+      "button_label": "Scan Plex",
+      "button_variant": "outline",
+      "button_color": "blue"
+    }
+  ]
+}
