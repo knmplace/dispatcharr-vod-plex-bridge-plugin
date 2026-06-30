@@ -160,6 +160,17 @@ def _dispatch(environ, start_response, bridge, settings):
     if path == "/api/plex/scan" and method == "POST":
         return _json_response(start_response, bridge.trigger_plex_scan(settings))
 
+    if path == "/api/proxy-log" and method == "GET":
+        from .bridge import get_proxy_log
+        return _json_response(start_response, get_proxy_log())
+
+    if path == "/api/cache/status" and method == "GET":
+        return _json_response(start_response, bridge.get_cache_status())
+
+    if path == "/api/cache/fetch" and method == "POST":
+        body = _read_body(environ)
+        return _json_response(start_response, bridge.trigger_cache_fetch_all())
+
     # --- VOD filesystem ---
     if path == "/vod":
         start_response("301 Moved Permanently", [("Location", "/vod/")])
@@ -184,6 +195,7 @@ def _dispatch(environ, start_response, bridge, settings):
             return _text_response(start_response, 404, "Not found")
 
         if method == "HEAD":
+            from .bridge import log_event
             info = bridge.get_movie_info(movie_id)
             if not info:
                 return _text_response(start_response, 404, "Not found")
@@ -194,15 +206,55 @@ def _dispatch(environ, start_response, bridge, settings):
             file_size = info.get("file_size")
             if file_size:
                 headers.append(("Content-Length", str(file_size)))
+            log_event("info", movie_id, "HEAD — served from cache", movie_name=info.get("name"), size=file_size)
             start_response("200 OK", headers)
             return [b""]
 
+        # Parse Range header
+        range_header = environ.get("HTTP_RANGE", "")
+        range_start, range_end = _parse_range(range_header)
+
+        from .bridge import log_event
+        info = bridge.get_movie_info(movie_id)
+        movie_name = info.get("name") if info else None
+
+        # Try cache first — serves Plex/rclone metadata probes with zero provider connections
+        cached = bridge.get_cached_range(movie_id, range_start or 0, range_end)
+        if cached is not None:
+            data, file_size = cached
+            content_type = "video/x-matroska"
+            if info:
+                content_type = info.get("content_type", content_type)
+                if not file_size:
+                    file_size = info.get("file_size")
+            actual_start = range_start or 0
+            actual_end = actual_start + len(data) - 1
+            headers = [
+                ("Content-Type", content_type),
+                ("Content-Length", str(len(data))),
+                ("Accept-Ranges", "bytes"),
+            ]
+            if range_header and file_size:
+                headers.append(("Content-Range", f"bytes {actual_start}-{actual_end}/{file_size}"))
+                start_response("206 Partial Content", headers)
+            else:
+                start_response("200 OK", headers)
+            log_event("info", movie_id, f"GET cache hit bytes {actual_start}-{actual_end}", movie_name=movie_name)
+            return [data]
+
+        # Not in cache — block concurrent probe if playback already active
+        if bridge.has_active_connection(movie_id):
+            log_event("warn", movie_id, "Blocked concurrent probe — connection active", movie_name=movie_name)
+            return _text_response(start_response, 503, "Stream busy")
+
+        # Real playback request — 302 to Dispatcharr
         redirect_url, error = bridge.get_redirect_url(movie_id)
         if error:
+            log_event("error", movie_id, f"Redirect error: {error}", movie_name=movie_name)
             status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
             return _text_response(start_response, status, error)
 
-        logger.info(f"302 redirect: movie {movie_id} -> {redirect_url}")
+        log_event("info", movie_id, f"302 redirect bytes={range_start}-{range_end}", movie_name=movie_name)
         start_response("302 Found", [("Location", redirect_url)])
         return [b""]
 
@@ -270,3 +322,17 @@ def _extract_movie_id(filename):
         return m.group(1)
     m = re.match(r'^(\d+)\.(mkv|mp4)$', filename)
     return m.group(1) if m else None
+
+
+def _parse_range(range_header):
+    """Parse HTTP Range header. Returns (start, end) as ints or None."""
+    if not range_header or not range_header.startswith("bytes="):
+        return None, None
+    try:
+        spec = range_header[6:]
+        parts = spec.split("-")
+        start = int(parts[0]) if parts[0] else None
+        end = int(parts[1]) if len(parts) > 1 and parts[1] else None
+        return start, end
+    except Exception:
+        return None, None
