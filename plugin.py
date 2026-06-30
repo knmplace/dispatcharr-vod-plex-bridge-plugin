@@ -15,10 +15,6 @@ def _load_manifest():
 
 _manifest = _load_manifest()
 
-_server_thread = None
-_server_instance = None
-_server_lock = threading.Lock()
-
 
 class Plugin:
     name = _manifest["name"]
@@ -30,7 +26,12 @@ class Plugin:
     actions = _manifest.get("actions", [])
 
     def __init__(self):
-        """Auto-start server when Dispatcharr discovers this enabled plugin on boot."""
+        """Dispatcharr calls Plugin() at startup for every enabled plugin.
+        We store server state on self so it survives across action calls on this instance."""
+        self._server_instance = None
+        self._server_thread = None
+        self._server_lock = threading.Lock()
+
         settings = self._load_settings_from_db()
         if settings:
             logger.info("VOD To Plex: auto-starting on Dispatcharr startup...")
@@ -41,7 +42,7 @@ class Plugin:
     def start(self, context):
         settings = context.get("settings", {})
         log = context.get("logger", logger)
-        log.info("VOD To Plex plugin starting (auto-start)...")
+        log.info("VOD To Plex plugin starting...")
         self._start_server(settings, log)
 
     def run(self, action, params, context):
@@ -73,26 +74,25 @@ class Plugin:
         self._do_stop_server(log)
 
     def _start_server(self, settings, log):
-        global _server_instance, _server_thread
-        with _server_lock:
-            if _server_instance and _server_instance.is_running():
+        with self._server_lock:
+            if self._server_instance and self._server_instance.is_running():
                 port = settings.get("http_port", 8888)
                 return {
                     "status": "ok",
-                    "message": f"Server already running on port {port}",
+                    "message": f"✓ Server already running on port {port}",
                 }
 
             port = int(settings.get("http_port", 8888))
 
             from .server import BridgeServer
 
-            _server_instance = BridgeServer(port=port, settings=settings)
-            _server_thread = threading.Thread(
-                target=_server_instance.serve,
+            self._server_instance = BridgeServer(port=port, settings=settings)
+            self._server_thread = threading.Thread(
+                target=self._server_instance.serve,
                 daemon=True,
                 name="vod-bridge-http",
             )
-            _server_thread.start()
+            self._server_thread.start()
             log.info(f"VOD To Plex server started on port {port}")
             return {
                 "status": "ok",
@@ -103,21 +103,20 @@ class Plugin:
         return self._do_stop_server(log)
 
     def _do_stop_server(self, log):
-        global _server_instance, _server_thread
-        with _server_lock:
-            if _server_instance:
-                _server_instance.shutdown()
-                _server_instance = None
-                _server_thread = None
+        with self._server_lock:
+            if self._server_instance:
+                self._server_instance.shutdown()
+                self._server_instance = None
+                self._server_thread = None
                 log.info("VOD To Plex server stopped")
                 return {"status": "ok", "message": "Server stopped."}
             return {"status": "ok", "message": "Server was not running."}
 
     def _server_status(self, settings, log):
-        with _server_lock:
-            if _server_instance and _server_instance.is_running():
+        with self._server_lock:
+            if self._server_instance and self._server_instance.is_running():
                 port = settings.get("http_port", 8888)
-                stats = _server_instance.get_stats()
+                stats = self._server_instance.get_stats()
                 return {
                     "status": "ok",
                     "message": (
@@ -140,7 +139,6 @@ class Plugin:
         }
 
     def _load_settings_from_db(self):
-        """Load our own settings from PluginConfig DB row. Returns {} if not found."""
         try:
             from apps.plugins.models import PluginConfig
             cfg = PluginConfig.objects.get(key="vod_plex_bridge")
@@ -153,9 +151,11 @@ class Plugin:
         return "localhost"
 
     def _generate_strm(self, settings, log):
-        if not _server_instance or not _server_instance.is_running():
-            return {"status": "error", "message": "Server not running. Start it first."}
-        count = _server_instance.generate_strm_files(settings, log)
+        with self._server_lock:
+            if not self._server_instance or not self._server_instance.is_running():
+                return {"status": "error", "message": "Server not running. Start it first."}
+            instance = self._server_instance
+        count = instance.generate_strm_files(settings, log)
         return {
             "status": "ok",
             "message": f"Generated {count} STRM files.",
