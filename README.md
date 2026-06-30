@@ -34,17 +34,21 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 ## Features
 
 - **Web Dashboard** — Browse, search, filter, activate/deactivate movies with a dark-themed UI
-- **Provider & Category Filtering** — Filter movies by provider, then by category. Selecting a provider dynamically shows only that provider's categories
+- **Provider & Category Filtering** — Multi-select dropdowns filter movies by provider and category
 - **Selective Activation** — Choose which movies appear in Plex, individually or in bulk
-- **Select All / Clear All** — Bulk select all movies matching current search, provider, and category filters
-- **Trailer Previews** — Watch YouTube trailers directly from movie cards (when available from provider metadata)
+- **Select All / Clear All** — Bulk select all movies matching current search and filter state
+- **Trailer Previews** — Watch YouTube trailers directly from movie cards (when available)
 - **302 Redirect Playback** — Zero overhead, Dispatcharr handles streaming natively
 - **NFO Metadata** — Title, year, rating, TMDB ID, genre, plot for Plex matching
 - **TMDB Posters** — Movie artwork via TMDB poster URLs in NFO files
+- **Language Detection** — Optional TMDB lookup to tag each movie's original language. Bulk detection with configurable limit (Activated Only / 500 / 1k / 2k / 5k / All). Runs at 2 req/sec — well within TMDB's rate limit.
+- **Language Filter** — Multi-select language dropdown in Browse to filter by original language
+- **Plex Real-Time Delete** — Deactivating a movie immediately removes it from Plex via API (no scan needed)
+- **Auto Plex Scan** — Triggers library scan after activation
 - **Plex Now Playing** — Monitor active Plex sessions from the dashboard (bridge vs local content)
+- **Auto-Start on Restart** — Server starts automatically when Dispatcharr restarts (no manual action needed)
 - **Health Checks** — Dispatcharr DB and Plex connectivity status
 - **Catalog Summary** — Category chips with movie counts, quick-filter on click
-- **Auto Plex Scan** — Triggers library scan after activation/deactivation
 - **Zero Dependencies** — Uses Python stdlib only (no pip installs needed)
 
 ## Requirements
@@ -67,7 +71,6 @@ Copy the plugin folder into Dispatcharr's plugins directory:
 ├── plugin.py
 ├── server.py
 ├── bridge.py
-├── streaming.py
 └── templates/
     └── dashboard.html
 ```
@@ -93,6 +96,8 @@ In Dispatcharr's plugin settings, configure:
 | **Plex Token** | X-Plex-Token for Plex API access | *(your token)* |
 | **Plex Library Section** | Library section ID for VOD movies | `7` |
 | **STRM Output Dir** | Where STRM/NFO files are written | `/data/plugin-strm` |
+| **TMDB API Key** | Optional — enables language detection | *(your key)* |
+| **TMDB Read Token** | Optional — alternative to API key (Bearer token) | *(your token)* |
 
 ### 3. Expose the Port
 
@@ -104,7 +109,7 @@ ports:
   - "8888:8888"  # VOD To Plex plugin
 ```
 
-> **Running multiple instances?** Each instance needs a unique port. If you run this plugin alongside other HTTP-serving plugins (like VODFS on port 8888), change one of them to a different port (e.g., 8889, 8890). Configure both the plugin setting and the Docker port mapping to match.
+> **Running multiple instances?** Each instance needs a unique port. Configure both the plugin setting and the Docker port mapping to match.
 
 ### 4. Set Up rclone on the Plex Server
 
@@ -165,12 +170,14 @@ systemctl enable --now rclone-vodplugin
 2. Point it to the rclone mount path (e.g., `/mnt/vod-plugin`)
 3. Set the agent to **Plex Movie** (or your preferred agent)
 4. **Recommended**: Under Advanced, set "Library scan" to **Manual** or disable automatic media analysis to avoid unnecessary provider connections during scans
+5. Enable **Allow media deletion** in Plex Settings → Troubleshooting — required for real-time Plex removal on deactivation
 
-### 6. Start the Server
+### 6. Enable the Plugin
 
-In Dispatcharr's plugin panel, click **Start Server**. Open the dashboard at `http://<host-ip>:8888/`.
+In Dispatcharr's plugin panel, enable the plugin. The HTTP server starts automatically — no manual "Start Server" click needed. Open the dashboard at `http://<host-ip>:8888/`.
 
-> **NOTE: On container restarts, the HTTP server must be manually restarted by clicking "Start Server" in the Dispatcharr plugin panel. Auto-start on reboot is planned for a future release.**
+To verify the server is running, click **Status** in the plugin actions panel — it will show:
+`✓ Server running on port 8888 | 11 activated | 38,534 in catalog`
 
 ## Usage
 
@@ -183,6 +190,17 @@ In Dispatcharr's plugin panel, click **Start Server**. Open the dashboard at `ht
 7. The plugin generates STRM + NFO files and triggers a Plex library scan
 8. Movies appear in Plex with posters and metadata
 9. Hit Play in Plex — the plugin redirects to Dispatcharr for streaming
+10. **Deactivating** a movie removes the STRM file and deletes it from Plex immediately via API
+
+### Language Detection (Optional)
+
+If you configure a TMDB API key or Read Access Token in plugin settings:
+
+1. In the Browse tab, use the **Language Detection** bar above the movie grid
+2. Choose a limit from the dropdown (default: 1,000 movies — about 8 minutes)
+3. Click **Detect Now** — detection runs in the background at 2 req/sec (safe within TMDB's rate limit)
+4. An amber status bar shows progress and ETA
+5. When complete, a language badge appears on each movie card and the **All Languages** filter populates
 
 ## Architecture
 
@@ -197,20 +215,25 @@ Plex GET /vod/12345.mkv
   → Dispatcharr streams natively (persistent connection, Range support)
 ```
 
+### Auto-Start
+`Plugin.__init__()` is called by Dispatcharr's plugin loader on every startup for enabled plugins. It reads the plugin's own settings from the `PluginConfig` database table and starts the WSGI server automatically. No user action required after container restart.
+
 ### File Size Estimation
 rclone uses HEAD requests to determine file sizes. The plugin estimates file size from the movie's duration:
 - `duration_seconds * 250,000 bytes/sec` (assumes ~2 Mbps average bitrate)
 - Falls back to 2 GiB if duration is unavailable
 - This ensures Plex never sees 0-byte files (which it would skip entirely)
 
-### Why 302 Redirect?
-Dispatcharr's `/proxy/vod/` endpoint already provides:
-- Persistent streaming connections
-- HTTP Range request support
-- Redis-based session management
-- Automatic stop detection
+### Plex Delete on Deactivation
+When a movie is deactivated, the plugin:
+1. Removes the STRM/NFO folder from disk
+2. Queries Plex's library JSON for matching entries by movie ID in the filename
+3. Sends `DELETE /library/metadata/{ratingKey}` to remove it from Plex immediately
 
-There's no need to duplicate this with a streaming proxy. The 302 approach is the same code path Dispatcharr uses for browser-based playback, which is proven stable for full-length movies.
+This requires **Allow media deletion** to be enabled in Plex Settings → Troubleshooting.
+
+### Why 302 Redirect?
+Dispatcharr's `/proxy/vod/` endpoint already provides persistent streaming connections, HTTP Range request support, Redis-based session management, and automatic stop detection. The 302 approach uses the same code path Dispatcharr uses for browser-based playback, which is proven stable for full-length movies.
 
 ## File Structure
 
@@ -218,10 +241,9 @@ There's no need to duplicate this with a streaming proxy. The 302 approach is th
 vod_plex_bridge/
 ├── __init__.py         # Exports Plugin class
 ├── plugin.json         # Plugin manifest (fields, actions, metadata)
-├── plugin.py           # Plugin lifecycle — start/stop, server management
+├── plugin.py           # Plugin lifecycle — auto-start, start/stop, status
 ├── server.py           # WSGI HTTP server (stdlib wsgiref, threaded)
-├── bridge.py           # Django ORM queries, 302 URL builder, STRM/NFO generation
-├── streaming.py        # Stub (302 redirect replaces streaming proxy)
+├── bridge.py           # Django ORM queries, 302 URL builder, STRM/NFO gen, Plex API
 ├── logo.jpg            # Plugin logo for Dispatcharr UI
 └── templates/
     └── dashboard.html  # Web dashboard (Browse, Streams, Health tabs)
@@ -229,7 +251,6 @@ vod_plex_bridge/
 
 ## Known Limitations
 
-- **Manual server restart required** after Dispatcharr container restarts (auto-start planned)
 - **No connection gating** — bulk activation + Plex scan can trigger many provider connections. Recommend setting Plex library analysis to Manual.
 - **Movies only** — series support is planned
 - **No provider fallback** — uses the first available stream per movie
@@ -237,12 +258,30 @@ vod_plex_bridge/
 
 ## Changelog
 
+### v0.1.5 (2026-06-30)
+- **Auto-start on Dispatcharr restart** — `Plugin.__init__()` loads settings from the `PluginConfig` DB and starts the WSGI server automatically when Dispatcharr discovers the enabled plugin on boot. No manual "Start Server" click needed after container restart.
+- **Richer status check** — "Status" button now shows `✓ Server running on port 8888 | N activated | N in catalog` when running, or a clear "not running" message with instruction when stopped.
+- **Brighter text** — Dashboard `--text2` color raised from `#888` to `#b0b0b0` for consistent legibility across panel headers, metadata labels, tabs, and filter elements.
+
+### v0.1.4 (2026-06-30)
+- **TMDB language detection** — optional `tmdb_api_key` + `tmdb_read_token` plugin settings enable per-movie original language lookup via TMDB API
+- **Configurable detection limit** — dropdown lets users choose scope: Activated Only / 500 / 1k / 2k / 5k / All. Default 1k ≈ 8 minutes. Safe rate: 2 req/sec vs TMDB's 40/10s limit.
+- **Language filter** — multi-select "All Languages" dropdown in Browse filters the movie grid by original language
+- **Language badges** — globe icon on movie cards showing detected language; amber status bar with ETA during detection; auto-refresh when complete
+- **Compact Movies header** — language detection bar moved into panel body to reduce header crowding
+
+### v0.1.3 (2026-06-29)
+- **Multi-select provider + category dropdowns** — checkbox panel UI replacing single-select dropdowns
+- **Per-page selector** — 300 / 800 / 1300 / 1800 / All
+- **Plex real-time delete on deactivation** — `_plex_delete_movies()` queries Plex library JSON and sends `DELETE /library/metadata/{ratingKey}` immediately on deactivation, no scan wait
+- **ORM filter bug fixed** — chaining `.filter()` on reverse multi-valued relation `m3u_relations` created independent JOINs allowing cross-provider movie contamination. Fixed by putting both conditions in a single `.filter()` call.
+
 ### v0.1.2 (2026-06-29)
-- **Provider filtering** — new dropdown filters movies and categories by M3U account. Only providers with VOD movies are shown.
-- **Select All / Clear All** — bulk select all movies matching current search, provider, and category filters
-- **Trailer previews** — YouTube trailer button on movie cards (from provider custom_properties)
+- **Provider filtering** — dropdown filters movies and categories by M3U account
+- **Select All / Clear All** — bulk select all movies matching current filters
+- **Trailer previews** — YouTube trailer button on movie cards
 - **Renamed** from "VOD Plex Bridge" to "VOD To Plex"
-- **Plugin logo** added for Dispatcharr UI
+- **Plugin logo** added
 
 ### v0.1.1 (2026-06-29)
 - Initial release — 302 redirect playback, web dashboard, STRM/NFO generation
