@@ -35,6 +35,13 @@ class BridgeCore:
         self._data_dir = "/data/vod-plex-bridge"
         self._lang_detect_running = False
         self._lang_status = ""
+        # session_id cache: key = "movie_id:stream_id", value = (resolved_url, timestamp)
+        # Reusing a session URL within SESSION_TTL collapses burst requests (e.g. rclone double-GET)
+        # to a single Dispatcharr session. After TTL, next request gets a fresh session so a
+        # second independent viewer always gets their own connection.
+        self._session_cache: dict = {}
+        self._session_lock = threading.Lock()
+        self._SESSION_TTL = 30  # seconds
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -901,6 +908,37 @@ class BridgeCore:
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
 
+    def _resolve_session(self, base_url, cache_key):
+        """Follow Dispatcharr's 301 to get a session-scoped URL.
+
+        Dispatcharr returns 301 to /proxy/vod/movie/{uuid}/{session_id}?stream_id=X
+        when no session_id is in the path. We capture that Location header so
+        subsequent requests reuse the same session instead of minting new ones.
+        Returns the resolved URL, or base_url on failure.
+        """
+        from urllib.parse import urlparse
+        from http.client import HTTPConnection, HTTPSConnection
+        try:
+            parsed = urlparse(base_url)
+            path = parsed.path
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            Conn = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+            conn = Conn(parsed.netloc, timeout=15)
+            conn.request("GET", path, headers={"Range": "bytes=0-0"})
+            resp = conn.getresponse()
+            location = resp.getheader("Location")
+            resp.read()  # drain
+            conn.close()
+            if location and resp.status in (301, 302):
+                if location.startswith("/"):
+                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                logger.info(f"Resolved session for {cache_key}: {location}")
+                return location
+        except Exception as e:
+            logger.warning(f"Session resolve failed for {cache_key}: {e}")
+        return base_url
+
     def get_redirect_url(self, movie_id):
         mid = str(movie_id)
         if mid not in self._activated:
@@ -922,8 +960,29 @@ class BridgeCore:
             return None, "No stream mapping for movie"
 
         stream_id = relation.stream_id
-        url = f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}"
-        return url, None
+        base_url = f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}"
+        cache_key = f"{mid}:{stream_id}"
+
+        now = time.monotonic()
+        with self._session_lock:
+            entry = self._session_cache.get(cache_key)
+            if entry:
+                resolved_url, ts = entry
+                if now - ts < self._SESSION_TTL:
+                    logger.debug(f"Session cache hit for movie {mid} ({now - ts:.1f}s old)")
+                    return resolved_url, None
+            # Cache miss or expired — resolve outside the lock to avoid blocking other threads
+
+        resolved_url = self._resolve_session(base_url, cache_key)
+
+        with self._session_lock:
+            # Re-check: another thread may have resolved while we were fetching
+            entry = self._session_cache.get(cache_key)
+            if entry and now - entry[1] < self._SESSION_TTL:
+                return entry[0], None
+            self._session_cache[cache_key] = (resolved_url, now)
+
+        return resolved_url, None
 
     def get_movie_info(self, movie_id):
         mid = str(movie_id)
