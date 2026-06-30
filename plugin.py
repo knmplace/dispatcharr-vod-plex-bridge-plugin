@@ -121,13 +121,12 @@ class Plugin:
                 return {
                     "status": "ok",
                     "message": (
-                        f"Running on port {port}\n"
-                        f"Movies in catalog: {stats.get('catalog_count', 0)}\n"
-                        f"Activated: {stats.get('activated_count', 0)}\n"
-                        f"Active streams: {stats.get('active_streams', 0)}"
+                        f"✓ Server running on port {port} | "
+                        f"{stats.get('activated_count', 0)} activated | "
+                        f"{stats.get('catalog_count', 0):,} in catalog"
                     ),
                 }
-            return {"status": "ok", "message": "Server is not running."}
+            return {"status": "ok", "message": "✗ Server is not running — click Start Server to launch."}
 
     def _open_dashboard(self, settings, log):
         port = int(settings.get("http_port", 8888))
