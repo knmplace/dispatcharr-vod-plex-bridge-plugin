@@ -90,22 +90,28 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
 .movie-card:hover .activate-btn { opacity: 1; }
 
-/* Trailer button */
-.movie-card .trailer-btn {
+/* Trailer + lang buttons — positioned above the info panel (title+year+lang ~72px) */
+.movie-card .trailer-btn,
+.movie-card .lang-btn {
   position: absolute;
-  bottom: 52px;
-  right: 4px;
-  background: rgba(0,0,0,0.7);
+  background: rgba(0,0,0,0.75);
   border: none;
-  color: var(--red);
   font-size: 0.85rem;
   cursor: pointer;
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: 3px 7px;
   opacity: 0;
   transition: opacity 0.15s;
+  bottom: 80px;
 }
-.movie-card:hover .trailer-btn { opacity: 1; }
+.movie-card:hover .trailer-btn,
+.movie-card:hover .lang-btn { opacity: 1; }
+.movie-card .lang-btn.detecting { opacity: 1; }
+
+.movie-card .trailer-btn { right: 4px; color: var(--red); }
+.movie-card .lang-btn    { left: 4px;  color: var(--amber); }
+
+.movie-lang { font-size: 0.65rem; color: var(--amber); margin-top: 1px; }
 
 /* Trailer modal */
 .trailer-modal {
@@ -208,7 +214,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </div>
 
 <div class="header">
-  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.3</span></h1>
+  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.4</span></h1>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
@@ -248,6 +254,20 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
         </div>
       </div>
       <div class="panel-body">
+        <!-- Language detection bar -->
+        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;padding:0.4rem 0.6rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+          <span style="font-size:0.75rem;color:var(--text2);white-space:nowrap;">&#127760; Language Detection:</span>
+          <select id="langLimitSel" class="search-input" style="flex:0 0 auto;min-width:130px;font-size:0.75rem;padding:0.25rem 0.4rem;">
+            <option value="activated">Activated Only</option>
+            <option value="500">500 movies</option>
+            <option value="1000" selected>1,000 movies</option>
+            <option value="2000">2,000 movies</option>
+            <option value="5000">5,000 movies</option>
+            <option value="0">All (~6h)</option>
+          </select>
+          <button class="btn btn-sm" id="detectLangBtn" onclick="detectAllLanguages()" style="background:var(--amber);color:#000;border-color:var(--amber);white-space:nowrap;">Detect Now</button>
+          <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+        </div>
         <div class="search-bar">
           <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
           <div class="ms-dropdown" id="provDropdown">
@@ -263,6 +283,13 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
               <span class="ms-arrow">&#9662;</span>
             </div>
             <div class="ms-panel" id="catPanel2"></div>
+          </div>
+          <div class="ms-dropdown" id="langDropdown">
+            <div class="ms-toggle" onclick="toggleMsPanel('lang')">
+              <span id="langLabel">All Languages</span>
+              <span class="ms-arrow">&#9662;</span>
+            </div>
+            <div class="ms-panel" id="langPanel"></div>
           </div>
           <select class="search-input" id="perPageSel" onchange="searchMovies()" style="min-width:90px;">
             <option value="300">300</option>
@@ -350,7 +377,8 @@ let streamRefreshTimer = null;
 // Multi-select state
 const msState = {
   msProv: new Set(),
-  msCat: new Set()
+  msCat: new Set(),
+  msLang: new Set()
 };
 
 function switchTab(tab) {
@@ -371,7 +399,7 @@ async function api(path, opts) {
 
 // Multi-select dropdown logic
 function toggleMsPanel(type) {
-  const panelId = type === 'prov' ? 'provPanel' : 'catPanel2';
+  const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
   const panel = document.getElementById(panelId);
   const toggle = panel.parentElement.querySelector('.ms-toggle');
   const wasOpen = panel.classList.contains('open');
@@ -394,7 +422,7 @@ document.addEventListener('click', e => {
 });
 
 function onMsChange(type, id) {
-  const set = type === 'prov' ? msState.msProv : msState.msCat;
+  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
   if (set.has(id)) set.delete(id);
   else set.add(id);
   updateMsLabel(type);
@@ -407,14 +435,15 @@ function onMsChange(type, id) {
 }
 
 function updateMsLabel(type) {
-  const set = type === 'prov' ? msState.msProv : msState.msCat;
-  const labelEl = document.getElementById(type === 'prov' ? 'provLabel' : 'catLabel');
-  const allLabel = type === 'prov' ? 'All Providers' : 'All Categories';
+  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
+  const labelEl = document.getElementById(type === 'prov' ? 'provLabel' : type === 'cat' ? 'catLabel' : 'langLabel');
+  const allLabel = type === 'prov' ? 'All Providers' : type === 'cat' ? 'All Categories' : 'All Languages';
 
   if (set.size === 0) {
     labelEl.innerHTML = allLabel;
   } else if (set.size === 1) {
-    const panel = document.getElementById(type === 'prov' ? 'provPanel' : 'catPanel2');
+    const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
+    const panel = document.getElementById(panelId);
     const item = panel.querySelector(`input[value="${[...set][0]}"]`);
     const name = item ? item.parentElement.querySelector('.ms-item-name').textContent : '1 selected';
     labelEl.innerHTML = name;
@@ -424,9 +453,9 @@ function updateMsLabel(type) {
 }
 
 function buildMsPanel(type, items) {
-  const panelId = type === 'prov' ? 'provPanel' : 'catPanel2';
+  const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
   const panel = document.getElementById(panelId);
-  const set = type === 'prov' ? msState.msProv : msState.msCat;
+  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
 
   panel.innerHTML = items.map(item => {
     const checked = set.has(String(item.id)) ? 'checked' : '';
@@ -442,9 +471,9 @@ function buildMsPanel(type, items) {
 
 // Build query params from multi-select
 function msParams(type) {
-  const set = type === 'prov' ? msState.msProv : msState.msCat;
-  const key = type === 'prov' ? 'provider_id' : 'category_id';
-  return [...set].map(v => `${key}=${v}`).join('&');
+  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
+  const key = type === 'prov' ? 'provider_id' : type === 'cat' ? 'category_id' : 'language';
+  return [...set].map(v => `${key}=${encodeURIComponent(v)}`).join('&');
 }
 
 // Summary
@@ -513,6 +542,8 @@ async function loadMovies(page) {
   if (provP) url += '&' + provP;
   const catP = msParams('cat');
   if (catP) url += '&' + catP;
+  const langP = msParams('lang');
+  if (langP) url += '&' + langP;
   if (activatedOnly) url += '&activated_only=1';
 
   const data = await api(url);
@@ -535,14 +566,20 @@ async function loadMovies(page) {
       ? `<button class="trailer-btn" onclick="event.stopPropagation();playTrailer('${m.trailer_key}')" title="Watch trailer">&#9654;</button>`
       : '';
 
+    const langName = m.language ? getLangName(m.language) : '';
+    const langBtn = `<button class="lang-btn" onclick="event.stopPropagation();detectSingleLang('${m.id}',this)" title="Detect language">&#127760;</button>`;
+    const langBadge = m.language ? `<div class="movie-lang">${langName}</div>` : '<div class="movie-lang"></div>';
+
     return `<div class="movie-card ${sel}" onclick="toggleSelect('${m.id}')" title="${m.name}${m.year ? ' ('+m.year+')' : ''}">
       ${actBadge}
       <button class="activate-btn" onclick="event.stopPropagation();quickActivate('${m.id}',${m.activated})" title="${m.activated?'Deactivate':'Activate'}">${m.activated?'⚡':'⚡'}</button>
       ${trailerBtn}
+      ${langBtn}
       ${poster}
       <div class="movie-info">
         <div class="movie-title">${m.name}</div>
         <div class="movie-year">${m.year||''}</div>
+        ${langBadge}
       </div>
     </div>`;
   }).join('');
@@ -590,6 +627,8 @@ async function selectAllMovies() {
   if (provP) url += provP + '&';
   const catP = msParams('cat');
   if (catP) url += catP + '&';
+  const langP = msParams('lang');
+  if (langP) url += langP + '&';
   const data = await api(url);
   if (data.movie_ids) {
     data.movie_ids.forEach(id => selectedMovies.add(id));
@@ -735,10 +774,106 @@ function formatTime(ms) {
   return `${m}:${String(sec).padStart(2,'0')}`;
 }
 
+// Language detection
+const LANG_NAMES = {
+  en:'English',es:'Spanish',fr:'French',de:'German',it:'Italian',pt:'Portuguese',
+  nl:'Dutch',ru:'Russian',ja:'Japanese',ko:'Korean',zh:'Chinese',hi:'Hindi',
+  ar:'Arabic',tr:'Turkish',pl:'Polish',sv:'Swedish',da:'Danish',no:'Norwegian',
+  fi:'Finnish',el:'Greek',he:'Hebrew',th:'Thai',vi:'Vietnamese',id:'Indonesian',
+  ms:'Malay',tl:'Tagalog',ro:'Romanian',hu:'Hungarian',cs:'Czech',sk:'Slovak',
+  bg:'Bulgarian',uk:'Ukrainian',hr:'Croatian',sr:'Serbian',fa:'Persian',ur:'Urdu',
+  bn:'Bengali',ta:'Tamil',te:'Telugu',ml:'Malayalam',cn:'Cantonese',
+};
+function getLangName(code) {
+  return LANG_NAMES[code] || code.toUpperCase();
+}
+
+let _langWasActive = false;
+let _langPollTimer = null;
+
+async function refreshLangStatus() {
+  const data = await api('/api/lang-status');
+  const msg = data.lang_status || '';
+  const el = document.getElementById('langMessage');
+  if (msg) {
+    el.textContent = msg;
+    el.style.display = '';
+  } else {
+    el.style.display = 'none';
+  }
+  const isActive = data.running;
+  const btn = document.getElementById('detectLangBtn');
+  if (_langWasActive && !isActive) {
+    loadMovies(currentPage);
+    loadLanguages();
+    loadSummary();
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#127760; Detect Languages'; }
+  }
+  if (isActive && btn) { btn.disabled = true; btn.textContent = '⏳ Detecting...'; }
+  _langWasActive = isActive;
+  if (isActive) {
+    _langPollTimer = setTimeout(refreshLangStatus, 2000);
+  } else {
+    _langPollTimer = null;
+  }
+}
+
+async function loadLanguages() {
+  const data = await api('/api/languages');
+  const items = (data.languages || []).map(l => ({
+    id: l.language,
+    name: getLangName(l.language),
+    count: l.cnt
+  }));
+  buildMsPanel('lang', items);
+}
+
+async function detectAllLanguages() {
+  const btn = document.getElementById('detectLangBtn');
+  const limitSel = document.getElementById('langLimitSel');
+  const limit = limitSel ? limitSel.value : '1000';
+  const data = await api('/api/movies/detect-language-all', { method: 'POST', body: JSON.stringify({ limit }) });
+  if (data.error) { alert(data.error); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Detecting...'; }
+  if (!_langPollTimer) refreshLangStatus();
+}
+
+async function detectSingleLang(movieId, btn) {
+  btn.classList.add('detecting');
+  btn.innerHTML = '&#8987;';
+  try {
+    const data = await api(`/api/movies/${movieId}/detect-language`, { method: 'POST' });
+    const card = btn.closest('.movie-card');
+    const langEl = card.querySelector('.movie-lang');
+    if (data.language) {
+      if (langEl) langEl.textContent = getLangName(data.language);
+      btn.innerHTML = '&#10003;';
+      btn.style.background = 'rgba(34,197,94,0.85)';
+      btn.style.color = '#fff';
+      loadLanguages();
+    } else {
+      btn.innerHTML = '&#10007;';
+      btn.style.background = 'rgba(239,68,68,0.85)';
+    }
+  } catch (e) {
+    btn.innerHTML = '&#10007;';
+    btn.style.background = 'rgba(239,68,68,0.85)';
+  } finally {
+    btn.classList.remove('detecting');
+    setTimeout(() => {
+      btn.innerHTML = '&#127760;';
+      btn.style.background = '';
+      btn.style.color = '';
+    }, 3000);
+  }
+}
+
 // Init
 loadProviders();
+loadLanguages();
 loadSummary();
 loadMovies(1);
+refreshLangStatus();
 </script>
 </body>
 </html>
