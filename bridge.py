@@ -1210,29 +1210,12 @@ class BridgeCore:
             return None, "No stream mapping for movie"
 
         stream_id = relation.stream_id
-        base_url = f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}"
-        cache_key = f"{mid}:{stream_id}"
-
-        now = time.monotonic()
-        with self._session_lock:
-            entry = self._session_cache.get(cache_key)
-            if entry:
-                resolved_url, ts = entry
-                if now - ts < self._SESSION_TTL:
-                    logger.debug(f"Session cache hit for movie {mid} ({now - ts:.1f}s old)")
-                    return resolved_url, None
-            # Cache miss or expired — resolve outside the lock to avoid blocking other threads
-
-        resolved_url = self._resolve_session(base_url, cache_key)
-
-        with self._session_lock:
-            # Re-check: another thread may have resolved while we were fetching
-            entry = self._session_cache.get(cache_key)
-            if entry and now - entry[1] < self._SESSION_TTL:
-                return entry[0], None
-            self._session_cache[cache_key] = (resolved_url, now)
-
-        return resolved_url, None
+        # Return bare Dispatcharr URL — no pre-resolution. Dispatcharr issues a fresh
+        # 301 to a new session URL on each request. rclone gets a new session per play,
+        # and Dispatcharr manages session lifecycle. Pre-resolving caused rclone to cache
+        # the session URL and reuse it indefinitely, opening new provider connections
+        # without the plugin knowing.
+        return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None
 
     def get_movie_info(self, movie_id):
         mid = str(movie_id)
