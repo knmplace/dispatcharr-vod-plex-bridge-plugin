@@ -15,6 +15,9 @@ def _load_manifest():
 
 _manifest = _load_manifest()
 
+_plugin_singleton = None
+_singleton_lock = threading.Lock()
+
 
 class Plugin:
     name = _manifest["name"]
@@ -25,9 +28,18 @@ class Plugin:
     fields = _manifest.get("fields", [])
     actions = _manifest.get("actions", [])
 
+    def __new__(cls):
+        global _plugin_singleton
+        with _singleton_lock:
+            if _plugin_singleton is None:
+                _plugin_singleton = super().__new__(cls)
+                _plugin_singleton._initialized = False
+            return _plugin_singleton
+
     def __init__(self):
-        """Dispatcharr calls Plugin() at startup for every enabled plugin.
-        We store server state on self so it survives across action calls on this instance."""
+        if self._initialized:
+            return
+        self._initialized = True
         self._server_instance = None
         self._server_thread = None
         self._server_lock = threading.Lock()
