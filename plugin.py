@@ -29,6 +29,15 @@ class Plugin:
     fields = _manifest.get("fields", [])
     actions = _manifest.get("actions", [])
 
+    def __init__(self):
+        """Auto-start server when Dispatcharr discovers this enabled plugin on boot."""
+        settings = self._load_settings_from_db()
+        if settings:
+            logger.info("VOD To Plex: auto-starting on Dispatcharr startup...")
+            self._start_server(settings, logger)
+        else:
+            logger.info("VOD To Plex: instantiated (no settings yet — start via action)")
+
     def start(self, context):
         settings = context.get("settings", {})
         log = context.get("logger", logger)
@@ -130,6 +139,16 @@ class Plugin:
             "message": f"Dashboard: http://{host}:{port}/",
             "url": f"http://{host}:{port}/",
         }
+
+    def _load_settings_from_db(self):
+        """Load our own settings from PluginConfig DB row. Returns {} if not found."""
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key="vod_plex_bridge")
+            return cfg.settings or {}
+        except Exception as e:
+            logger.debug(f"VOD To Plex: could not load settings from DB: {e}")
+            return {}
 
     def _detect_host(self):
         return "localhost"
