@@ -115,6 +115,24 @@ def _dispatch(environ, start_response, bridge, settings):
         query = _parse_query(environ)
         return _json_response(start_response, bridge.list_providers(query))
 
+    if path == "/api/languages" and method == "GET":
+        return _json_response(start_response, bridge.list_languages())
+
+    if path == "/api/lang-status" and method == "GET":
+        return _json_response(start_response, bridge.get_lang_status())
+
+    if path == "/api/movies/detect-language" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.detect_language(body))
+
+    if path == "/api/movies/detect-language-all" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.detect_language_all(body))
+
+    if re.match(r"^/api/movies/\d+/detect-language$", path) and method == "POST":
+        movie_id = path.split("/")[3]
+        return _json_response(start_response, bridge.detect_single_language(movie_id))
+
     if path == "/api/health" and method == "GET":
         return _json_response(start_response, bridge.health_check(settings))
 

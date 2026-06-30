@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -89,6 +89,28 @@
       "label": "Streaming",
       "type": "info",
       "description": "Playback uses 302 redirect to Dispatcharr's native VOD proxy. No streaming configuration needed — Dispatcharr handles connections, Range requests, and session management."
+    },
+    {
+      "id": "_section_language",
+      "label": "Language Detection",
+      "type": "info",
+      "description": "Optional. Enter a TMDB API key to enable looking up each movie's original language. Leave blank to disable this feature entirely."
+    },
+    {
+      "id": "tmdb_api_key",
+      "label": "TMDB API Key (v3)",
+      "type": "string",
+      "default": "",
+      "help_text": "TMDB v3 API key. Used for language lookups. Either this or the Read Access Token is required.",
+      "input_type": "password"
+    },
+    {
+      "id": "tmdb_read_token",
+      "label": "TMDB Read Access Token",
+      "type": "string",
+      "default": "",
+      "help_text": "TMDB API Read Access Token (Bearer). Takes priority over v3 API key if both are set.",
+      "input_type": "password"
     }
   ],
   "actions": [

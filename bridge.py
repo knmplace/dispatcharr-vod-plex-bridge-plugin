@@ -2,10 +2,27 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
 logger = logging.getLogger("vod_plex_bridge.bridge")
+
+LANG_NAMES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ru": "Russian",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "hi": "Hindi",
+    "ar": "Arabic", "tr": "Turkish", "pl": "Polish", "sv": "Swedish",
+    "da": "Danish", "no": "Norwegian", "fi": "Finnish", "el": "Greek",
+    "he": "Hebrew", "th": "Thai", "vi": "Vietnamese", "id": "Indonesian",
+    "ms": "Malay", "tl": "Tagalog", "ro": "Romanian", "hu": "Hungarian",
+    "cs": "Czech", "sk": "Slovak", "bg": "Bulgarian", "uk": "Ukrainian",
+    "hr": "Croatian", "sr": "Serbian", "sl": "Slovenian", "lt": "Lithuanian",
+    "lv": "Latvian", "et": "Estonian", "ka": "Georgian", "hy": "Armenian",
+    "fa": "Persian", "ur": "Urdu", "bn": "Bengali", "ta": "Tamil",
+    "te": "Telugu", "ml": "Malayalam", "kn": "Kannada", "mr": "Marathi",
+    "gu": "Gujarati", "pa": "Punjabi", "cn": "Cantonese",
+}
 
 
 class BridgeCore:
@@ -14,7 +31,10 @@ class BridgeCore:
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
+        self._languages = {}
         self._data_dir = "/data/vod-plex-bridge"
+        self._lang_detect_running = False
+        self._lang_status = ""
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -36,6 +56,14 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
+        lang_file = os.path.join(self._data_dir, "language_cache.json")
+        if os.path.exists(lang_file):
+            try:
+                with open(lang_file, "r") as f:
+                    self._languages = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load language cache: {e}")
+
     def _save_state(self):
         state_file = os.path.join(self._data_dir, "bridge_state.json")
         try:
@@ -43,6 +71,14 @@ class BridgeCore:
                 json.dump({"activated": self._activated}, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+
+    def _save_languages(self):
+        lang_file = os.path.join(self._data_dir, "language_cache.json")
+        try:
+            with open(lang_file, "w") as f:
+                json.dump(self._languages, f)
+        except Exception as e:
+            logger.error(f"Failed to save language cache: {e}")
 
     def get_stats(self):
         return {
@@ -102,6 +138,7 @@ class BridgeCore:
             search = query.get("search", [""])[0]
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
+            languages = [v for v in query.get("language", []) if v]
             activated_only = query.get("activated_only", [""])[0]
 
             qs = Movie.objects.all()
@@ -109,10 +146,21 @@ class BridgeCore:
             if search:
                 qs = qs.filter(name__icontains=search)
 
-            if provider_ids:
-                qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
+            if languages:
+                wanted_ids = [
+                    int(mid) for mid, lang in self._languages.items()
+                    if lang in languages
+                ]
+                qs = qs.filter(id__in=wanted_ids)
 
-            if category_ids:
+            if provider_ids and category_ids:
+                qs = qs.filter(
+                    m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids],
+                    m3u_relations__category_id__in=[int(c) for c in category_ids],
+                ).distinct()
+            elif provider_ids:
+                qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
+            elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
             if activated_only:
@@ -158,6 +206,7 @@ class BridgeCore:
                         "uuid": str(getattr(m, "uuid", "")),
                         "activated": mid in self._activated,
                         "trailer_key": trailer_key,
+                        "language": self._languages.get(mid),
                     }
                 )
 
@@ -185,13 +234,25 @@ class BridgeCore:
             search = query.get("search", [""])[0]
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
+            languages = [v for v in query.get("language", []) if v]
 
             qs = Movie.objects.all()
             if search:
                 qs = qs.filter(name__icontains=search)
-            if provider_ids:
+            if languages:
+                wanted_ids = [
+                    int(mid) for mid, lang in self._languages.items()
+                    if lang in languages
+                ]
+                qs = qs.filter(id__in=wanted_ids)
+            if provider_ids and category_ids:
+                qs = qs.filter(
+                    m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids],
+                    m3u_relations__category_id__in=[int(c) for c in category_ids],
+                ).distinct()
+            elif provider_ids:
                 qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
-            if category_ids:
+            elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
             ids = list(qs.values_list("id", flat=True))
@@ -253,6 +314,214 @@ class BridgeCore:
 
     def list_active_streams(self):
         return {"streams": [], "count": 0}
+
+    # --- Language Detection (TMDB) ---
+
+    def list_languages(self):
+        counts = {}
+        for lang in self._languages.values():
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+        languages = [
+            {"language": lang, "cnt": cnt}
+            for lang, cnt in sorted(counts.items(), key=lambda x: -x[1])
+        ]
+        return {"languages": languages}
+
+    def get_lang_status(self):
+        return {"lang_status": self._lang_status, "running": self._lang_detect_running}
+
+    def _tmdb_lookup_language(self, tmdb_id, api_key, read_token=None):
+        import requests
+
+        url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
+        headers = {}
+        params = {}
+        if read_token:
+            headers["Authorization"] = f"Bearer {read_token}"
+        else:
+            params["api_key"] = api_key
+        for attempt in range(5):
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=10)
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", "4"))
+                    time.sleep(retry_after + 1)
+                    continue
+                if resp.status_code != 200:
+                    return None
+                return resp.json().get("original_language", "") or None
+            except Exception as e:
+                if attempt < 4:
+                    time.sleep(2)
+                    continue
+                logger.warning(f"TMDB language lookup failed for tmdb_id={tmdb_id}: {e}")
+                return None
+        return None
+
+    def detect_language(self, body):
+        api_key = self.settings.get("tmdb_api_key", "")
+        read_token = self.settings.get("tmdb_read_token", "")
+        if not api_key and not read_token:
+            return {"error": "TMDB API key not configured"}
+
+        movie_ids = body.get("movie_ids", [])
+        if not movie_ids:
+            return {"error": "movie_ids required"}
+
+        try:
+            from apps.vod.models import Movie
+
+            detected = 0
+            skipped = 0
+            no_tmdb = 0
+            results = []
+            for mid in movie_ids:
+                mid = str(mid)
+                try:
+                    movie = Movie.objects.get(id=int(mid))
+                except Exception:
+                    skipped += 1
+                    continue
+                tmdb_id = getattr(movie, "tmdb_id", None)
+                if not tmdb_id:
+                    no_tmdb += 1
+                    continue
+                lang = self._tmdb_lookup_language(tmdb_id, api_key, read_token)
+                if lang:
+                    self._languages[mid] = lang
+                    detected += 1
+                    results.append({"id": mid, "language": lang, "language_name": LANG_NAMES.get(lang, lang)})
+                else:
+                    skipped += 1
+                time.sleep(0.15)
+
+            self._save_languages()
+            return {"detected": detected, "skipped": skipped, "no_tmdb_id": no_tmdb, "results": results}
+        except Exception as e:
+            logger.error(f"detect_language error: {e}")
+            return {"error": str(e)}
+
+    def detect_single_language(self, movie_id):
+        api_key = self.settings.get("tmdb_api_key", "")
+        read_token = self.settings.get("tmdb_read_token", "")
+        if not api_key and not read_token:
+            return {"error": "TMDB API key not configured"}
+
+        try:
+            from apps.vod.models import Movie
+
+            mid = str(movie_id)
+            try:
+                movie = Movie.objects.get(id=int(mid))
+            except Exception:
+                return {"error": "Movie not found"}
+
+            tmdb_id = getattr(movie, "tmdb_id", None)
+            if not tmdb_id:
+                return {"id": mid, "language": None, "message": "No TMDB ID"}
+
+            lang = self._tmdb_lookup_language(tmdb_id, api_key, read_token)
+            if lang:
+                self._languages[mid] = lang
+                self._save_languages()
+                return {"id": mid, "language": lang, "language_name": LANG_NAMES.get(lang, lang)}
+            return {"id": mid, "language": None, "message": "Not found on TMDB"}
+        except Exception as e:
+            logger.error(f"detect_single_language error: {e}")
+            return {"error": str(e)}
+
+    def detect_language_all(self, body=None):
+        api_key = self.settings.get("tmdb_api_key", "")
+        read_token = self.settings.get("tmdb_read_token", "")
+        if not api_key and not read_token:
+            return {"error": "TMDB API key not configured"}
+
+        if self._lang_detect_running:
+            return {"status": "already_running"}
+
+        limit = (body or {}).get("limit", "1000")
+        thread = threading.Thread(target=self._bulk_detect_languages, args=(api_key, read_token, limit), daemon=True)
+        thread.start()
+        return {"status": "started", "message": "Bulk language detection started in background"}
+
+    def _bulk_detect_languages(self, api_key, read_token="", limit="1000"):
+        self._lang_detect_running = True
+        try:
+            from django.db import close_old_connections
+            from apps.vod.models import Movie
+
+            close_old_connections()
+
+            known_ids = {int(mid) for mid in self._languages.keys()}
+
+            if limit == "activated":
+                activated_ids = [int(mid) for mid in self._activated.keys()]
+                qs = Movie.objects.filter(id__in=activated_ids)
+            else:
+                qs = Movie.objects.all()
+
+            movies = list(
+                qs.exclude(id__in=known_ids)
+                .exclude(tmdb_id__isnull=True)
+                .exclude(tmdb_id="")
+                .values("id", "tmdb_id")
+            )
+
+            try:
+                limit_n = int(limit)
+            except (ValueError, TypeError):
+                limit_n = 0
+            if limit_n > 0:
+                movies = movies[:limit_n]
+
+            total = len(movies)
+            if not total:
+                self._lang_status = "All languages detected"
+                return
+
+            est_minutes = max(1, round(total * 0.5 / 60))
+            self._lang_status = f"Detecting languages in background: 0/{total} (~{est_minutes} min remaining)..."
+            logger.info(f"Language detection started: {total} movies, estimated {est_minutes} min")
+
+            detected = 0
+            skipped = 0
+            start_time = time.time()
+
+            for i, movie in enumerate(movies):
+                mid = str(movie["id"])
+                tmdb_id = movie["tmdb_id"]
+                lang = self._tmdb_lookup_language(tmdb_id, api_key, read_token)
+                if lang:
+                    self._languages[mid] = lang
+                    detected += 1
+                else:
+                    skipped += 1
+
+                time.sleep(0.5)
+                processed = i + 1
+                if processed % 25 == 0:
+                    self._save_languages()
+                    elapsed = time.time() - start_time
+                    rate = processed / elapsed if elapsed > 0 else 2
+                    remaining = total - processed
+                    est_min = max(1, round(remaining / rate / 60))
+                    self._lang_status = (
+                        f"Detecting languages in background: {processed}/{total} "
+                        f"({detected} detected, ~{est_min} min remaining)..."
+                    )
+
+            self._save_languages()
+            elapsed_min = round((time.time() - start_time) / 60, 1)
+            self._lang_status = (
+                f"Language detection complete: {detected} detected, {skipped} not found ({elapsed_min} min)"
+            )
+            logger.info(f"Bulk language detection complete: {detected} detected, {skipped} not found out of {total} in {elapsed_min} min")
+        except Exception as e:
+            logger.error(f"Bulk language detection failed: {e}")
+            self._lang_status = f"Error: {str(e)[:200]}"
+        finally:
+            self._lang_detect_running = False
 
     def health_check(self, settings):
         checks = {}
