@@ -4,32 +4,8 @@ import os
 import re
 import threading
 import time
-from collections import deque
-from http.client import HTTPConnection, HTTPSConnection
-from pathlib import Path
-from urllib.parse import urlparse
-
-HEAD_CACHE_SIZE = 8 * 1024 * 1024   # 8MB — covers Plex fast-start and moov atom probes
-TAIL_CACHE_SIZE = 256 * 1024         # 256KB — covers seek table / moov atom at end of file
 
 logger = logging.getLogger("vod_plex_bridge.bridge")
-
-# --- Proxy Activity Log ---
-MAX_LOG_ENTRIES = 500
-_proxy_log: deque = deque(maxlen=MAX_LOG_ENTRIES)
-_log_lock = threading.Lock()
-
-
-def log_event(level: str, movie_id, msg: str, movie_name: str = None, **extra):
-    entry = {"ts": time.time(), "level": level, "movie_id": movie_id,
-             "movie_name": movie_name, "msg": msg, **extra}
-    with _log_lock:
-        _proxy_log.append(entry)
-
-
-def get_proxy_log():
-    with _log_lock:
-        return list(_proxy_log)
 
 LANG_NAMES = {
     "en": "English", "es": "Spanish", "fr": "French", "de": "German",
@@ -58,28 +34,9 @@ class BridgeCore:
         self._data_dir = "/data/vod-plex-bridge"
         self._lang_detect_running = False
         self._lang_status = ""
-        # session_id cache: key = "movie_id:stream_id", value = (resolved_url, timestamp)
-        # Reusing a session URL within SESSION_TTL collapses burst requests (e.g. rclone double-GET)
-        # to a single Dispatcharr session. After TTL, next request gets a fresh session so a
-        # second independent viewer always gets their own connection.
-        self._session_cache: dict = {}
-        self._session_lock = threading.Lock()
-        self._SESSION_TTL = 30  # seconds
-
-        # Head/tail byte cache — keyed by movie_id string
-        # Populated at activation. Serves Plex/rclone metadata probes without provider connections.
-        self._cache_dir = os.path.join(self._data_dir, "cache")
-        self._cache_fetching: set = set()   # movie_ids currently being fetched
-        self._cache_lock = threading.Lock()
-
-        # Active provider connections — keyed by movie_id string
-        # Prevents a metadata probe from opening a second connection while playback is active.
-        self._active_connections: dict = {}  # movie_id -> count
-        self._conn_lock = threading.Lock()
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
-        os.makedirs(self._cache_dir, exist_ok=True)
         self._load_state()
         logger.info(
             f"BridgeCore initialized. {len(self._activated)} activated movies."
@@ -668,7 +625,6 @@ class BridgeCore:
 
         if activated:
             strm_count = self._generate_strm_for_movies(activated)
-            self._trigger_cache_fetch_for_movies(activated)
             self._trigger_plex_scan()
             return {"status": "ok", "activated": len(activated), "strm_generated": strm_count}
 
@@ -725,6 +681,22 @@ class BridgeCore:
             logger.error(f"STRM generation error: {e}")
         return count
 
+    def _get_dispatcharr_stream_url(self, movie, settings=None):
+        """Return the direct Dispatcharr proxy URL for a movie, or None if unavailable."""
+        s = settings if settings is not None else self.settings
+        dispatcharr_url = s.get("dispatcharr_url", "").rstrip("/")
+        if not dispatcharr_url:
+            return None
+        try:
+            relation = movie.m3u_relations.first()
+            if not relation:
+                return None
+            uuid = str(movie.uuid)
+            stream_id = relation.stream_id
+            return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}"
+        except Exception:
+            return None
+
     def _remove_strm_for_movies(self, movie_ids):
         strm_dir = self.settings.get("strm_output_dir", "/data/strm")
         try:
@@ -745,62 +717,6 @@ class BridgeCore:
                     logger.info(f"STRM removed: {folder_name}")
         except Exception as e:
             logger.error(f"STRM removal error: {e}")
-
-    def get_cache_status(self):
-        """Return per-movie cache status for the dashboard."""
-        result = []
-        for mid in list(self._activated.keys()):
-            head = os.path.exists(self._cache_path(mid, "head"))
-            tail = os.path.exists(self._cache_path(mid, "tail"))
-            fetching = mid in self._cache_fetching
-            head_size = os.path.getsize(self._cache_path(mid, "head")) if head else 0
-            result.append({"movie_id": mid, "head": head, "tail": tail,
-                           "fetching": fetching, "head_bytes": head_size})
-        return {"movies": result, "total": len(result),
-                "cached": sum(1 for m in result if m["head"])}
-
-    def trigger_cache_fetch_all(self):
-        """Trigger background cache fetch for all activated movies missing cache."""
-        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
-        if not dispatcharr_url:
-            return {"status": "error", "message": "Dispatcharr URL not configured"}
-        triggered = []
-        try:
-            from apps.vod.models import Movie
-            for mid in list(self._activated.keys()):
-                if not os.path.exists(self._cache_path(mid, "head")):
-                    try:
-                        movie = Movie.objects.get(id=int(mid))
-                        relation = movie.m3u_relations.first()
-                        if relation:
-                            base_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
-                            self.start_cache_fetch(mid, base_url)
-                            triggered.append(mid)
-                    except Exception as e:
-                        logger.warning(f"Cache fetch trigger failed for {mid}: {e}")
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-        return {"status": "ok", "triggered": len(triggered)}
-
-    def _trigger_cache_fetch_for_movies(self, movie_ids):
-        """Start background head/tail cache fetch for newly activated movies."""
-        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
-        if not dispatcharr_url:
-            return
-        try:
-            from apps.vod.models import Movie
-            for mid in movie_ids:
-                try:
-                    movie = Movie.objects.get(id=int(mid))
-                    relation = movie.m3u_relations.first()
-                    if not relation:
-                        continue
-                    base_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
-                    self.start_cache_fetch(mid, base_url)
-                except Exception as e:
-                    logger.warning(f"Cache fetch trigger failed for movie {mid}: {e}")
-        except Exception as e:
-            logger.error(f"Cache fetch trigger error: {e}")
 
     def _trigger_plex_scan(self):
         plex_url = self.settings.get("plex_url", "")
@@ -1000,195 +916,6 @@ class BridgeCore:
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
 
-
-    def _cache_path(self, movie_id, part):
-        return os.path.join(self._cache_dir, f"{movie_id}_{part}.bin")
-
-    def _fetch_and_cache(self, movie_id, base_url):
-        """Fetch head+tail bytes from Dispatcharr and store to disk. Runs in background thread."""
-        with self._cache_lock:
-            if movie_id in self._cache_fetching:
-                return
-            self._cache_fetching.add(movie_id)
-        try:
-            # Resolve session first (safe — no provider connection opened)
-            cache_key = f"{movie_id}:cache"
-            resolved = self._resolve_session(base_url, cache_key)
-            parsed = urlparse(resolved)
-            path = parsed.path
-            if parsed.query:
-                path = f"{path}?{parsed.query}"
-            Conn = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
-
-            # Fetch head
-            head_path = self._cache_path(movie_id, "head")
-            if not os.path.exists(head_path):
-                conn = Conn(parsed.netloc, timeout=30)
-                conn.request("GET", path, headers={"Range": f"bytes=0-{HEAD_CACHE_SIZE - 1}"})
-                resp = conn.getresponse()
-                if resp.status in (200, 206):
-                    data = resp.read(HEAD_CACHE_SIZE)
-                    conn.close()
-                    with open(head_path, "wb") as f:
-                        f.write(data)
-                    logger.info(f"Head cache written for movie {movie_id}: {len(data)} bytes")
-                    log_event("info", movie_id, "Head cache fetched", bytes=len(data))
-                else:
-                    conn.close()
-                    logger.warning(f"Head cache fetch failed for movie {movie_id}: HTTP {resp.status}")
-                    log_event("warn", movie_id, f"Head cache fetch failed: HTTP {resp.status}")
-                    return
-
-            # Fetch tail — need file size first from Content-Range header
-            tail_path = self._cache_path(movie_id, "tail")
-            if not os.path.exists(tail_path):
-                conn = Conn(parsed.netloc, timeout=30)
-                conn.request("GET", path, headers={"Range": "bytes=0-0"})
-                resp = conn.getresponse()
-                resp.read()
-                cr = resp.getheader("Content-Range", "")
-                conn.close()
-                file_size = None
-                if cr and "/" in cr:
-                    try:
-                        file_size = int(cr.split("/")[1])
-                    except Exception:
-                        pass
-                if file_size and file_size > TAIL_CACHE_SIZE:
-                    tail_start = file_size - TAIL_CACHE_SIZE
-                    conn = Conn(parsed.netloc, timeout=30)
-                    conn.request("GET", path, headers={"Range": f"bytes={tail_start}-{file_size - 1}"})
-                    resp = conn.getresponse()
-                    if resp.status in (200, 206):
-                        data = resp.read(TAIL_CACHE_SIZE)
-                        conn.close()
-                        # Store tail with its start offset in a meta file
-                        with open(tail_path, "wb") as f:
-                            f.write(data)
-                        with open(self._cache_path(movie_id, "tail_meta"), "w") as f:
-                            json.dump({"start": tail_start, "size": file_size}, f)
-                        logger.info(f"Tail cache written for movie {movie_id}: {len(data)} bytes @ {tail_start}")
-                        log_event("info", movie_id, "Tail cache fetched", bytes=len(data), tail_start=tail_start, file_size=file_size)
-                    else:
-                        conn.close()
-                        logger.warning(f"Tail cache fetch failed for movie {movie_id}: HTTP {resp.status}")
-                        log_event("warn", movie_id, f"Tail cache fetch failed: HTTP {resp.status}")
-        except Exception as e:
-            logger.error(f"Cache fetch error for movie {movie_id}: {e}")
-            log_event("error", movie_id, f"Cache fetch error: {e}")
-        finally:
-            with self._cache_lock:
-                self._cache_fetching.discard(movie_id)
-
-    def start_cache_fetch(self, movie_id, base_url):
-        """Launch background cache fetch for a movie."""
-        t = threading.Thread(target=self._fetch_and_cache, args=(movie_id, base_url), daemon=True)
-        t.start()
-
-    def get_cached_range(self, movie_id, range_start, range_end):
-        """Return cached bytes if the requested range is fully covered, else None.
-        range_end is inclusive. Returns (data, file_size) or None.
-        """
-        mid = str(movie_id)
-        head_path = self._cache_path(mid, "head")
-        tail_path = self._cache_path(mid, "tail")
-        tail_meta_path = self._cache_path(mid, "tail_meta")
-
-        file_size = None
-        tail_start = None
-        if os.path.exists(tail_meta_path):
-            try:
-                with open(tail_meta_path) as f:
-                    meta = json.load(f)
-                file_size = meta.get("size")
-                tail_start = meta.get("start")
-            except Exception:
-                pass
-
-        # Normalize range_end
-        if range_end is None or (file_size and range_end >= file_size):
-            range_end = (file_size - 1) if file_size else range_end
-
-        # Check head cache
-        if os.path.exists(head_path) and range_start is not None and range_start >= 0:
-            try:
-                head_data = open(head_path, "rb").read()
-                head_size = len(head_data)
-                if range_end is not None and range_end < head_size:
-                    return head_data[range_start:range_end + 1], file_size
-                elif range_end is None and range_start < head_size:
-                    return head_data[range_start:], file_size
-            except Exception:
-                pass
-
-        # Check tail cache
-        if (os.path.exists(tail_path) and tail_start is not None
-                and range_start is not None and range_start >= tail_start):
-            try:
-                tail_data = open(tail_path, "rb").read()
-                offset = range_start - tail_start
-                end_offset = (range_end - tail_start + 1) if range_end is not None else len(tail_data)
-                if offset >= 0 and end_offset <= len(tail_data):
-                    return tail_data[offset:end_offset], file_size
-            except Exception:
-                pass
-
-        return None
-
-    def has_cache(self, movie_id):
-        return os.path.exists(self._cache_path(str(movie_id), "head"))
-
-    def open_connection(self, movie_id):
-        """Register an active provider connection. Returns False if one already exists."""
-        mid = str(movie_id)
-        with self._conn_lock:
-            if self._active_connections.get(mid, 0) > 0:
-                return False
-            self._active_connections[mid] = 1
-            return True
-
-    def close_connection(self, movie_id):
-        mid = str(movie_id)
-        with self._conn_lock:
-            if mid in self._active_connections:
-                self._active_connections[mid] = max(0, self._active_connections[mid] - 1)
-                if self._active_connections[mid] == 0:
-                    del self._active_connections[mid]
-
-    def has_active_connection(self, movie_id):
-        return self._active_connections.get(str(movie_id), 0) > 0
-
-    def _resolve_session(self, base_url, cache_key):
-        """Follow Dispatcharr's 301 to get a session-scoped URL.
-
-        Dispatcharr returns 301 to /proxy/vod/movie/{uuid}/{session_id}?stream_id=X
-        when no session_id is in the path. We capture that Location header so
-        subsequent requests reuse the same session instead of minting new ones.
-        Returns the resolved URL, or base_url on failure.
-        """
-        from urllib.parse import urlparse
-        from http.client import HTTPConnection, HTTPSConnection
-        try:
-            parsed = urlparse(base_url)
-            path = parsed.path
-            if parsed.query:
-                path = f"{path}?{parsed.query}"
-            Conn = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
-            conn = Conn(parsed.netloc, timeout=15)
-            conn.request("GET", path, headers={"Range": "bytes=0-0"})
-            resp = conn.getresponse()
-            location = resp.getheader("Location")
-            resp.read()  # drain
-            conn.close()
-            if location and resp.status in (301, 302):
-                if location.startswith("/"):
-                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
-                logger.info(f"Resolved session for {cache_key}: {location}")
-                return location
-        except Exception as e:
-            logger.warning(f"Session resolve failed for {cache_key}: {e}")
-        return base_url
-
     def get_redirect_url(self, movie_id):
         mid = str(movie_id)
         if mid not in self._activated:
@@ -1210,12 +937,13 @@ class BridgeCore:
             return None, "No stream mapping for movie"
 
         stream_id = relation.stream_id
+        account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
         # Return bare Dispatcharr URL — no pre-resolution. Dispatcharr issues a fresh
         # 301 to a new session URL on each request. rclone gets a new session per play,
         # and Dispatcharr manages session lifecycle. Pre-resolving caused rclone to cache
         # the session URL and reuse it indefinitely, opening new provider connections
         # without the plugin knowing.
-        return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None
+        return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None, account_id
 
     def get_movie_info(self, movie_id):
         mid = str(movie_id)
