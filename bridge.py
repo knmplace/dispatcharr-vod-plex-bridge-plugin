@@ -919,31 +919,67 @@ class BridgeCore:
     def get_redirect_url(self, movie_id):
         mid = str(movie_id)
         if mid not in self._activated:
-            return None, "Movie not activated"
+            return None, "Movie not activated", None
 
         dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
         if not dispatcharr_url:
-            return None, "Dispatcharr URL not configured"
+            return None, "Dispatcharr URL not configured", None
 
         try:
             from apps.vod.models import Movie
             movie = Movie.objects.get(id=int(mid))
         except Exception:
-            return None, "Movie not found"
+            return None, "Movie not found", None
 
         uuid = str(movie.uuid)
-        relation = movie.m3u_relations.first()
-        if not relation:
-            return None, "No stream mapping for movie"
+        relations = list(movie.m3u_relations.all())
+        if not relations:
+            return None, "No stream mapping for movie", None
+
+        # Prefer the cached last-known-good relation if this movie has more than
+        # one mapping and a previous play already picked one that worked.
+        entry = self._activated.get(mid, {})
+        cached_stream_id = entry.get("stream_pick")
+        relation = relations[0]
+        if cached_stream_id is not None:
+            for r in relations:
+                if str(r.stream_id) == str(cached_stream_id):
+                    relation = r
+                    break
 
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
-        # Return bare Dispatcharr URL — no pre-resolution. Dispatcharr issues a fresh
-        # 301 to a new session URL on each request. rclone gets a new session per play,
-        # and Dispatcharr manages session lifecycle. Pre-resolving caused rclone to cache
-        # the session URL and reuse it indefinitely, opening new provider connections
-        # without the plugin knowing.
+        # Bare Dispatcharr URL, no pre-resolution and no liveness probe here —
+        # Dispatcharr/rclone handle session retry on their own per Range request.
+        # Adding an HTTP pre-flight on every request just adds extra provider
+        # connections on top of whatever Dispatcharr is already doing.
         return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None, account_id
+
+    def mark_stream_bad(self, movie_id, stream_id):
+        """Advance the cached stream pick to the next available relation for a
+        movie, so future plays skip a confirmed-dead stream_id. Called manually
+        (e.g. from the dashboard) after a movie is confirmed not playing."""
+        mid = str(movie_id)
+        if mid not in self._activated:
+            return False
+
+        try:
+            from apps.vod.models import Movie
+            movie = Movie.objects.get(id=int(mid))
+        except Exception:
+            return False
+
+        relations = list(movie.m3u_relations.all())
+        remaining = [r for r in relations if str(r.stream_id) != str(stream_id)]
+        if not remaining:
+            return False
+
+        entry = self._activated.get(mid, {})
+        entry["stream_pick"] = remaining[0].stream_id
+        self._activated[mid] = entry
+        self._save_state()
+        logger.info(f"Movie {mid}: switched stream pick away from {stream_id} to {remaining[0].stream_id}")
+        return True
 
     def get_movie_info(self, movie_id):
         mid = str(movie_id)

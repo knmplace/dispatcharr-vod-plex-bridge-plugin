@@ -74,6 +74,9 @@ def _create_app(bridge, settings):
     def app(environ, start_response):
         try:
             return _dispatch(environ, start_response, bridge, settings)
+        except Exception:
+            logger.exception("Unhandled error in request dispatch")
+            return _text_response(start_response, 500, "Internal server error")
         finally:
             try:
                 from django.db import close_old_connections
@@ -91,6 +94,9 @@ def _dispatch(environ, start_response, bridge, settings):
     # --- Dashboard ---
     if path in ("/", "/dashboard"):
         return _serve_dashboard(environ, start_response)
+
+    if path in ("/favicon.ico", "/logo.png"):
+        return _serve_logo(start_response)
 
     # --- API routes ---
     if path == "/api/catalog/summary" and method == "GET":
@@ -223,6 +229,21 @@ def _serve_dashboard(environ, start_response):
     except FileNotFoundError:
         return _json_response(start_response,
                               {"error": "Dashboard template not found"}, status=500)
+
+
+def _serve_logo(start_response):
+    logo_path = os.path.join(PLUGIN_DIR, "logo.png")
+    try:
+        with open(logo_path, "rb") as f:
+            body = f.read()
+        start_response("200 OK", [
+            ("Content-Type", "image/png"),
+            ("Content-Length", str(len(body))),
+            ("Cache-Control", "public, max-age=86400"),
+        ])
+        return [body]
+    except FileNotFoundError:
+        return _text_response(start_response, 404, "Not found")
 
 
 def _json_response(start_response, data, status=200):
