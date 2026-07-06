@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VOD To Plex</title>
 <link rel="icon" type="image/png" href="/logo.png">
+<link rel="shortcut icon" type="image/png" href="/logo.png">
+<link rel="apple-touch-icon" href="/logo.png">
+<meta name="apple-mobile-web-app-title" content="VOD To Plex">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="application-name" content="VOD To Plex">
+<meta name="theme-color" content="#0f1117">
 <style>
 :root {
   --bg: #0f1117;
@@ -31,7 +37,7 @@ a { color: var(--accent); text-decoration: none; }
 .header-stats .stat-val { color: var(--text); font-weight: 600; }
 
 /* Tabs */
-.tabs { display: flex; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); }
+.tabs { display: flex; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); }
 .tab { padding: 0.6rem 1.2rem; cursor: pointer; color: var(--text2); font-size: 0.85rem; border-bottom: 2px solid transparent; transition: all 0.15s; position: relative; }
 .tab:hover { color: var(--text); background: var(--surface2); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -41,6 +47,10 @@ a { color: var(--accent); text-decoration: none; }
 .content { padding: 1rem 1.2rem; max-width: 1400px; margin: 0 auto; }
 .tab-pane { display: none; }
 .tab-pane.active { display: block; }
+
+/* Pinned browse sub-header (catalog summary + movie filters) */
+.browse-pinned { position: sticky; top: calc(var(--header-h, 0px) + var(--tabs-h, 0px)); z-index: 80; background: var(--bg); padding-top: 1rem; margin: 0 -1.2rem; padding-left: 1.2rem; padding-right: 1.2rem; }
+.browse-pinned .panel:last-child { margin-bottom: 0.8rem; }
 
 /* Panels */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1rem; overflow: hidden; }
@@ -226,7 +236,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </div>
 
 <div class="header">
-  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.7</span></h1>
+  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v0.1.12</span></h1>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
@@ -244,82 +254,89 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 <div class="content">
   <!-- Browse Tab -->
   <div class="tab-pane active" id="pane-browse">
-    <div class="panel">
-      <div class="panel-header">
-        <span>Catalog Summary</span>
-        <button class="btn btn-outline btn-sm" onclick="loadSummary()">Refresh</button>
+    <div class="browse-pinned" id="browsePinned">
+      <div class="panel">
+        <div class="panel-header">
+          <span>Catalog Summary</span>
+          <button class="btn btn-outline btn-sm" onclick="loadSummary(this)">Refresh</button>
+        </div>
+        <div class="panel-body">
+          <div class="summary-grid" id="summaryGrid">
+            <div class="loading"><span class="spinner"></span> Loading...</div>
+          </div>
+        </div>
       </div>
-      <div class="panel-body">
-        <div class="summary-grid" id="summaryGrid">
-          <div class="loading"><span class="spinner"></span> Loading...</div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <span>Movies</span>
+          <div style="display:flex;gap:0.3rem;align-items:center;">
+            <button class="btn btn-primary btn-sm" onclick="selectAllMovies()">Select All</button>
+            <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear All</button>
+            <button class="btn btn-green btn-sm" onclick="activateSelected()">Activate Selected</button>
+            <button class="btn btn-outline btn-sm" onclick="deactivateSelected()">Deactivate Selected</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <!-- Language detection bar -->
+          <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;padding:0.4rem 0.6rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+            <span style="font-size:0.75rem;color:var(--text2);white-space:nowrap;">&#127760; Language Detection:</span>
+            <select id="langLimitSel" class="search-input" style="flex:0 0 auto;min-width:130px;font-size:0.75rem;padding:0.25rem 0.4rem;">
+              <option value="activated">Activated Only</option>
+              <option value="500">500 movies</option>
+              <option value="1000" selected>1,000 movies</option>
+              <option value="2000">2,000 movies</option>
+              <option value="5000">5,000 movies</option>
+              <option value="0">All (~6h)</option>
+            </select>
+            <button class="btn btn-sm" id="detectLangBtn" onclick="detectAllLanguages()" style="background:var(--amber);color:#000;border-color:var(--amber);white-space:nowrap;">Detect Now</button>
+            <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+          </div>
+          <div class="search-bar">
+            <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
+            <div class="ms-dropdown" id="provDropdown">
+              <div class="ms-toggle" onclick="toggleMsPanel('prov')">
+                <span id="provLabel">All Providers</span>
+                <span class="ms-arrow">&#9662;</span>
+              </div>
+              <div class="ms-panel" id="provPanel"></div>
+            </div>
+            <div class="ms-dropdown" id="catDropdown">
+              <div class="ms-toggle" onclick="toggleMsPanel('cat')">
+                <span id="catLabel">All Categories</span>
+                <span class="ms-arrow">&#9662;</span>
+              </div>
+              <div class="ms-panel" id="catPanel2"></div>
+            </div>
+            <div class="ms-dropdown" id="langDropdown">
+              <div class="ms-toggle" onclick="toggleMsPanel('lang')">
+                <span id="langLabel">All Languages</span>
+                <span class="ms-arrow">&#9662;</span>
+              </div>
+              <div class="ms-panel" id="langPanel"></div>
+            </div>
+            <select class="search-input" id="perPageSel" onchange="searchMovies()" style="min-width:90px;">
+              <option value="300">300</option>
+              <option value="800">800</option>
+              <option value="1300">1300</option>
+              <option value="1800">1800</option>
+              <option value="0">All</option>
+            </select>
+            <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+              <input type="checkbox" id="activatedFilter" onchange="searchMovies()"> Activated Only
+            </label>
+            <button class="btn btn-primary btn-sm" onclick="searchMovies()">Search</button>
+          </div>
+          <div class="selection-bar" id="selectionBar" style="display:none;">
+            <span>Selected: <span class="count" id="selCount">0</span></span>
+            <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear Selection</button>
+          </div>
         </div>
       </div>
     </div>
 
     <div class="panel">
-      <div class="panel-header">
-        <span>Movies</span>
-        <div style="display:flex;gap:0.3rem;align-items:center;">
-          <button class="btn btn-primary btn-sm" onclick="selectAllMovies()">Select All</button>
-          <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear All</button>
-          <button class="btn btn-green btn-sm" onclick="activateSelected()">Activate Selected</button>
-          <button class="btn btn-outline btn-sm" onclick="deactivateSelected()">Deactivate Selected</button>
-        </div>
-      </div>
       <div class="panel-body">
-        <!-- Language detection bar -->
-        <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;padding:0.4rem 0.6rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
-          <span style="font-size:0.75rem;color:var(--text2);white-space:nowrap;">&#127760; Language Detection:</span>
-          <select id="langLimitSel" class="search-input" style="flex:0 0 auto;min-width:130px;font-size:0.75rem;padding:0.25rem 0.4rem;">
-            <option value="activated">Activated Only</option>
-            <option value="500">500 movies</option>
-            <option value="1000" selected>1,000 movies</option>
-            <option value="2000">2,000 movies</option>
-            <option value="5000">5,000 movies</option>
-            <option value="0">All (~6h)</option>
-          </select>
-          <button class="btn btn-sm" id="detectLangBtn" onclick="detectAllLanguages()" style="background:var(--amber);color:#000;border-color:var(--amber);white-space:nowrap;">Detect Now</button>
-          <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
-        </div>
-        <div class="search-bar">
-          <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
-          <div class="ms-dropdown" id="provDropdown">
-            <div class="ms-toggle" onclick="toggleMsPanel('prov')">
-              <span id="provLabel">All Providers</span>
-              <span class="ms-arrow">&#9662;</span>
-            </div>
-            <div class="ms-panel" id="provPanel"></div>
-          </div>
-          <div class="ms-dropdown" id="catDropdown">
-            <div class="ms-toggle" onclick="toggleMsPanel('cat')">
-              <span id="catLabel">All Categories</span>
-              <span class="ms-arrow">&#9662;</span>
-            </div>
-            <div class="ms-panel" id="catPanel2"></div>
-          </div>
-          <div class="ms-dropdown" id="langDropdown">
-            <div class="ms-toggle" onclick="toggleMsPanel('lang')">
-              <span id="langLabel">All Languages</span>
-              <span class="ms-arrow">&#9662;</span>
-            </div>
-            <div class="ms-panel" id="langPanel"></div>
-          </div>
-          <select class="search-input" id="perPageSel" onchange="searchMovies()" style="min-width:90px;">
-            <option value="300">300</option>
-            <option value="800">800</option>
-            <option value="1300">1300</option>
-            <option value="1800">1800</option>
-            <option value="0">All</option>
-          </select>
-          <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
-            <input type="checkbox" id="activatedFilter" onchange="searchMovies()"> Activated Only
-          </label>
-          <button class="btn btn-primary btn-sm" onclick="searchMovies()">Search</button>
-        </div>
-        <div class="selection-bar" id="selectionBar" style="display:none;">
-          <span>Selected: <span class="count" id="selCount">0</span></span>
-          <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear Selection</button>
-        </div>
         <div id="movieGrid" class="movie-grid">
           <div class="loading"><span class="spinner"></span> Loading movies...</div>
         </div>
@@ -435,6 +452,28 @@ async function api(path, opts) {
   return resp.json();
 }
 
+function updateStickyOffsets() {
+  const header = document.querySelector('.header');
+  const tabs = document.querySelector('.tabs');
+  const root = document.documentElement;
+  if (header) root.style.setProperty('--header-h', header.offsetHeight + 'px');
+  if (tabs) root.style.setProperty('--tabs-h', tabs.offsetHeight + 'px');
+}
+window.addEventListener('resize', updateStickyOffsets);
+window.addEventListener('load', updateStickyOffsets);
+updateStickyOffsets();
+
+function posterRetry(img) {
+  const retries = parseInt(img.dataset.retries || '0', 10);
+  if (retries < 2) {
+    img.dataset.retries = retries + 1;
+    const src = img.src.split('?')[0];
+    setTimeout(() => { img.src = src + '?r=' + Date.now(); }, 600 * (retries + 1));
+  } else {
+    img.outerHTML = '<div class="movie-poster no-poster">No Poster</div>';
+  }
+}
+
 // Multi-select dropdown logic
 function toggleMsPanel(type) {
   const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
@@ -515,31 +554,40 @@ function msParams(type) {
 }
 
 // Summary
-async function loadSummary() {
-  const data = await api('/api/catalog/summary');
-  document.getElementById('hdrTotal').textContent = data.total || 0;
-  document.getElementById('hdrActivated').textContent = data.activated || 0;
-  document.getElementById('hdrStreams').textContent = data.active_streams || 0;
+async function loadSummary(btn) {
+  if (btn) { btn.disabled = true; var origLabel = btn.textContent; btn.textContent = 'Refreshing…'; }
+  try {
+    const data = await api('/api/catalog/summary');
+    document.getElementById('hdrTotal').textContent = data.total || 0;
+    document.getElementById('hdrActivated').textContent = data.activated || 0;
+    document.getElementById('hdrStreams').textContent = data.active_streams || 0;
 
-  const grid = document.getElementById('summaryGrid');
-  grid.innerHTML = `
-    <div class="summary-card"><div class="summary-val">${data.total||0}</div><div class="summary-label">Total Movies</div></div>
-    <div class="summary-card"><div class="summary-val">${data.activated||0}</div><div class="summary-label">Activated</div></div>
-    <div class="summary-card"><div class="summary-val">${data.active_streams||0}</div><div class="summary-label">Active Streams</div></div>
-    <div class="summary-card"><div class="summary-val">${(data.categories||[]).length}</div><div class="summary-label">Categories</div></div>
-  `;
+    const grid = document.getElementById('summaryGrid');
+    grid.innerHTML = `
+      <div class="summary-card"><div class="summary-val">${data.total||0}</div><div class="summary-label">Total Movies</div></div>
+      <div class="summary-card"><div class="summary-val">${data.activated||0}</div><div class="summary-label">Activated</div></div>
+      <div class="summary-card"><div class="summary-val">${data.active_streams||0}</div><div class="summary-label">Active Streams</div></div>
+      <div class="summary-card"><div class="summary-val">${(data.categories||[]).length}</div><div class="summary-label">Categories</div></div>
+    `;
 
-  // Category chips
-  const catList = document.getElementById('catList');
-  if (data.categories && data.categories.length > 0) {
-    catList.innerHTML = data.categories.map(c =>
-      `<span class="cat-chip" onclick="filterByCategory(${c.id})">${c.name}<span class="cat-count">(${c.count})</span></span>`
-    ).join('');
-  } else {
-    catList.innerHTML = '<span class="empty">No categories</span>';
+    // Category chips
+    const catList = document.getElementById('catList');
+    if (data.categories && data.categories.length > 0) {
+      catList.innerHTML = data.categories.map(c =>
+        `<span class="cat-chip" onclick="filterByCategory(${c.id})">${c.name}<span class="cat-count">(${c.count})</span></span>`
+      ).join('');
+    } else {
+      catList.innerHTML = '<span class="empty">No categories</span>';
+    }
+
+    await loadCategories();
+  } catch (e) {
+    console.error('loadSummary failed', e);
+    const grid = document.getElementById('summaryGrid');
+    if (grid) grid.innerHTML = '<div class="empty">Failed to load catalog summary — check plugin logs</div>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origLabel; }
   }
-
-  loadCategories();
 }
 
 // Providers
@@ -597,7 +645,7 @@ async function loadMovies(page) {
     const sel = selectedMovies.has(m.id) ? 'activated' : '';
     const actBadge = m.activated ? '<span class="movie-badge">Active</span>' : '';
     const poster = m.poster
-      ? `<img class="movie-poster" src="${m.poster}" loading="lazy" onerror="this.outerHTML='<div class=\\'movie-poster no-poster\\'>No Poster</div>'">`
+      ? `<img class="movie-poster" src="${m.poster}" loading="lazy" onerror="posterRetry(this)">`
       : '<div class="movie-poster no-poster">No Poster</div>';
 
     const trailerBtn = m.trailer_key

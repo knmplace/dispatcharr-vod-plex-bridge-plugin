@@ -141,6 +141,12 @@ See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — covers the common "activate
 
 ## Changelog
 
+### v0.1.12 (2026-07-06)
+- **Fixed Catalog Summary "Refresh" button** — failures in the refresh chain now surface a visible error instead of silently doing nothing; button shows a "Refreshing…" state while in flight
+- **Poster load retry** — movie posters that fail to load (more common on mobile) now retry twice with backoff before falling back to "No Poster", instead of giving up on the first failure
+- **Pinned Browse sub-header** — Catalog Summary and the Movies filter bar (search, provider/category/language filters, per-page, Select All/Clear/Activate/Deactivate) now stay fixed at the top while scrolling through the movie grid
+- **Favicon / home-screen icon** — added `apple-touch-icon` and related meta tags so the plugin logo shows up correctly in browser tabs and when saved to a mobile home screen
+
 ### v0.1.5 (2026-06-30)
 - **Auto-start on Dispatcharr restart** — `Plugin.__init__()` loads settings from the `PluginConfig` DB and starts the WSGI server automatically when Dispatcharr discovers the enabled plugin on boot. No manual "Start Server" click needed after container restart.
 - **Richer status check** — "Status" button now shows `✓ Server running on port 8888 | N activated | N in catalog` when running, or a clear "not running" message with instruction when stopped.
