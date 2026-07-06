@@ -145,7 +145,15 @@ systemctl enable --now rclone-vodplugin
    ```
    http://<plex-server-ip>:32400/library/sections?X-Plex-Token=<your-token>
    ```
-3. This returns XML listing every library. Find the `<Directory>` entry whose `title` matches the library you just created (e.g. "Stream-Movies-Bridge"), and use its `key` attribute — that number is the Plex Library Section ID.
+
+   **Worked example** — if your Plex server's IP is `192.168.1.20` and your token is `abc123XYZ`, the actual URL you'd type into your browser's address bar is:
+   ```
+   http://192.168.1.20:32400/library/sections?X-Plex-Token=abc123XYZ
+   ```
+3. This returns XML listing every library. Find the `<Directory>` entry whose `title` matches the library you just created (e.g. "Stream-Movies-Bridge"), and use its `key` attribute — that number is the Plex Library Section ID. For example, in this snippet the Library Section ID is **7**:
+   ```xml
+   <Directory key="7" type="movie" title="Stream-Movies-Bridge" .../>
+   ```
 
 ## 6. Enable the Plugin
 
