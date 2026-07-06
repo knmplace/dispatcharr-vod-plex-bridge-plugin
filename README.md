@@ -46,7 +46,6 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 - **Plex Real-Time Delete** — Deactivating a movie immediately removes it from Plex via API (no scan needed)
 - **Auto Plex Scan** — Triggers library scan after activation
 - **Plex Now Playing** — Monitor active Plex sessions from the dashboard (bridge vs local content)
-- **Auto-Start on Restart** — Server starts automatically when Dispatcharr restarts (no manual action needed)
 - **Health Checks** — Dispatcharr DB and Plex connectivity status
 - **Catalog Summary** — Category chips with movie counts, quick-filter on click
 - **Zero Dependencies** — Uses Python stdlib only (no pip installs needed)
