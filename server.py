@@ -220,6 +220,7 @@ def _serve_dashboard(environ, start_response):
     try:
         with open(template_path, "r", encoding="utf-8") as f:
             html = f.read()
+        html = html.replace("{{PLUGIN_VERSION}}", _plugin_version())
         body = html.encode("utf-8")
         start_response("200 OK", [
             ("Content-Type", "text/html; charset=utf-8"),
@@ -229,6 +230,14 @@ def _serve_dashboard(environ, start_response):
     except FileNotFoundError:
         return _json_response(start_response,
                               {"error": "Dashboard template not found"}, status=500)
+
+
+def _plugin_version():
+    try:
+        with open(os.path.join(PLUGIN_DIR, "plugin.json"), "r", encoding="utf-8") as f:
+            return json.load(f).get("version", "?")
+    except Exception:
+        return "?"
 
 
 def _serve_logo(start_response):
