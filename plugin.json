@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
