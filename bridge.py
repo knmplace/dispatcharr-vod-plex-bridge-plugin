@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 
 logger = logging.getLogger("vod_plex_bridge.bridge")
 
@@ -44,6 +45,12 @@ class BridgeCore:
     # the DB every watchdog tick (~10s).
     DEFAULT_REMOVED_CHECK_INTERVAL_SECS = 300
 
+    # Max number of activity-log entries kept (in memory and on disk) for the
+    # dashboard's Logs tab. Oldest entries drop off as new ones are appended,
+    # so this is also the natural archive point — a busy server with lots of
+    # activity rotates through its history faster than a quiet one.
+    ACTIVITY_LOG_MAXLEN = 500
+
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
@@ -57,10 +64,12 @@ class BridgeCore:
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
         self._last_removed_check = 0.0
+        self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
         self._load_state()
+        self._load_activity_log()
         logger.info(
             f"BridgeCore initialized. {len(self._activated)} activated movies."
         )
@@ -69,6 +78,38 @@ class BridgeCore:
     def cleanup(self):
         self._watchdog_stop.set()
         self._save_state()
+
+    def _activity_log_path(self):
+        return os.path.join(self._data_dir, "activity_log.json")
+
+    def _load_activity_log(self):
+        try:
+            with open(self._activity_log_path(), "r") as f:
+                entries = json.load(f)
+            self._activity_log.extend(entries[-self.ACTIVITY_LOG_MAXLEN:])
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error(f"Failed to load activity log: {e}")
+
+    def _save_activity_log(self):
+        try:
+            with open(self._activity_log_path(), "w") as f:
+                json.dump(list(self._activity_log), f)
+        except Exception as e:
+            logger.error(f"Failed to save activity log: {e}")
+
+    def _log_event(self, level, message):
+        self._activity_log.append({"ts": time.time(), "level": level, "message": message})
+        self._save_activity_log()
+
+    def get_activity_log(self):
+        return list(self._activity_log)
+
+    def clear_activity_log(self):
+        self._activity_log.clear()
+        self._save_activity_log()
+        return {"status": "ok"}
 
     def _start_stall_watchdog(self):
         self._watchdog_thread = threading.Thread(
@@ -187,7 +228,12 @@ class BridgeCore:
             str(i) for i in Movie.objects.filter(id__in=activated_ids).values_list("id", flat=True)
         )
         removed = [mid for mid in self._activated.keys() if mid not in existing_ids]
+
         if not removed:
+            self._log_event(
+                "info",
+                f"Cleanup check: {len(activated_ids)} activated movie(s) checked, none removed",
+            )
             return
 
         logger.warning(
@@ -202,6 +248,12 @@ class BridgeCore:
         for mid in removed:
             self._activated.pop(mid, None)
         self._save_state()
+
+        self._log_event(
+            "warn",
+            f"Cleanup check: {len(activated_ids)} activated movie(s) checked, "
+            f"{len(removed)} removed (no longer in Dispatcharr's catalog)",
+        )
 
     def _match_session_to_movie(self, session):
         title = session.get("title", "")
@@ -265,7 +317,6 @@ class BridgeCore:
         return {
             "catalog_count": self._get_catalog_count(),
             "activated_count": len(self._activated),
-            "active_streams": 0,
         }
 
     def _get_catalog_count(self):
@@ -306,7 +357,6 @@ class BridgeCore:
         return {
             "total": total,
             "activated": activated,
-            "active_streams": 0,
             "categories": categories,
         }
 
@@ -492,9 +542,6 @@ class BridgeCore:
             return {"providers": providers}
         except Exception as e:
             return {"providers": [], "error": str(e)}
-
-    def list_active_streams(self):
-        return {"streams": [], "count": 0}
 
     # --- Language Detection (TMDB) ---
 
@@ -809,6 +856,10 @@ class BridgeCore:
             strm_count = self._generate_strm_for_movies(activated)
             self._save_state()
             self._trigger_plex_scan()
+            self._log_event(
+                "info",
+                f"Activated {len(activated)} movie(s), generated {strm_count} STRM file(s)",
+            )
             return {"status": "ok", "activated": len(activated), "strm_generated": strm_count}
 
         return {"status": "ok", "activated": 0}
@@ -830,6 +881,10 @@ class BridgeCore:
         if deactivated:
             self._remove_strm_for_movies(deactivated, folder_hints=folder_hints)
             plex_removed = self._plex_delete_movies(deactivated)
+            self._log_event(
+                "info",
+                f"Deactivated {len(deactivated)} movie(s), removed {plex_removed} from Plex",
+            )
 
         return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
 
@@ -1126,6 +1181,19 @@ class BridgeCore:
             logger.error(f"VOD directory listing error: {e}")
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
+
+    def log_play_request(self, movie_id, client_ip, ok, detail=None):
+        mid = str(movie_id)
+        try:
+            from apps.vod.models import Movie
+            name = Movie.objects.get(id=int(mid)).name
+        except Exception:
+            name = f"#{mid}"
+
+        if ok:
+            self._log_event("info", f"Play request: \"{name}\" from {client_ip} — redirect OK")
+        else:
+            self._log_event("error", f"Play request: \"{name}\" from {client_ip} — FAILED: {detail}")
 
     def get_redirect_url(self, movie_id):
         mid = str(movie_id)

@@ -142,11 +142,14 @@ def _dispatch(environ, start_response, bridge, settings):
     if path == "/api/health" and method == "GET":
         return _json_response(start_response, bridge.health_check(settings))
 
-    if path == "/api/streams" and method == "GET":
-        return _json_response(start_response, bridge.list_active_streams())
-
     if path == "/api/plex/sessions" and method == "GET":
         return _json_response(start_response, bridge.get_plex_sessions(settings))
+
+    if path == "/api/activity-log" and method == "GET":
+        return _json_response(start_response, bridge.get_activity_log())
+
+    if path == "/api/activity-log" and method == "DELETE":
+        return _json_response(start_response, bridge.clear_activity_log())
 
     if path == "/api/stats" and method == "GET":
         return _json_response(start_response, bridge.get_stats())
@@ -203,12 +206,16 @@ def _dispatch(environ, start_response, bridge, settings):
             start_response("200 OK", headers)
             return [b""]
 
+        client_ip = environ.get("REMOTE_ADDR", "unknown")
+
         redirect_url, error, account_id = bridge.get_redirect_url(movie_id)
         if error:
             status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
+            bridge.log_play_request(movie_id, client_ip, ok=False, detail=error)
             return _text_response(start_response, status, error)
 
         logger.info(f"302 redirect: movie {movie_id} -> {redirect_url}")
+        bridge.log_play_request(movie_id, client_ip, ok=True, detail=None)
         start_response("302 Found", [("Location", redirect_url)])
         return [b""]
 

@@ -248,14 +248,13 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
-    <span>Streams: <span class="stat-val" id="hdrStreams">-</span></span>
   </div>
 </div>
 
 <div class="tabs">
   <div class="tab active" data-tab="browse" onclick="switchTab('browse')">Browse</div>
-  <div class="tab" data-tab="streams" onclick="switchTab('streams')">Streams <span class="badge" id="streamBadge" style="display:none">0</span></div>
-  <div class="tab" data-tab="logs" onclick="switchTab('logs')">Proxy Logs</div>
+  <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
+  <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
   <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
 </div>
 
@@ -366,17 +365,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
   <div class="tab-pane" id="pane-streams">
     <div class="panel">
       <div class="panel-header">
-        <span>Active Streams</span>
-        <label style="font-size:0.7rem;color:var(--text2);"><input type="checkbox" id="autoRefreshStreams" checked> Auto-refresh</label>
-      </div>
-      <div class="panel-body" id="streamsBody">
-        <div class="empty">No active streams</div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-header">
         <span>Plex Now Playing</span>
+        <label style="font-size:0.7rem;color:var(--text2);"><input type="checkbox" id="autoRefreshStreams" checked> Auto-refresh</label>
       </div>
       <div class="panel-body" id="plexBody">
         <div class="empty">No Plex sessions</div>
@@ -384,11 +374,11 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     </div>
   </div>
 
-  <!-- Proxy Logs Tab -->
+  <!-- Logs Tab -->
   <div class="tab-pane" id="pane-logs">
     <div class="panel" style="height:calc(100vh - 140px);display:flex;flex-direction:column;">
       <div class="panel-header" style="display:flex;align-items:center;gap:0.5rem;flex-shrink:0;">
-        <span>Proxy Logs</span>
+        <span>Logs</span>
         <select id="logLevelFilter" onchange="renderProxyLog()" style="padding:0.2rem 0.4rem;font-size:0.7rem;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;">
           <option value="">All</option>
           <option value="info">Info</option>
@@ -568,13 +558,11 @@ async function loadSummary(btn) {
     const data = await api('/api/catalog/summary');
     document.getElementById('hdrTotal').textContent = data.total || 0;
     document.getElementById('hdrActivated').textContent = data.activated || 0;
-    document.getElementById('hdrStreams').textContent = data.active_streams || 0;
 
     const grid = document.getElementById('summaryGrid');
     grid.innerHTML = `
       <div class="summary-card"><div class="summary-val">${data.total||0}</div><div class="summary-label">Total Movies</div></div>
       <div class="summary-card"><div class="summary-val">${data.activated||0}</div><div class="summary-label">Activated</div></div>
-      <div class="summary-card"><div class="summary-val">${data.active_streams||0}</div><div class="summary-label">Active Streams</div></div>
       <div class="summary-card"><div class="summary-val">${(data.categories||[]).length}</div><div class="summary-label">Categories</div></div>
     `;
 
@@ -776,24 +764,7 @@ async function deactivateSelected() {
 
 // Streams
 async function loadStreams() {
-  const [streams, plex] = await Promise.all([
-    api('/api/streams'),
-    api('/api/plex/sessions')
-  ]);
-
-  const sBody = document.getElementById('streamsBody');
-  if (streams.streams && streams.streams.length > 0) {
-    sBody.innerHTML = streams.streams.map(s => `
-      <div class="stream-card">
-        <div>
-          <div class="stream-title">${s.movie_name}</div>
-          <div class="stream-meta">${formatBytes(s.bytes_downloaded)} downloaded | ${s.bitrate_kbps} KB/s</div>
-        </div>
-      </div>
-    `).join('');
-  } else {
-    sBody.innerHTML = '<div class="empty">No active streams</div>';
-  }
+  const plex = await api('/api/plex/sessions');
 
   const pBody = document.getElementById('plexBody');
   if (plex.sessions && plex.sessions.length > 0) {
@@ -813,7 +784,7 @@ async function loadStreams() {
   }
 
   const badge = document.getElementById('streamBadge');
-  const count = Math.max((streams.streams||[]).length, (plex.sessions||[]).length);
+  const count = (plex.sessions||[]).length;
   if (count > 0) { badge.textContent = count; badge.style.display = ''; }
   else { badge.style.display = 'none'; }
 }
@@ -962,7 +933,7 @@ async function detectSingleLang(movieId, btn) {
   }
 }
 
-// Proxy Log
+// Activity Log
 let proxyLogData = [];
 let logRefreshTimer = null;
 
@@ -972,7 +943,7 @@ function escapeHtml(s) {
 
 async function loadProxyLog() {
   try {
-    const data = await api('/api/proxy-log');
+    const data = await api('/api/activity-log');
     proxyLogData = Array.isArray(data) ? data : [];
     renderProxyLog();
   } catch (e) {
@@ -984,7 +955,7 @@ function renderProxyLog() {
   const container = document.getElementById('logContainer');
   const levelFilter = document.getElementById('logLevelFilter').value;
   let entries = proxyLogData.slice().reverse();
-  if (levelFilter !== 'all') entries = entries.filter(e => e.level === levelFilter);
+  if (levelFilter) entries = entries.filter(e => e.level === levelFilter);
   if (entries.length === 0) {
     container.innerHTML = '<div class="empty">No log entries</div>';
     return;
@@ -992,20 +963,16 @@ function renderProxyLog() {
   container.innerHTML = entries.map(e => {
     const ts = new Date(e.ts * 1000).toLocaleTimeString();
     const lvl = (e.level || 'info').toLowerCase();
-    const movie = e.movie_name ? `<span class="log-movie">${escapeHtml(e.movie_name)}</span>` : (e.movie_id ? `<span class="log-movie">#${escapeHtml(e.movie_id)}</span>` : '');
-    const meta = Object.entries(e).filter(([k]) => !['ts','level','movie_id','movie_name','msg'].includes(k))
-      .map(([k,v]) => `${k}=${escapeHtml(v)}`).join(' ');
     return `<div class="log-entry">
       <span class="log-ts">${ts}</span>
       <span class="log-level ${lvl}">${lvl}</span>
-      ${movie}
-      <span class="log-msg">${escapeHtml(e.msg || '')}</span>
-      ${meta ? `<span class="log-meta">${meta}</span>` : ''}
+      <span class="log-msg">${escapeHtml(e.message || '')}</span>
     </div>`;
   }).join('');
 }
 
-function clearProxyLog() {
+async function clearProxyLog() {
+  await api('/api/activity-log', { method: 'DELETE' });
   proxyLogData = [];
   renderProxyLog();
 }
