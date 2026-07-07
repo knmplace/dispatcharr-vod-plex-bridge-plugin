@@ -141,6 +141,9 @@ See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — covers the common "activate
 
 ## Changelog
 
+### v0.1.15 (2026-07-07)
+- **Fixed stale version number in dashboard header** — the dashboard template had the plugin version hardcoded as static text, so it silently drifted from the real version on every release (e.g. still showed "v0.1.12" while the plugin card correctly showed v0.1.14). The header now reads the version from `plugin.json` at request time and substitutes it into the template, so it can never go stale again.
+
 ### v0.1.14 (2026-07-07)
 - **Fixed "Stop Server" no-op bug** — Start/Stop/Status tracked the running server via `self._server_instance` on the `Plugin` object, but Dispatcharr's plugin runner isn't guaranteed to reuse the same `Plugin()` instance across action calls, so a click on Stop Server could hit a freshly-constructed instance with no memory of the server the earlier Start click had spun up — it always reported "Server was not running" without stopping anything. Server tracking moved to module-level state instead, so Start/Stop/Status always agree regardless of how many `Plugin` instances get created. Also: Start Server no longer falsely reports success if the port is already bound by something it isn't tracking, and Status now distinguishes "our tracked server is running" from "the port is bound but not by us."
 
