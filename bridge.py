@@ -37,11 +37,12 @@ class BridgeCore:
     # burned through in rapid succession.
     STALL_COOLDOWN_SECS = 600
 
-    # How often (in watchdog ticks, each ~10s) to check whether activated
-    # movies still exist in Dispatcharr's VOD catalog. 30 ticks ~= 5 minutes —
-    # frequent enough to catch removals soon after an M3U refresh without
-    # hammering the DB every 10s.
-    REMOVED_CHECK_EVERY_TICKS = 30
+    # Default interval (seconds) between checks for whether activated movies
+    # still exist in Dispatcharr's VOD catalog, if not overridden by the
+    # "removed_check_interval_secs" plugin setting. 300s (5 min) is frequent
+    # enough to catch removals soon after an M3U refresh without hammering
+    # the DB every watchdog tick (~10s).
+    DEFAULT_REMOVED_CHECK_INTERVAL_SECS = 300
 
     def __init__(self, settings):
         self.settings = settings
@@ -55,6 +56,7 @@ class BridgeCore:
         self._watchdog_thread = None
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
+        self._last_removed_check = 0.0
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -84,7 +86,18 @@ class BridgeCore:
                 logger.error(f"Stall watchdog error: {e}")
 
             self._watchdog_ticks += 1
-            if self._watchdog_ticks % self.REMOVED_CHECK_EVERY_TICKS == 0:
+            try:
+                interval = int(self.settings.get(
+                    "removed_check_interval_secs",
+                    self.DEFAULT_REMOVED_CHECK_INTERVAL_SECS,
+                ))
+            except (TypeError, ValueError):
+                interval = self.DEFAULT_REMOVED_CHECK_INTERVAL_SECS
+            interval = max(interval, 10)
+
+            now = time.time()
+            if now - self._last_removed_check >= interval:
+                self._last_removed_check = now
                 try:
                     self._reconcile_removed_movies()
                 except Exception as e:
