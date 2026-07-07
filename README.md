@@ -141,6 +141,9 @@ See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — covers the common "activate
 
 ## Changelog
 
+### v0.1.16 (2026-07-07)
+- **Fixed Provider/Category/Language dropdowns showing only one entry on desktop** — the base `.panel` CSS rule had `overflow: hidden` (originally just to round the panel's corners), but the Provider/Category/Language multi-select dropdowns are absolutely-positioned popouts that live inside a `.panel` — so their ancestor's `overflow: hidden` clipped the dropdown to the panel's own box, hiding everything past the first row even though the panel-body's own `max-height: 300px; overflow-y: auto` was configured correctly. Data was never the problem (the `/api/providers` endpoint always returned the full list). Fixed by moving `overflow: hidden` out of the base `.panel` rule and into an opt-in `.panel.clip` class for the one panel (Proxy Logs) that actually still needs edge clipping — dropdowns now expand and scroll properly on desktop.
+
 ### v0.1.15 (2026-07-07)
 - **Fixed stale version number in dashboard header** — the dashboard template had the plugin version hardcoded as static text, so it silently drifted from the real version on every release (e.g. still showed "v0.1.12" while the plugin card correctly showed v0.1.14). The header now reads the version from `plugin.json` at request time and substitutes it into the template, so it can never go stale again.
 
