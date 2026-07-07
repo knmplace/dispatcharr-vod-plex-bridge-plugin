@@ -141,6 +141,10 @@ See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — covers the common "activate
 
 ## Changelog
 
+### v0.1.13 (2026-07-07)
+- **Fixed orphaned STRM folders on catalog removal** — deactivating a movie whose Dispatcharr `Movie` row was already gone previously silently skipped folder deletion, since the folder name was recomputed from the (now missing) DB row instead of being remembered. Activation now stores the folder name at generation time so removal always works regardless of catalog state.
+- **New: automatic cleanup for movies removed from Dispatcharr** — a background check (piggybacked on the existing stall-watchdog loop, runs every ~5 minutes) now detects activated movies that have disappeared from Dispatcharr's VOD catalog (e.g. dropped by an M3U account refresh) and automatically removes their STRM folder, deletes them from Plex, and clears their activation state — previously these were never detected and lingered forever.
+
 ### v0.1.12 (2026-07-06)
 - **Fixed Catalog Summary "Refresh" button** — failures in the refresh chain now surface a visible error instead of silently doing nothing; button shows a "Refreshing…" state while in flight
 - **Poster load retry** — movie posters that fail to load (more common on mobile) now retry twice with backoff before falling back to "No Poster", instead of giving up on the first failure

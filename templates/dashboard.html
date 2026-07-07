@@ -52,6 +52,13 @@ a { color: var(--accent); text-decoration: none; }
 .browse-pinned { position: sticky; top: calc(var(--header-h, 0px) + var(--tabs-h, 0px)); z-index: 80; background: var(--bg); padding-top: 1rem; margin: 0 -1.2rem; padding-left: 1.2rem; padding-right: 1.2rem; }
 .browse-pinned .panel:last-child { margin-bottom: 0.8rem; }
 
+/* On narrow/mobile screens, three stacked sticky bars (header + tabs +
+   browse-pinned) consume most of the viewport and leave almost no room to
+   scroll the movie grid. Unpin all three so the page scrolls normally. */
+@media (max-width: 768px) {
+  .header, .tabs, .browse-pinned { position: static; top: auto; }
+}
+
 /* Panels */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1rem; overflow: hidden; }
 .panel-header { padding: 0.5rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }

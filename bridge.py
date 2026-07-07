@@ -27,6 +27,22 @@ LANG_NAMES = {
 class BridgeCore:
     """Core bridge logic. Accesses Dispatcharr VOD data via Django ORM."""
 
+    # Minimum time a bridge session must sit in "buffering" with a
+    # non-advancing view_offset before we treat it as stuck and advance to
+    # the next stream relation, rather than the one-time cached pick living
+    # forever (see mark_stream_bad / get_redirect_url).
+    STALL_THRESHOLD_SECS = 25
+    # Once we've auto-advanced a movie's stream pick, don't do it again for
+    # this long — prevents a genuinely bad batch of providers from being
+    # burned through in rapid succession.
+    STALL_COOLDOWN_SECS = 600
+
+    # How often (in watchdog ticks, each ~10s) to check whether activated
+    # movies still exist in Dispatcharr's VOD catalog. 30 ticks ~= 5 minutes —
+    # frequent enough to catch removals soon after an M3U refresh without
+    # hammering the DB every 10s.
+    REMOVED_CHECK_EVERY_TICKS = 30
+
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
@@ -34,6 +50,11 @@ class BridgeCore:
         self._data_dir = "/data/vod-plex-bridge"
         self._lang_detect_running = False
         self._lang_status = ""
+        self._stall_watch = {}  # movie_id -> {"view_offset": int, "since": float}
+        self._stall_last_switch = {}  # movie_id -> timestamp of last auto-advance
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
+        self._watchdog_ticks = 0
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -41,9 +62,157 @@ class BridgeCore:
         logger.info(
             f"BridgeCore initialized. {len(self._activated)} activated movies."
         )
+        self._start_stall_watchdog()
 
     def cleanup(self):
+        self._watchdog_stop.set()
         self._save_state()
+
+    def _start_stall_watchdog(self):
+        self._watchdog_thread = threading.Thread(
+            target=self._stall_watchdog_loop,
+            daemon=True,
+            name="vod-bridge-stall-watchdog",
+        )
+        self._watchdog_thread.start()
+
+    def _stall_watchdog_loop(self):
+        while not self._watchdog_stop.wait(10):
+            try:
+                self._check_for_stalls()
+            except Exception as e:
+                logger.error(f"Stall watchdog error: {e}")
+
+            self._watchdog_ticks += 1
+            if self._watchdog_ticks % self.REMOVED_CHECK_EVERY_TICKS == 0:
+                try:
+                    self._reconcile_removed_movies()
+                except Exception as e:
+                    logger.error(f"Removed-movie reconciliation error: {e}")
+
+    def _check_for_stalls(self):
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token or not self._activated:
+            return
+
+        result = self.get_plex_sessions(self.settings)
+        sessions = result.get("sessions", [])
+        bridge_sessions = [s for s in sessions if s.get("is_bridge")]
+
+        now = time.time()
+        seen_mids = set()
+
+        for session in bridge_sessions:
+            mid = self._match_session_to_movie(session)
+            if mid is None:
+                continue
+            seen_mids.add(mid)
+
+            if session.get("state") != "buffering":
+                self._stall_watch.pop(mid, None)
+                continue
+
+            offset = session.get("view_offset", 0)
+            watch = self._stall_watch.get(mid)
+            if watch is None or watch["view_offset"] != offset:
+                self._stall_watch[mid] = {"view_offset": offset, "since": now}
+                continue
+
+            stalled_for = now - watch["since"]
+            if stalled_for < self.STALL_THRESHOLD_SECS:
+                continue
+
+            last_switch = self._stall_last_switch.get(mid, 0)
+            if now - last_switch < self.STALL_COOLDOWN_SECS:
+                continue
+
+            entry = self._activated.get(mid, {})
+            current_stream_id = entry.get("stream_pick")
+            if current_stream_id is None:
+                # Not resolved yet (never played) — nothing to advance away from.
+                continue
+
+            if self.mark_stream_bad(mid, current_stream_id):
+                logger.warning(
+                    f"Movie {mid}: stuck buffering for {stalled_for:.0f}s at offset "
+                    f"{offset} — auto-advanced to next stream"
+                )
+                self._stall_last_switch[mid] = now
+                self._stall_watch.pop(mid, None)
+
+        # Drop stall-tracking for movies no longer actively buffering/playing.
+        for mid in list(self._stall_watch.keys()):
+            if mid not in seen_mids:
+                self._stall_watch.pop(mid, None)
+
+    def _reconcile_removed_movies(self):
+        """Clean up activated movies that no longer exist in Dispatcharr's VOD
+        catalog (e.g. dropped by an M3U account refresh).
+
+        Dispatcharr owns the Movie/M3UMovieRelation rows and deletes them
+        itself when a provider's VOD list no longer contains an item — this
+        plugin only tracks activation state on top of that. Without this
+        check, an activated movie that Dispatcharr removes leaves behind an
+        orphaned STRM folder, a stale Plex library entry, and a dead entry in
+        self._activated forever, since nothing else in the plugin re-checks
+        existence after activation time.
+        """
+        if not self._activated:
+            return
+
+        try:
+            from apps.vod.models import Movie
+        except Exception:
+            return
+
+        activated_ids = [int(mid) for mid in self._activated.keys() if mid.isdigit()]
+        if not activated_ids:
+            return
+
+        existing_ids = set(
+            str(i) for i in Movie.objects.filter(id__in=activated_ids).values_list("id", flat=True)
+        )
+        removed = [mid for mid in self._activated.keys() if mid not in existing_ids]
+        if not removed:
+            return
+
+        logger.warning(
+            f"Reconciliation: {len(removed)} activated movie(s) no longer in "
+            f"Dispatcharr's VOD catalog — removing: {removed}"
+        )
+
+        folder_hints = {mid: self._activated[mid].get("strm_folder") for mid in removed}
+        self._remove_strm_for_movies(removed, folder_hints=folder_hints)
+        self._plex_delete_movies(removed)
+
+        for mid in removed:
+            self._activated.pop(mid, None)
+        self._save_state()
+
+    def _match_session_to_movie(self, session):
+        title = session.get("title", "")
+        year = str(session.get("year", ""))
+        if not title:
+            return None
+
+        try:
+            from apps.vod.models import Movie
+        except Exception:
+            return None
+
+        for mid in self._activated.keys():
+            try:
+                movie = Movie.objects.get(id=int(mid))
+            except Exception:
+                continue
+            if self._clean_title(movie.name) != title:
+                continue
+            movie_year = str(getattr(movie, "year", "") or "")
+            if year and movie_year and year != movie_year:
+                continue
+            return mid
+        return None
 
     def _load_state(self):
         state_file = os.path.join(self._data_dir, "bridge_state.json")
@@ -625,6 +794,7 @@ class BridgeCore:
 
         if activated:
             strm_count = self._generate_strm_for_movies(activated)
+            self._save_state()
             self._trigger_plex_scan()
             return {"status": "ok", "activated": len(activated), "strm_generated": strm_count}
 
@@ -633,9 +803,11 @@ class BridgeCore:
     def deactivate_movies(self, body):
         movie_ids = body.get("movie_ids", [])
         deactivated = []
+        folder_hints = {}
         for mid in movie_ids:
             mid = str(mid)
             if mid in self._activated:
+                folder_hints[mid] = self._activated[mid].get("strm_folder")
                 del self._activated[mid]
                 deactivated.append(mid)
 
@@ -643,7 +815,7 @@ class BridgeCore:
 
         plex_removed = 0
         if deactivated:
-            self._remove_strm_for_movies(deactivated)
+            self._remove_strm_for_movies(deactivated, folder_hints=folder_hints)
             plex_removed = self._plex_delete_movies(deactivated)
 
         return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
@@ -675,6 +847,11 @@ class BridgeCore:
                     f.write(strm_url)
 
                 self._write_nfo(movie, folder, folder_name)
+                # Stored so removal (deactivation, or reconciliation when a
+                # movie disappears from Dispatcharr) never has to recompute
+                # this from a Movie row that may no longer exist.
+                if mid in self._activated:
+                    self._activated[mid]["strm_folder"] = folder_name
                 count += 1
                 logger.info(f"STRM generated: {folder_name}")
         except Exception as e:
@@ -697,26 +874,47 @@ class BridgeCore:
         except Exception:
             return None
 
-    def _remove_strm_for_movies(self, movie_ids):
+    def _remove_strm_for_movies(self, movie_ids, folder_hints=None):
+        """Delete each movie's STRM/NFO folder.
+
+        Prefers the folder name stored at activation time (folder_hints, or
+        self._activated[mid]["strm_folder"]) so removal works even if the
+        Movie row is already gone from Dispatcharr's DB (e.g. after an M3U
+        refresh drops it). Only falls back to recomputing the name from the
+        live Movie row for older activations from before strm_folder was
+        tracked.
+        """
         strm_dir = self.settings.get("strm_output_dir", "/data/strm")
+        folder_hints = folder_hints or {}
+        import shutil
         try:
             from apps.vod.models import Movie
-            import shutil
-            for mid in movie_ids:
+        except Exception:
+            Movie = None
+
+        for mid in movie_ids:
+            folder_name = folder_hints.get(mid) or self._activated.get(mid, {}).get("strm_folder")
+
+            if not folder_name and Movie is not None:
                 try:
                     movie = Movie.objects.get(id=int(mid))
-                except Movie.DoesNotExist:
-                    continue
+                    name = self._clean_title(movie.name)
+                    year = getattr(movie, "year", None)
+                    folder_name = f"{name} ({year})" if year else name
+                except Exception:
+                    folder_name = None
 
-                name = self._clean_title(movie.name)
-                year = getattr(movie, "year", None)
-                folder_name = f"{name} ({year})" if year else name
+            if not folder_name:
+                logger.warning(f"STRM removal skipped for movie {mid}: no known folder name")
+                continue
+
+            try:
                 folder = os.path.join(strm_dir, folder_name)
                 if os.path.exists(folder):
                     shutil.rmtree(folder)
                     logger.info(f"STRM removed: {folder_name}")
-        except Exception as e:
-            logger.error(f"STRM removal error: {e}")
+            except Exception as e:
+                logger.error(f"STRM removal error for {folder_name}: {e}")
 
     def _trigger_plex_scan(self):
         plex_url = self.settings.get("plex_url", "")
@@ -946,6 +1144,13 @@ class BridgeCore:
                 if str(r.stream_id) == str(cached_stream_id):
                     relation = r
                     break
+        else:
+            # Persist the resolved pick so mark_stream_bad() and the stall
+            # watchdog know which relation is actually in use, even before
+            # any explicit switch has happened.
+            entry["stream_pick"] = relation.stream_id
+            self._activated[mid] = entry
+            self._save_state()
 
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
