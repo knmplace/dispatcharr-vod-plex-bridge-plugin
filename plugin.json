@@ -91,6 +91,20 @@
       "description": "Playback uses 302 redirect to Dispatcharr's native VOD proxy. No streaming configuration needed — Dispatcharr handles connections, Range requests, and session management."
     },
     {
+      "id": "_section_maintenance",
+      "label": "Maintenance",
+      "type": "info",
+      "description": "Background checks that keep the activated library in sync with Dispatcharr's VOD catalog."
+    },
+    {
+      "id": "removed_check_interval_secs",
+      "label": "Removed-Movie Check Interval (seconds)",
+      "type": "number",
+      "default": 300,
+      "help_text": "How often the plugin checks whether activated movies still exist in Dispatcharr's catalog (e.g. after an M3U account refresh removes them). Cleans up orphaned STRM files and stale Plex entries. Minimum 10 seconds.",
+      "min": 10
+    },
+    {
       "id": "_section_language",
       "label": "Language Detection",
       "type": "info",
