@@ -1236,9 +1236,11 @@ class BridgeCore:
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
         # Bare Dispatcharr URL, no pre-resolution and no liveness probe here —
-        # Dispatcharr/rclone handle session retry on their own per Range request.
-        # Adding an HTTP pre-flight on every request just adds extra provider
-        # connections on top of whatever Dispatcharr is already doing.
+        # a HEAD request against Dispatcharr's proxy doesn't open a real
+        # streaming connection, so it can't catch a provider that accepts the
+        # connection and then stalls/buffers (the actual common failure mode
+        # here) — only the stall watchdog, which watches real Plex playback
+        # state, can detect that. See mark_stream_bad() / _check_for_stalls().
         return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None, account_id
 
     def mark_stream_bad(self, movie_id, stream_id):
