@@ -44,7 +44,7 @@ class BridgeServer:
         self._bridge = BridgeCore(self.settings)
         self._bridge.initialize()
 
-        app = _create_app(self._bridge, self.settings)
+        app = _create_app(self, self._bridge, self.settings)
         self._server = make_server("0.0.0.0", self.port, app,
                                    server_class=_ThreadedWSGIServer)
         self._running = True
@@ -64,6 +64,14 @@ class BridgeServer:
             self._bridge.cleanup()
             self._bridge = None
 
+    def request_shutdown(self):
+        """Same as shutdown(), but safe to call from a request handler
+        thread that belongs to this same server (see /api/shutdown) —
+        must run off the request thread since server.shutdown() blocks
+        until serve_forever()'s loop notices and exits, which can't
+        happen while this thread is still inside a request."""
+        self.shutdown()
+
     def is_running(self):
         return self._running
 
@@ -78,12 +86,12 @@ class BridgeServer:
         return self._bridge.generate_strm_files(settings, log)
 
 
-def _create_app(bridge, settings):
+def _create_app(server, bridge, settings):
     """Return a WSGI application with URL routing."""
 
     def app(environ, start_response):
         try:
-            return _dispatch(environ, start_response, bridge, settings)
+            return _dispatch(environ, start_response, server, bridge, settings)
         except Exception:
             logger.exception("Unhandled error in request dispatch")
             return _text_response(start_response, 500, "Internal server error")
@@ -97,12 +105,28 @@ def _create_app(bridge, settings):
     return app
 
 
-def _dispatch(environ, start_response, bridge, settings):
+def _dispatch(environ, start_response, server, bridge, settings):
     method = environ["REQUEST_METHOD"]
     path = unquote(environ.get("PATH_INFO", "/"))
 
     if path == "/api/ping" and method == "GET":
         return _json_response(start_response, {"plugin": "vod_plex_bridge"})
+
+    if path == "/api/shutdown" and method == "POST":
+        # Lets Stop Server work even when the click lands in a different
+        # worker process than the one that started the server (Celery
+        # autoscale spreads plugin action calls across processes, each
+        # with its own independent _server_instance). Rather than trying
+        # to signal/kill a foreign OS process, ask the actual owning
+        # process's server to shut itself down over loopback HTTP — this
+        # request is already proof the server is reachable from outside.
+        # request_shutdown() must run off this request's own handler
+        # thread, since server.shutdown() blocks until serve_forever()'s
+        # loop notices and exits, which can't happen while this thread
+        # is still busy handling this very request.
+        import threading as _threading
+        _threading.Thread(target=server.request_shutdown, daemon=True).start()
+        return _json_response(start_response, {"status": "ok"})
 
     # --- Dashboard ---
     if path in ("/", "/dashboard"):

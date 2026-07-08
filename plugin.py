@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import threading
+import time
 import logging
 
 logger = logging.getLogger("vod_plex_bridge")
@@ -51,6 +52,24 @@ def _is_our_server(port):
         return False
 
 
+def _request_remote_shutdown(port):
+    """Ask a server bound in a different worker process to shut itself
+    down, over loopback HTTP (see /api/shutdown in server.py). This is
+    the only reliable way to stop it: the WSGI server lives on a thread
+    inside that other process, not as its own process, so there is no
+    safe way to signal/kill it from here directly (that process also
+    runs other Celery tasks unrelated to this plugin)."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/shutdown", data=b"", method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except Exception:
+        return False
+
+
 class Plugin:
     name = _manifest["name"]
     version = _manifest["version"]
@@ -90,7 +109,8 @@ class Plugin:
     def stop(self, context):
         log = context.get("logger", logger)
         log.info("VOD To Plex plugin stopping...")
-        self._do_stop_server(log)
+        settings = context.get("settings", {})
+        self._do_stop_server(log, settings)
 
     def _start_server(self, settings, log):
         global _server_instance, _server_thread
@@ -157,9 +177,9 @@ class Plugin:
             }
 
     def _stop_server(self, settings, log):
-        return self._do_stop_server(log)
+        return self._do_stop_server(log, settings)
 
-    def _do_stop_server(self, log):
+    def _do_stop_server(self, log, settings=None):
         global _server_instance, _server_thread
         with _server_lock:
             if _server_instance is not None:
@@ -168,6 +188,34 @@ class Plugin:
                 _server_thread = None
                 log.info("VOD To Plex server stopped")
                 return {"status": "ok", "message": "Server stopped."}
+
+            # Nothing tracked in this process, but the server may actually
+            # be bound and running in a different worker process (each
+            # process has its own independent _server_instance) — Celery
+            # autoscale spreads plugin action calls across processes, so
+            # Start and Stop frequently land in different ones. Ask that
+            # server to shut itself down over loopback HTTP instead of
+            # falsely reporting "stopped"/"not running" while the
+            # dashboard stays up.
+            port = int((settings or {}).get("http_port", 8888))
+            if _port_in_use(port) and _is_our_server(port):
+                if _request_remote_shutdown(port):
+                    for _ in range(20):
+                        time.sleep(0.25)
+                        if not _port_in_use(port):
+                            log.info(f"VOD To Plex: server on port {port} (different worker process) stopped")
+                            return {"status": "ok", "message": "Server stopped."}
+                log.warning(
+                    f"VOD To Plex: Stop Server called, but the running "
+                    f"server on port {port} belongs to a different worker "
+                    f"process and did not shut down in time."
+                )
+                return {
+                    "status": "error",
+                    "message": f"Server on port {port} (different worker process) "
+                                f"did not shut down in time. Try again, or restart "
+                                f"the Dispatcharr container to fully stop it.",
+                }
             return {"status": "ok", "message": "Server was not running."}
 
     def _server_status(self, settings, log):
