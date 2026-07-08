@@ -30,7 +30,15 @@ class BridgeServer:
         self._server = None
         self._running = False
 
-    def serve(self):
+    def bind(self):
+        """Bind the listening socket synchronously, before handing off to a
+        background thread. Doing the bind here (in the caller's thread,
+        while it still holds _server_lock) closes the race where a second
+        concurrent Start Server click could see the port as free during the
+        window between spawning the server thread and that thread actually
+        calling make_server() — the DB-backed BridgeCore.initialize() below
+        used to run before the bind, making that window wide enough to hit
+        in practice."""
         from .bridge import BridgeCore
 
         self._bridge = BridgeCore(self.settings)
@@ -40,6 +48,8 @@ class BridgeServer:
         self._server = make_server("0.0.0.0", self.port, app,
                                    server_class=_ThreadedWSGIServer)
         self._running = True
+
+    def serve(self):
         logger.info(f"VOD To Plex WSGI server on :{self.port}")
         self._server.serve_forever()
         self._running = False
@@ -90,6 +100,9 @@ def _create_app(bridge, settings):
 def _dispatch(environ, start_response, bridge, settings):
     method = environ["REQUEST_METHOD"]
     path = unquote(environ.get("PATH_INFO", "/"))
+
+    if path == "/api/ping" and method == "GET":
+        return _json_response(start_response, {"plugin": "vod_plex_bridge"})
 
     # --- Dashboard ---
     if path in ("/", "/dashboard"):
