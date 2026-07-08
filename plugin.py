@@ -38,6 +38,19 @@ def _port_in_use(port):
             return True
 
 
+def _is_our_server(port):
+    """Check whether whatever is bound to `port` is this plugin's own WSGI
+    server — e.g. started by another Celery worker process, which has its
+    own independent _server_instance and won't know about this one."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("plugin") == "vod_plex_bridge"
+    except Exception:
+        return False
+
+
 class Plugin:
     name = _manifest["name"]
     version = _manifest["version"]
@@ -48,10 +61,8 @@ class Plugin:
     actions = _manifest.get("actions", [])
 
     def start(self, context):
-        settings = context.get("settings", {})
         log = context.get("logger", logger)
-        log.info("VOD To Plex plugin starting...")
-        self._start_server(settings, log)
+        log.info("VOD To Plex plugin loaded. Use the Start Server action to launch the server.")
 
     def run(self, action, params, context):
         settings = context.get("settings", {})
@@ -94,9 +105,18 @@ class Plugin:
                 }
 
             if _port_in_use(port):
-                # Something else (or a stale server this process lost track
-                # of) is bound to the port. Don't claim we started a new
-                # server when we didn't — report the real state instead.
+                # Something is bound to the port that this process's
+                # _server_instance doesn't know about — could be a genuine
+                # foreign process, or it could be our own server started by
+                # a different Celery worker process (module-level state is
+                # per-process, so each worker tracks its own instance).
+                # Ask the port itself before reporting a false conflict.
+                if _is_our_server(port):
+                    log.info(f"VOD To Plex: server already running on port {port} (another worker process)")
+                    return {
+                        "status": "ok",
+                        "message": f"✓ Server already running on port {port} (started by another worker process)",
+                    }
                 log.warning(
                     f"VOD To Plex: port {port} is already bound but not by "
                     f"our tracked instance — not starting a duplicate server"
@@ -109,7 +129,21 @@ class Plugin:
 
             from .server import BridgeServer
 
-            _server_instance = BridgeServer(port=port, settings=settings)
+            candidate = BridgeServer(port=port, settings=settings)
+            try:
+                # Bind synchronously, still holding _server_lock, so a
+                # concurrent Start Server call (e.g. a double-click) can't
+                # see the port as free during the old async-bind window.
+                candidate.bind()
+            except OSError as e:
+                log.warning(f"VOD To Plex: failed to bind port {port}: {e}")
+                return {
+                    "status": "error",
+                    "message": f"Port {port} is already in use by another process. "
+                                f"Check Status, or stop the existing process first.",
+                }
+
+            _server_instance = candidate
             _server_thread = threading.Thread(
                 target=_server_instance.serve,
                 daemon=True,
@@ -147,8 +181,15 @@ class Plugin:
                 "message": f"✓ Server running on port {port}",
             }
         if port_bound:
-            # Port is bound but not by anything this process is tracking —
-            # surface that mismatch instead of just saying "running".
+            if _is_our_server(port):
+                return {
+                    "status": "ok",
+                    "message": f"✓ Server running on port {port} (started by another worker process — "
+                                f"Stop Server from this session won't affect it).",
+                }
+            # Port is bound but not by anything this process is tracking, and
+            # it doesn't answer as our own plugin either — surface that
+            # mismatch instead of just saying "running".
             return {
                 "status": "ok",
                 "message": f"⚠ Port {port} is in use, but not by a server this "
