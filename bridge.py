@@ -77,6 +77,17 @@ class BridgeCore:
 
     def cleanup(self):
         self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            # Bound the wait: the loop only checks the stop event every 10s
+            # and may be mid-way through a Plex/DB call, so give it a window
+            # to exit cleanly rather than blocking Stop Server indefinitely.
+            self._watchdog_thread.join(timeout=15)
+            if self._watchdog_thread.is_alive():
+                logger.warning(
+                    "VOD To Plex: stall watchdog thread did not stop within "
+                    "15s of shutdown — it will keep running until it next "
+                    "wakes and observes the stop signal."
+                )
         self._save_state()
 
     def _activity_log_path(self):
