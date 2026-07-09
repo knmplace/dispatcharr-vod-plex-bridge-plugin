@@ -45,6 +45,19 @@ class BridgeCore:
     # the DB every watchdog tick (~10s).
     DEFAULT_REMOVED_CHECK_INTERVAL_SECS = 300
 
+    # Default days between automatic stream-pick refreshes for activated
+    # movies, if not overridden by the "stream_refresh_interval_days" plugin
+    # setting. Light touch only (clears the cached provider pick so the next
+    # play re-resolves fresh) — not a full deactivate/reactivate, since this
+    # runs unattended and shouldn't disrupt Plex watch state on a schedule.
+    DEFAULT_STREAM_REFRESH_INTERVAL_DAYS = 7
+
+    # Delay between each movie's refresh within one scheduled pass, so a
+    # library-wide refresh doesn't burst requests against providers all at
+    # once — spreads them out the same way a human clicking through movies
+    # one at a time would.
+    STREAM_REFRESH_DELAY_SECS = 7
+
     # Max number of activity-log entries kept (in memory and on disk) for the
     # dashboard's Logs tab. Oldest entries drop off as new ones are appended,
     # so this is also the natural archive point — a busy server with lots of
@@ -64,7 +77,21 @@ class BridgeCore:
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
         self._last_removed_check = 0.0
+        self._last_stream_refresh_check = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
+        # Running counters surfaced on the Health tab so cleanup/refresh
+        # activity is visible without digging through the activity log.
+        # Persisted in bridge_state.json alongside _activated.
+        self._maint_stats = {
+            "auto_refreshed_total": 0,
+            "manual_refreshed_total": 0,
+            "reactivated_total": 0,
+            "removed_total": 0,
+            "last_auto_refresh": None,    # {"ts", "refreshed", "skipped_playing", "names"}
+            "last_manual_refresh": None,  # {"ts", "refreshed", "names"}
+            "last_reactivate": None,      # {"ts", "reactivated", "names"}
+            "last_removed_check": None,   # {"ts", "checked", "removed", "removed_names"}
+        }
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -155,6 +182,23 @@ class BridgeCore:
                 except Exception as e:
                     logger.error(f"Removed-movie reconciliation error: {e}")
 
+            try:
+                refresh_days = float(self.settings.get(
+                    "stream_refresh_interval_days",
+                    self.DEFAULT_STREAM_REFRESH_INTERVAL_DAYS,
+                ))
+            except (TypeError, ValueError):
+                refresh_days = self.DEFAULT_STREAM_REFRESH_INTERVAL_DAYS
+
+            if refresh_days > 0:
+                refresh_secs = refresh_days * 86400
+                if now - self._last_stream_refresh_check >= refresh_secs:
+                    self._last_stream_refresh_check = now
+                    try:
+                        self._auto_refresh_stream_picks(refresh_secs)
+                    except Exception as e:
+                        logger.error(f"Scheduled stream-pick refresh error: {e}")
+
     def _check_for_stalls(self):
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
@@ -241,11 +285,22 @@ class BridgeCore:
         removed = [mid for mid in self._activated.keys() if mid not in existing_ids]
 
         if not removed:
+            self._maint_stats["last_removed_check"] = {
+                "ts": time.time(), "checked": len(activated_ids), "removed": 0,
+            }
+            self._save_state()
             self._log_event(
                 "info",
                 f"Cleanup check: {len(activated_ids)} activated movie(s) checked, none removed",
             )
             return
+
+        # Names must be resolved before removal — the movie's own catalog row
+        # is already gone at this point, so folder_hints/strm_folder (captured
+        # at activation time) is the only source left for a human-readable title.
+        removed_names = [
+            self._activated[mid].get("strm_folder", f"#{mid}") for mid in removed
+        ]
 
         logger.warning(
             f"Reconciliation: {len(removed)} activated movie(s) no longer in "
@@ -258,13 +313,167 @@ class BridgeCore:
 
         for mid in removed:
             self._activated.pop(mid, None)
+
+        self._maint_stats["removed_total"] += len(removed)
+        self._maint_stats["last_removed_check"] = {
+            "ts": time.time(), "checked": len(activated_ids), "removed": len(removed),
+            "removed_names": removed_names,
+        }
         self._save_state()
 
+        titles = ", ".join(f'"{n}"' for n in removed_names)
         self._log_event(
             "warn",
             f"Cleanup check: {len(activated_ids)} activated movie(s) checked, "
-            f"{len(removed)} removed (no longer in Dispatcharr's catalog)",
+            f"{len(removed)} removed ({titles}) — no longer in Dispatcharr's catalog",
         )
+
+    def _auto_refresh_stream_picks(self, refresh_secs):
+        """Scheduled light-touch refresh: clear the cached stream_pick for any
+        activated movie whose last refresh is older than the configured
+        interval, so the next play re-resolves via _pick_relation_with_capacity
+        instead of reusing a pick that may have quietly gone stale.
+
+        Deliberately does NOT probe stream liveness (HEAD checks gave false
+        positives in v0.1.18/v0.1.19 — a provider can accept a connection and
+        then stall, which a HEAD can't see) and does NOT touch STRM files or
+        the Plex library entry — this is scheduled/unattended, so it should
+        never risk deleting a movie or disrupting an in-progress watch. The
+        heavier full deactivate+reactivate remains a manual, deliberate action
+        via reactivate_movies().
+
+        Movies currently in an active Plex session are skipped for this pass
+        (checked again next cycle) rather than interrupting playback by
+        swapping the pick out from under it. A short delay is inserted between
+        each movie so a large library doesn't burst requests at providers all
+        at once.
+        """
+        if not self._activated:
+            return
+
+        now = time.time()
+        due = [
+            mid for mid, entry in self._activated.items()
+            if now - entry.get("last_refreshed", entry.get("activated_at", 0)) >= refresh_secs
+        ]
+        if not due:
+            return
+
+        playing_mids = self._currently_playing_movie_ids()
+
+        refreshed = 0
+        skipped_playing = 0
+        refreshed_mids = []
+        for mid in due:
+            if mid in playing_mids:
+                skipped_playing += 1
+                continue
+
+            if self._refresh_stream_pick(mid):
+                refreshed += 1
+                refreshed_mids.append(mid)
+
+            if self._watchdog_stop.wait(self.STREAM_REFRESH_DELAY_SECS):
+                break
+
+        self._maint_stats["auto_refreshed_total"] += refreshed
+        self._maint_stats["last_auto_refresh"] = {
+            "ts": time.time(), "refreshed": refreshed, "skipped_playing": skipped_playing,
+            "names": self._movie_names(refreshed_mids),
+        }
+        self._save_state()
+
+        titles = ", ".join(f'"{n}"' for n in self._movie_names(due))
+        self._log_event(
+            "info",
+            f"Scheduled stream refresh: {len(due)} movie(s) due ({titles}), {refreshed} "
+            f"refreshed, {skipped_playing} skipped (currently playing)",
+        )
+
+    def _refresh_stream_pick(self, mid):
+        """Clear the cached stream_pick for one movie so the next play
+        re-resolves fresh (honoring provider capacity via
+        _pick_relation_with_capacity in get_redirect_url). Returns True if a
+        pick was cleared."""
+        entry = self._activated.get(mid)
+        if entry is None:
+            return False
+        entry.pop("stream_pick", None)
+        entry["last_refreshed"] = time.time()
+        self._activated[mid] = entry
+        return True
+
+    def _currently_playing_movie_ids(self):
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token:
+            return set()
+        try:
+            result = self.get_plex_sessions(self.settings)
+        except Exception:
+            return set()
+        sessions = result.get("sessions", [])
+        playing = set()
+        for session in sessions:
+            if not session.get("is_bridge"):
+                continue
+            mid = self._match_session_to_movie(session)
+            if mid is not None:
+                playing.add(mid)
+        return playing
+
+    def refresh_movies(self, body):
+        """Manual per-card/bulk 'Refresh' — same light touch as the scheduled
+        job (clear cached stream_pick only), but on demand and without the
+        currently-playing skip, since a manual click is an explicit user
+        request for this specific movie right now."""
+        movie_ids = body.get("movie_ids", [])
+        refreshed = [str(mid) for mid in movie_ids if self._refresh_stream_pick(str(mid))]
+        if refreshed:
+            self._maint_stats["manual_refreshed_total"] += len(refreshed)
+            names = self._movie_names(refreshed)
+            self._maint_stats["last_manual_refresh"] = {
+                "ts": time.time(), "refreshed": len(refreshed), "names": names,
+            }
+            self._save_state()
+            titles = ", ".join(f'"{n}"' for n in names)
+            self._log_event(
+                "info",
+                f"Manual refresh: {len(refreshed)} movie(s) stream pick cleared: {titles}",
+            )
+            return {"status": "ok", "refreshed": len(refreshed), "names": names}
+        return {"status": "ok", "refreshed": 0, "names": []}
+
+    def reactivate_movies(self, body):
+        """Manual 'Reactivate' — full deactivate+reactivate for already-
+        activated movies: regenerates STRM/NFO, deletes and recreates the
+        Plex library entry, and clears the cached stream_pick. Heavier than
+        refresh_movies() and deliberately not run on a schedule (see
+        _auto_refresh_stream_picks) — this is for when a user has confirmed a
+        specific movie needs the same fix that a manual deactivate+reactivate
+        already provides."""
+        movie_ids = [str(mid) for mid in body.get("movie_ids", [])]
+        targets = [mid for mid in movie_ids if mid in self._activated]
+        if not targets:
+            return {"status": "ok", "reactivated": 0, "names": []}
+
+        self.deactivate_movies({"movie_ids": targets})
+        result = self.activate_movies({"movie_ids": targets})
+
+        reactivated = result.get("activated", 0)
+        self._maint_stats["reactivated_total"] += reactivated
+        names = self._movie_names(targets)
+        self._maint_stats["last_reactivate"] = {
+            "ts": time.time(), "reactivated": len(targets), "names": names,
+        }
+        self._save_state()
+
+        titles = ", ".join(f'"{n}"' for n in names)
+        self._log_event(
+            "info",
+            f"Reactivated {len(targets)} movie(s): {titles}",
+        )
+        return {"status": "ok", "reactivated": reactivated, "names": names}
 
     def _match_session_to_movie(self, session):
         title = session.get("title", "")
@@ -297,6 +506,7 @@ class BridgeCore:
                 with open(state_file, "r") as f:
                     state = json.load(f)
                 self._activated = state.get("activated", {})
+                self._maint_stats.update(state.get("maint_stats", {}))
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
@@ -312,7 +522,7 @@ class BridgeCore:
         state_file = os.path.join(self._data_dir, "bridge_state.json")
         try:
             with open(state_file, "w") as f:
-                json.dump({"activated": self._activated}, f)
+                json.dump({"activated": self._activated, "maint_stats": self._maint_stats}, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -793,7 +1003,7 @@ class BridgeCore:
         else:
             checks["plex"] = {"status": "unconfigured"}
 
-        return {"health": checks}
+        return {"health": checks, "maintenance": self._maint_stats}
 
     def get_plex_sessions(self, settings):
         plex_url = settings.get("plex_url", "")
@@ -867,13 +1077,15 @@ class BridgeCore:
             strm_count = self._generate_strm_for_movies(activated)
             self._save_state()
             self._trigger_plex_scan()
+            names = self._movie_names(activated)
+            titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
                 "info",
-                f"Activated {len(activated)} movie(s), generated {strm_count} STRM file(s)",
+                f"Activated {len(activated)} movie(s): {titles} — generated {strm_count} STRM file(s)",
             )
-            return {"status": "ok", "activated": len(activated), "strm_generated": strm_count}
+            return {"status": "ok", "activated": len(activated), "strm_generated": strm_count, "names": names}
 
-        return {"status": "ok", "activated": 0}
+        return {"status": "ok", "activated": 0, "names": []}
 
     def deactivate_movies(self, body):
         movie_ids = body.get("movie_ids", [])
@@ -889,15 +1101,18 @@ class BridgeCore:
         self._save_state()
 
         plex_removed = 0
+        names = []
         if deactivated:
             self._remove_strm_for_movies(deactivated, folder_hints=folder_hints)
             plex_removed = self._plex_delete_movies(deactivated)
+            names = self._movie_names(deactivated)
+            titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
                 "info",
-                f"Deactivated {len(deactivated)} movie(s), removed {plex_removed} from Plex",
+                f"Deactivated {len(deactivated)} movie(s): {titles} — removed {plex_removed} from Plex",
             )
 
-        return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
+        return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed, "names": names}
 
     def _generate_strm_for_movies(self, movie_ids):
         strm_dir = self.settings.get("strm_output_dir", "/data/strm")
@@ -1193,7 +1408,7 @@ class BridgeCore:
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
 
-    def log_play_request(self, movie_id, client_ip, ok, detail=None):
+    def log_play_request(self, movie_id, client_ip, ok, detail=None, account_id=None):
         mid = str(movie_id)
         try:
             from apps.vod.models import Movie
@@ -1202,9 +1417,74 @@ class BridgeCore:
             name = f"#{mid}"
 
         if ok:
-            self._log_event("info", f"Play request: \"{name}\" from {client_ip} — redirect OK")
+            via = f" (via {self._account_name(account_id)})" if account_id else ""
+            self._log_event("info", f"Play request: \"{name}\" from {client_ip} — redirect OK{via}")
         else:
             self._log_event("error", f"Play request: \"{name}\" from {client_ip} — FAILED: {detail}")
+
+    def _account_name(self, account_id):
+        try:
+            from apps.m3u.models import M3UAccount
+            return M3UAccount.objects.get(id=int(account_id)).name
+        except Exception:
+            return f"account #{account_id}"
+
+    def _movie_names(self, movie_ids):
+        try:
+            from apps.vod.models import Movie
+            ids = [int(m) for m in movie_ids]
+            rows = Movie.objects.filter(id__in=ids).values_list("id", "name")
+            names = {str(i): n for i, n in rows}
+            return [names.get(str(m), f"#{m}") for m in movie_ids]
+        except Exception:
+            return [f"#{m}" for m in movie_ids]
+
+    def _account_has_capacity(self, account_id):
+        """True if the given M3U account's default active profile currently
+        has a free connection slot, per Dispatcharr's own Redis-backed
+        connection pool (apps.m3u.connection_pool) — the same check
+        apps.proxy.vod_proxy.views uses before it 503s a request. Returns
+        True (assume available) if the check can't be performed for any
+        reason, so a lookup failure here never blocks playback outright —
+        worst case we're back to today's behavior for that one request.
+        """
+        try:
+            from apps.m3u.models import M3UAccountProfile
+            from apps.m3u.connection_pool import pool_has_capacity_for_profile
+            from core.utils import RedisClient
+
+            profile = M3UAccountProfile.objects.filter(
+                m3u_account_id=account_id, is_active=True
+            ).order_by("-is_default").first()
+            if profile is None:
+                return True
+
+            redis_client = RedisClient.get_client()
+            return pool_has_capacity_for_profile(profile, redis_client)
+        except Exception as e:
+            logger.debug(f"Capacity check skipped for account {account_id}: {e}")
+            return True
+
+    def _pick_relation_with_capacity(self, relations, preferred):
+        """Return `preferred` if its account has a free connection slot right
+        now, otherwise the first other relation (in DB order) whose account
+        does. Falls back to `preferred` unchanged if nothing has room, so
+        callers still get the previous behavior (and its error message)
+        rather than a new failure mode."""
+        if self._account_has_capacity(preferred.m3u_account_id):
+            return preferred
+
+        for r in relations:
+            if r is preferred:
+                continue
+            if self._account_has_capacity(r.m3u_account_id):
+                logger.info(
+                    f"Account {preferred.m3u_account_id} at capacity — "
+                    f"switching movie stream pick to account {r.m3u_account_id}"
+                )
+                return r
+
+        return preferred
 
     def get_redirect_url(self, movie_id):
         mid = str(movie_id)
@@ -1236,13 +1516,21 @@ class BridgeCore:
                 if str(r.stream_id) == str(cached_stream_id):
                     relation = r
                     break
-        else:
-            # Persist the resolved pick so mark_stream_bad() and the stall
-            # watchdog know which relation is actually in use, even before
-            # any explicit switch has happened.
-            entry["stream_pick"] = relation.stream_id
-            self._activated[mid] = entry
-            self._save_state()
+
+        # The cached/default pick's account may be at its connection-pool
+        # capacity right now (e.g. another movie already holds the provider's
+        # only slot) — Dispatcharr's own proxy would 503 on this before ever
+        # opening a stream, which the stall watchdog can't see or react to
+        # (it only advances a pick that got as far as a buffering Plex
+        # session). Check real capacity here via Dispatcharr's own
+        # Redis-backed connection pool and, if the pick is full, fall
+        # through to the next relation with room instead of re-serving a
+        # guaranteed-503 pick on every retry.
+        relation = self._pick_relation_with_capacity(relations, relation)
+
+        entry["stream_pick"] = relation.stream_id
+        self._activated[mid] = entry
+        self._save_state()
 
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"

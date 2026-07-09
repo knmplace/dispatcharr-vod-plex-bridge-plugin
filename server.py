@@ -199,6 +199,14 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.deactivate_movies(body))
 
+    if path == "/api/movies/refresh" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.refresh_movies(body))
+
+    if path == "/api/movies/reactivate" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.reactivate_movies(body))
+
     if path == "/api/strm/generate" and method == "POST":
         count = bridge.generate_strm_files(settings, logger)
         return _json_response(start_response, {"status": "ok", "count": count})
@@ -252,7 +260,7 @@ def _dispatch(environ, start_response, server, bridge, settings):
             return _text_response(start_response, status, error)
 
         logger.info(f"302 redirect: movie {movie_id} -> {redirect_url}")
-        bridge.log_play_request(movie_id, client_ip, ok=True, detail=None)
+        bridge.log_play_request(movie_id, client_ip, ok=True, detail=None, account_id=account_id)
         start_response("302 Found", [("Location", redirect_url)])
         return [b""]
 
