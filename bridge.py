@@ -445,33 +445,38 @@ class BridgeCore:
         return {"status": "ok", "refreshed": 0, "names": []}
 
     def reactivate_movies(self, body):
-        """Manual 'Reactivate' — full deactivate+reactivate for already-
-        activated movies: regenerates STRM/NFO, deletes and recreates the
-        Plex library entry, and clears the cached stream_pick. Heavier than
-        refresh_movies() and deliberately not run on a schedule (see
-        _auto_refresh_stream_picks) — this is for when a user has confirmed a
-        specific movie needs the same fix that a manual deactivate+reactivate
-        already provides."""
+        """Manual 'Reactivate' — fixes a stuck/dead stream for an already-
+        activated movie by clearing its cached stream_pick and rewriting its
+        STRM/NFO file in place (same folder/filename). Deliberately does NOT
+        touch Plex: no delete, no scan trigger. Plex sees the STRM's target
+        change on its own next scan. This is intentionally lighter than a
+        manual deactivate+activate — the previous implementation called
+        deactivate_movies()+activate_movies(), which deleted the Plex library
+        entry as a side effect once Plex delete-matching started working
+        correctly; that side effect is not wanted here, only on an explicit
+        Deactivate."""
         movie_ids = [str(mid) for mid in body.get("movie_ids", [])]
         targets = [mid for mid in movie_ids if mid in self._activated]
         if not targets:
             return {"status": "ok", "reactivated": 0, "names": []}
 
-        self.deactivate_movies({"movie_ids": targets})
-        result = self.activate_movies({"movie_ids": targets})
+        for mid in targets:
+            self._refresh_stream_pick(mid)
+        self._generate_strm_for_movies(targets)
+        self._save_state()
 
-        reactivated = result.get("activated", 0)
+        reactivated = len(targets)
         self._maint_stats["reactivated_total"] += reactivated
         names = self._movie_names(targets)
         self._maint_stats["last_reactivate"] = {
-            "ts": time.time(), "reactivated": len(targets), "names": names,
+            "ts": time.time(), "reactivated": reactivated, "names": names,
         }
         self._save_state()
 
         titles = ", ".join(f'"{n}"' for n in names)
         self._log_event(
             "info",
-            f"Reactivated {len(targets)} movie(s): {titles}",
+            f"Reactivated {reactivated} movie(s): {titles} — STRM refreshed, Plex untouched",
         )
         return {"status": "ok", "reactivated": reactivated, "names": names}
 
