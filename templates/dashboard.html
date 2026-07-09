@@ -108,6 +108,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #fff; font-size: 0.55rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
 .activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
 .movie-card:hover .activate-btn { opacity: 1; }
+.reactivate-btn { position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--amber); font-size: 0.9rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; z-index: 2; }
+.movie-card:hover .reactivate-btn { opacity: 1; }
 
 /* Trailer + lang buttons — positioned above the info panel (title+year+lang ~72px) */
 .movie-card .trailer-btn,
@@ -205,6 +207,27 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .summary-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
 .summary-label { font-size: 0.7rem; color: var(--text2); margin-top: 0.2rem; }
 
+/* Toasts */
+#toastStack { position: fixed; bottom: 1rem; right: 1rem; z-index: 999; display: flex; flex-direction: column; gap: 0.5rem; max-width: 360px; }
+.toast { background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); padding: 0.6rem 0.8rem; font-size: 0.8rem; box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: toast-in 0.15s ease-out; }
+.toast.success { border-left-color: var(--green); }
+.toast.error { border-left-color: var(--red); }
+.toast.loading { border-left-color: var(--text2); }
+.toast-title { font-weight: 600; margin-bottom: 0.15rem; }
+.toast-detail { color: var(--text2); font-size: 0.72rem; }
+@keyframes toast-in { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes toast-out { from { opacity: 1; } to { opacity: 0; transform: translateX(20px); } }
+.toast.closing { animation: toast-out 0.2s ease-in forwards; }
+
+/* Busy state — brief spinner on the element that triggered an in-flight action */
+.btn.is-busy, .activate-btn.is-busy, .reactivate-btn.is-busy { position: relative; color: transparent !important; pointer-events: none; }
+.btn.is-busy::after, .activate-btn.is-busy::after, .reactivate-btn.is-busy::after {
+  content: ""; position: absolute; top: 50%; left: 50%; width: 14px; height: 14px;
+  margin: -7px 0 0 -7px; border: 2px solid rgba(255,255,255,0.35); border-top-color: currentColor;
+  border-radius: 50%; animation: spin 0.6s linear infinite; color: var(--accent);
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* Category chips */
 .cat-list { display: flex; flex-wrap: wrap; gap: 0.3rem; }
 .cat-chip { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 0.2rem 0.6rem; font-size: 0.7rem; cursor: pointer; transition: all 0.15s; }
@@ -237,6 +260,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </style>
 </head>
 <body>
+
+<div id="toastStack"></div>
 
 <div class="trailer-modal" id="trailerModal" onclick="closeTrailer(event)">
   <span class="trailer-close" onclick="closeTrailer()">&times;</span>
@@ -280,8 +305,9 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
           <div style="display:flex;gap:0.3rem;align-items:center;">
             <button class="btn btn-primary btn-sm" onclick="selectAllMovies()">Select All</button>
             <button class="btn btn-outline btn-sm" onclick="clearAllSelections()">Clear All</button>
-            <button class="btn btn-green btn-sm" onclick="activateSelected()">Activate Selected</button>
-            <button class="btn btn-outline btn-sm" onclick="deactivateSelected()">Deactivate Selected</button>
+            <button class="btn btn-green btn-sm" id="activateSelectedBtn" onclick="activateSelected(this)">Activate Selected</button>
+            <button class="btn btn-outline btn-sm" id="deactivateSelectedBtn" onclick="deactivateSelected(this)">Deactivate Selected</button>
+            <button class="btn btn-outline btn-sm" id="reactivateSelectedBtn" onclick="reactivateSelected(this)" style="display:none;">Reactivate Selected</button>
           </div>
         </div>
         <div class="panel-body">
@@ -330,7 +356,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
               <option value="0">All</option>
             </select>
             <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
-              <input type="checkbox" id="activatedFilter" onchange="searchMovies()"> Activated Only
+              <input type="checkbox" id="activatedFilter" onchange="onActivatedFilterChange()"> Activated Only
             </label>
             <button class="btn btn-primary btn-sm" onclick="searchMovies()">Search</button>
           </div>
@@ -410,6 +436,15 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     </div>
 
     <div class="panel">
+      <div class="panel-header">
+        <span>Maintenance Activity</span>
+      </div>
+      <div class="panel-body" id="maintBody">
+        <div class="loading"><span class="spinner"></span> Loading...</div>
+      </div>
+    </div>
+
+    <div class="panel">
       <div class="panel-header">Actions</div>
       <div class="panel-body" style="display:flex;gap:0.5rem;flex-wrap:wrap;">
         <button class="btn btn-green" onclick="generateStrm()">Generate STRMs</button>
@@ -448,6 +483,49 @@ function switchTab(tab) {
 async function api(path, opts) {
   const resp = await fetch(BASE + path, opts);
   return resp.json();
+}
+
+function showToast(title, detail, kind) {
+  const stack = document.getElementById('toastStack');
+  const el = document.createElement('div');
+  el.className = `toast ${kind || 'success'}`;
+  el.innerHTML = `<div class="toast-title">${escapeHtml(title)}</div>${detail ? `<div class="toast-detail">${escapeHtml(detail)}</div>` : ''}`;
+  stack.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('closing');
+    setTimeout(() => el.remove(), 200);
+  }, 4000);
+}
+
+function namesPreview(names, fallbackCount) {
+  if (names && names.length) {
+    const shown = names.slice(0, 3).join(', ');
+    const more = names.length > 3 ? ` +${names.length - 3} more` : '';
+    return shown + more;
+  }
+  return fallbackCount != null ? `${fallbackCount} movie(s)` : '';
+}
+
+async function runMovieAction(btnEl, path, movieIds, verb) {
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const data = await api(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movie_ids: movieIds }),
+    });
+    if (data.status === 'error') {
+      showToast(`${verb} failed`, data.message || 'Unknown error', 'error');
+    } else {
+      showToast(`${verb} complete`, namesPreview(data.names, movieIds.length), 'success');
+    }
+    return data;
+  } catch (e) {
+    showToast(`${verb} failed`, String(e), 'error');
+    throw e;
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
 }
 
 function updateStickyOffsets() {
@@ -652,9 +730,14 @@ async function loadMovies(page) {
     const langBtn = `<button class="lang-btn" onclick="event.stopPropagation();detectSingleLang('${m.id}',this)" title="Detect language">&#127760;</button>`;
     const langBadge = m.language ? `<div class="movie-lang">${langName}</div>` : '<div class="movie-lang"></div>';
 
+    const reactivateBtn = m.activated
+      ? `<button class="reactivate-btn" onclick="event.stopPropagation();quickReactivate('${m.id}', this)" title="Reactivate (fixes stuck/dead stream)">&#8635;</button>`
+      : '';
+
     return `<div class="movie-card ${sel}" onclick="toggleSelect('${m.id}')" title="${m.name}${m.year ? ' ('+m.year+')' : ''}">
       ${actBadge}
-      <button class="activate-btn" onclick="event.stopPropagation();quickActivate('${m.id}',${m.activated})" title="${m.activated?'Deactivate':'Activate'}">${m.activated?'⚡':'⚡'}</button>
+      <button class="activate-btn" onclick="event.stopPropagation();quickActivate('${m.id}',${m.activated},this)" title="${m.activated?'Deactivate':'Activate'}">${m.activated?'⚡':'⚡'}</button>
+      ${reactivateBtn}
       ${trailerBtn}
       ${langBtn}
       ${poster}
@@ -679,6 +762,12 @@ async function loadMovies(page) {
 }
 
 function searchMovies() { loadMovies(1); }
+
+function onActivatedFilterChange() {
+  const activatedOnly = document.getElementById('activatedFilter').checked;
+  document.getElementById('reactivateSelectedBtn').style.display = activatedOnly ? '' : 'none';
+  searchMovies();
+}
 
 function toggleSelect(id) {
   if (selectedMovies.has(id)) selectedMovies.delete(id);
@@ -736,27 +825,41 @@ function closeTrailer(e) {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTrailer(); });
 
-async function quickActivate(id, isActive) {
+async function quickActivate(id, isActive, btnEl) {
   if (isActive) {
-    await api('/api/movies/deactivate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[id]}) });
+    await runMovieAction(btnEl, '/api/movies/deactivate', [id], 'Deactivate');
   } else {
-    await api('/api/movies/activate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[id]}) });
+    await runMovieAction(btnEl, '/api/movies/activate', [id], 'Activate');
   }
   loadMovies(currentPage);
   loadSummary();
 }
 
-async function activateSelected() {
+async function activateSelected(btnEl) {
   if (selectedMovies.size === 0) return;
-  await api('/api/movies/activate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[...selectedMovies]}) });
+  await runMovieAction(btnEl, '/api/movies/activate', [...selectedMovies], 'Activate');
   selectedMovies.clear();
   loadMovies(currentPage);
   loadSummary();
 }
 
-async function deactivateSelected() {
+async function deactivateSelected(btnEl) {
   if (selectedMovies.size === 0) return;
-  await api('/api/movies/deactivate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({movie_ids:[...selectedMovies]}) });
+  await runMovieAction(btnEl, '/api/movies/deactivate', [...selectedMovies], 'Deactivate');
+  selectedMovies.clear();
+  loadMovies(currentPage);
+  loadSummary();
+}
+
+async function quickReactivate(id, btnEl) {
+  await runMovieAction(btnEl, '/api/movies/reactivate', [id], 'Reactivate');
+  loadMovies(currentPage);
+  loadSummary();
+}
+
+async function reactivateSelected(btnEl) {
+  if (selectedMovies.size === 0) return;
+  await runMovieAction(btnEl, '/api/movies/reactivate', [...selectedMovies], 'Reactivate');
   selectedMovies.clear();
   loadMovies(currentPage);
   loadSummary();
@@ -810,6 +913,55 @@ async function loadHealth() {
     const msg = v.message ? ` — ${v.message}` : v.http_status ? ` — HTTP ${v.http_status}` : '';
     return `<div class="health-item"><span><span class="health-dot ${cls}"></span>${label}</span><span style="font-size:0.75rem;color:var(--text2)">${v.status}${msg}</span></div>`;
   }).join('');
+
+  renderMaintenance(data.maintenance || {});
+}
+
+function timeAgo(ts) {
+  if (!ts) return 'never';
+  const secs = Math.max(0, Date.now()/1000 - ts);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return Math.floor(secs/60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs/3600) + 'h ago';
+  return Math.floor(secs/86400) + 'd ago';
+}
+
+function namesLine(names) {
+  if (!names || !names.length) return '';
+  const shown = names.slice(0, 3).map(n => `"${escapeHtml(n)}"`).join(', ');
+  const more = names.length > 3 ? ` +${names.length - 3} more` : '';
+  return `<div style="font-size:0.7rem;color:var(--text2);margin-top:2px;">${shown}${more}</div>`;
+}
+
+function renderMaintenance(m) {
+  const body = document.getElementById('maintBody');
+  const rows = [];
+
+  const lastRefresh = m.last_auto_refresh;
+  const refreshDetail = lastRefresh
+    ? `${lastRefresh.refreshed} refreshed, ${lastRefresh.skipped_playing} skipped (playing) — ${timeAgo(lastRefresh.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Auto Refreshed (scheduled)<br>${namesLine(lastRefresh && lastRefresh.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.auto_refreshed_total||0} total — last: ${refreshDetail}</span></div>`);
+
+  const lastManual = m.last_manual_refresh;
+  const manualDetail = lastManual
+    ? `${lastManual.refreshed} refreshed — ${timeAgo(lastManual.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Manually Refreshed<br>${namesLine(lastManual && lastManual.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.manual_refreshed_total||0} total — last: ${manualDetail}</span></div>`);
+
+  const lastReactivate = m.last_reactivate;
+  const reactivateDetail = lastReactivate
+    ? `${lastReactivate.reactivated} reactivated — ${timeAgo(lastReactivate.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Reactivated<br>${namesLine(lastReactivate && lastReactivate.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.reactivated_total||0} total — last: ${reactivateDetail}</span></div>`);
+
+  const lastRemoved = m.last_removed_check;
+  const removedDetail = lastRemoved
+    ? `${lastRemoved.checked} checked, ${lastRemoved.removed} removed — ${timeAgo(lastRemoved.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Removed (missing from catalog)<br>${namesLine(lastRemoved && lastRemoved.removed_names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.removed_total||0} total — last: ${removedDetail}</span></div>`);
+
+  body.innerHTML = rows.join('');
 }
 
 // Actions
