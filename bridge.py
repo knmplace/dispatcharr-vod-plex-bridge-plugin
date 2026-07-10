@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 from collections import deque
@@ -87,10 +89,13 @@ class BridgeCore:
             "manual_refreshed_total": 0,
             "reactivated_total": 0,
             "removed_total": 0,
+            "audio_checked_total": 0,
+            "audio_missing_total": 0,
             "last_auto_refresh": None,    # {"ts", "refreshed", "skipped_playing", "names"}
             "last_manual_refresh": None,  # {"ts", "refreshed", "names"}
             "last_reactivate": None,      # {"ts", "reactivated", "names"}
             "last_removed_check": None,   # {"ts", "checked", "removed", "removed_names"}
+            "last_audio_check": None,     # {"ts", "movie_id", "name", "stream_id", "provider", "status"}
         }
 
     def initialize(self):
@@ -539,6 +544,87 @@ class BridgeCore:
         except Exception as e:
             logger.error(f"Failed to save language cache: {e}")
 
+    def _audio_checks(self, entry):
+        checks = entry.get("audio_checks")
+        return checks if isinstance(checks, dict) else {}
+
+    def _get_cached_audio_check(self, entry, stream_id=None):
+        if not isinstance(entry, dict):
+            return None
+        target_stream_id = str(stream_id or entry.get("stream_pick") or "")
+        if not target_stream_id:
+            return None
+        return self._audio_checks(entry).get(target_stream_id)
+
+    def _store_audio_check(self, movie_id, stream_id, result):
+        mid = str(movie_id)
+        sid = str(stream_id)
+        entry = self._activated.get(mid, {})
+        checks = self._audio_checks(entry)
+        checks[sid] = result
+        entry["audio_checks"] = checks
+        self._activated[mid] = entry
+
+    def _record_audio_probe_stats(self, movie, relation, result, persist=False):
+        mid = str(movie.id)
+        self._store_audio_check(mid, relation.stream_id, result)
+        self._maint_stats["audio_checked_total"] += 1
+        if result.get("status") == "missing":
+            self._maint_stats["audio_missing_total"] += 1
+        self._maint_stats["last_audio_check"] = {
+            "ts": result.get("checked_at"),
+            "movie_id": mid,
+            "name": movie.name,
+            "stream_id": str(relation.stream_id),
+            "provider": result.get("provider_name"),
+            "status": result.get("status"),
+        }
+        if persist:
+            self._save_state()
+
+    def _log_audio_probe_result(self, movie, relation, result):
+        audio_count = result.get("audio_stream_count")
+        codec_list = ", ".join(result.get("audio_codecs", [])) or "none"
+        self._log_event(
+            "info" if result.get("status") == "ok" else "warn",
+            f'Audio check: "{movie.name}" via {result.get("provider_name")} '
+            f'(stream {relation.stream_id}) - {result.get("status")} '
+            f"(audio={audio_count if audio_count is not None else '?'}; codecs={codec_list})",
+        )
+
+    def _current_audio_summary(self, movie_id):
+        entry = self._activated.get(str(movie_id), {})
+        cached = self._get_cached_audio_check(entry)
+        if cached:
+            return {
+                "status": cached.get("status", "unknown"),
+                "checked_at": cached.get("checked_at"),
+                "stream_id": str(cached.get("stream_id", entry.get("stream_pick", "")) or ""),
+                "provider_name": cached.get("provider_name"),
+                "audio_stream_count": cached.get("audio_stream_count"),
+                "audio_codecs": cached.get("audio_codecs", []),
+                "message": cached.get("message", ""),
+            }
+        if entry.get("stream_pick"):
+            return {
+                "status": "unknown",
+                "checked_at": None,
+                "stream_id": str(entry.get("stream_pick")),
+                "provider_name": None,
+                "audio_stream_count": None,
+                "audio_codecs": [],
+                "message": "Current stream has not been audio-checked yet",
+            }
+        return {
+            "status": "unknown",
+            "checked_at": None,
+            "stream_id": "",
+            "provider_name": None,
+            "audio_stream_count": None,
+            "audio_codecs": [],
+            "message": "No stream selected yet",
+        }
+
     def get_stats(self):
         return {
             "catalog_count": self._get_catalog_count(),
@@ -664,6 +750,7 @@ class BridgeCore:
                         "activated": mid in self._activated,
                         "trailer_key": trailer_key,
                         "language": self._languages.get(mid),
+                        "audio_check": self._current_audio_summary(mid) if mid in self._activated else None,
                     }
                 )
 
@@ -1073,7 +1160,7 @@ class BridgeCore:
         for mid in movie_ids:
             mid = str(mid)
             if mid not in self._activated:
-                self._activated[mid] = {"activated_at": time.time()}
+                self._activated[mid] = {"activated_at": time.time(), "audio_checks": {}}
                 activated.append(mid)
 
         self._save_state()
@@ -1167,11 +1254,16 @@ class BridgeCore:
             relation = movie.m3u_relations.first()
             if not relation:
                 return None
-            uuid = str(movie.uuid)
-            stream_id = relation.stream_id
-            return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}"
+            return self._build_dispatcharr_proxy_url(movie, relation, settings=s)
         except Exception:
             return None
+
+    def _build_dispatcharr_proxy_url(self, movie, relation, settings=None):
+        s = settings if settings is not None else self.settings
+        dispatcharr_url = s.get("dispatcharr_url", "").rstrip("/")
+        if not dispatcharr_url:
+            return None
+        return f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
 
     def _remove_strm_for_movies(self, movie_ids, folder_hints=None):
         """Delete each movie's STRM/NFO folder.
@@ -1434,6 +1526,297 @@ class BridgeCore:
         except Exception:
             return f"account #{account_id}"
 
+    def _resolve_relation(self, movie_id, persist_pick=False):
+        mid = str(movie_id)
+        if mid not in self._activated:
+            return None, None, None, "Movie not activated"
+
+        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
+        if not dispatcharr_url:
+            return None, None, None, "Dispatcharr URL not configured"
+
+        try:
+            from apps.vod.models import Movie
+            movie = Movie.objects.get(id=int(mid))
+        except Exception:
+            return None, None, None, "Movie not found"
+
+        relations = list(movie.m3u_relations.all())
+        if not relations:
+            return movie, None, None, "No stream mapping for movie"
+
+        entry = self._activated.get(mid, {})
+        cached_stream_id = entry.get("stream_pick")
+        relation = relations[0]
+        if cached_stream_id is not None:
+            for r in relations:
+                if str(r.stream_id) == str(cached_stream_id):
+                    relation = r
+                    break
+
+        relation = self._pick_relation_with_capacity(relations, relation)
+
+        if persist_pick:
+            entry["stream_pick"] = relation.stream_id
+            self._activated[mid] = entry
+            self._save_state()
+
+        return movie, relation, entry, None
+
+    def _probe_audio_for_relation(self, movie, relation):
+        stream_id = str(relation.stream_id)
+        account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
+        provider_name = self._account_name(account_id)
+        started = time.time()
+        result = {
+            "status": "unknown",
+            "checked_at": started,
+            "stream_id": stream_id,
+            "account_id": account_id,
+            "provider_name": provider_name,
+            "audio_stream_count": None,
+            "audio_codecs": [],
+            "video_stream_count": None,
+            "format_name": None,
+            "message": "",
+            "method": "ffprobe",
+        }
+
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            result["status"] = "probe_failed"
+            result["message"] = "ffprobe is not installed in the plugin runtime"
+            return result
+
+        url = self._build_dispatcharr_proxy_url(movie, relation)
+        if not url:
+            result["status"] = "probe_failed"
+            result["message"] = "Dispatcharr URL not configured"
+            return result
+
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-rw_timeout", "5000000",
+            "-probesize", "262144",
+            "-analyzeduration", "1000000",
+            "-show_entries", "stream=index,codec_type,codec_name,channels:format=format_name",
+            "-of", "json",
+            url,
+        ]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            result["status"] = "probe_failed"
+            result["message"] = "ffprobe timed out while probing the stream"
+            return result
+        except Exception as e:
+            result["status"] = "probe_failed"
+            result["message"] = f"ffprobe execution failed: {e}"
+            return result
+
+        if proc.returncode != 0:
+            result["status"] = "probe_failed"
+            result["message"] = (proc.stderr or proc.stdout or "ffprobe failed").strip()[:240]
+            return result
+
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except Exception as e:
+            result["status"] = "probe_failed"
+            result["message"] = f"Invalid ffprobe JSON: {e}"
+            return result
+
+        streams = data.get("streams", []) or []
+        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+        video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        audio_codecs = sorted({s.get("codec_name", "") for s in audio_streams if s.get("codec_name")})
+
+        result["audio_stream_count"] = len(audio_streams)
+        result["video_stream_count"] = len(video_streams)
+        result["audio_codecs"] = audio_codecs
+        result["format_name"] = ((data.get("format") or {}).get("format_name") or "")
+        result["status"] = "ok" if audio_streams else "missing"
+        result["message"] = (
+            f"Detected {len(audio_streams)} audio stream(s)"
+            if audio_streams else
+            "No audio streams detected"
+        )
+        return result
+
+    def check_movie_audio(self, body):
+        movie_ids = body.get("movie_ids", [])
+        if not movie_ids:
+            return {"status": "error", "message": "No movie_ids provided"}
+
+        mid = str(movie_ids[0])
+        movie, relation, _entry, error = self._resolve_relation(mid, persist_pick=True)
+        if error:
+            return {"status": "error", "message": error}
+
+        result = self._probe_audio_for_relation(movie, relation)
+        self._store_audio_check(mid, relation.stream_id, result)
+        self._maint_stats["audio_checked_total"] += 1
+        if result.get("status") == "missing":
+            self._maint_stats["audio_missing_total"] += 1
+        self._maint_stats["last_audio_check"] = {
+            "ts": result.get("checked_at"),
+            "movie_id": mid,
+            "name": movie.name,
+            "stream_id": str(relation.stream_id),
+            "provider": result.get("provider_name"),
+            "status": result.get("status"),
+        }
+        self._save_state()
+
+        audio_count = result.get("audio_stream_count")
+        codec_list = ", ".join(result.get("audio_codecs", [])) or "none"
+        self._log_event(
+            "info" if result.get("status") == "ok" else "warn",
+            f'Audio check: "{movie.name}" via {result.get("provider_name")} '
+            f'(stream {relation.stream_id}) — {result.get("status")} '
+            f"(audio={audio_count if audio_count is not None else '?'}; codecs={codec_list})",
+        )
+
+        return {
+            "status": "ok",
+            "movie_id": mid,
+            "name": movie.name,
+            "audio_check": result,
+        }
+
+    def activate_movies(self, body):
+        movie_ids = body.get("movie_ids", [])
+        if not movie_ids:
+            return {"status": "error", "message": "No movie_ids provided"}
+
+        activated = []
+        activated_names = []
+        failed = []
+        failed_names = []
+        try:
+            from apps.vod.models import Movie
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        for mid in movie_ids:
+            mid = str(mid)
+            if mid in self._activated:
+                continue
+
+            try:
+                movie = Movie.objects.get(id=int(mid))
+            except Exception:
+                failed.append({"id": mid, "name": f"#{mid}", "message": "Movie not found"})
+                failed_names.append(f"#{mid}")
+                continue
+
+            relations = list(movie.m3u_relations.all())
+            if not relations:
+                failed.append({"id": mid, "name": movie.name, "message": "No stream mapping for movie"})
+                failed_names.append(movie.name)
+                continue
+
+            chosen_relation = None
+            audio_checks = {}
+            for relation in relations:
+                result = self._probe_audio_for_relation(movie, relation)
+                audio_checks[str(relation.stream_id)] = result
+                self._record_audio_probe_stats(movie, relation, result, persist=False)
+                self._log_audio_probe_result(movie, relation, result)
+                if result.get("status") == "ok":
+                    chosen_relation = relation
+                    break
+
+            if chosen_relation is None:
+                failed.append({
+                    "id": mid,
+                    "name": movie.name,
+                    "message": "No provider stream with detectable audio found",
+                })
+                failed_names.append(movie.name)
+                continue
+
+            self._activated[mid] = {
+                "activated_at": time.time(),
+                "audio_checks": audio_checks,
+                "stream_pick": chosen_relation.stream_id,
+            }
+            activated.append(mid)
+            activated_names.append(movie.name)
+
+        self._save_state()
+
+        if activated:
+            strm_count = self._generate_strm_for_movies(activated)
+            self._save_state()
+            self._trigger_plex_scan()
+            names = activated_names or self._movie_names(activated)
+            titles = ", ".join(f'"{n}"' for n in names)
+            self._log_event(
+                "info",
+                f'Activated {len(activated)} movie(s): {titles} - generated {strm_count} STRM file(s)',
+            )
+            if failed:
+                failed_titles = ", ".join(f'"{n}"' for n in failed_names)
+                self._log_event(
+                    "warn",
+                    f"Activation skipped {len(failed)} movie(s) with no detectable audio: {failed_titles}",
+                )
+            return {
+                "status": "ok",
+                "activated": len(activated),
+                "strm_generated": strm_count,
+                "names": names,
+                "failed": failed,
+                "failed_names": failed_names,
+            }
+
+        if failed:
+            failed_titles = ", ".join(f'"{n}"' for n in failed_names)
+            self._log_event(
+                "warn",
+                f"Activation failed: no detectable audio on any provider for {len(failed)} movie(s): {failed_titles}",
+            )
+            return {
+                "status": "error",
+                "message": "No provider stream with detectable audio found",
+                "activated": 0,
+                "names": [],
+                "failed": failed,
+                "failed_names": failed_names,
+            }
+
+        return {"status": "ok", "activated": 0, "names": [], "failed": []}
+
+    def check_movie_audio(self, body):
+        movie_ids = body.get("movie_ids", [])
+        if not movie_ids:
+            return {"status": "error", "message": "No movie_ids provided"}
+
+        mid = str(movie_ids[0])
+        movie, relation, _entry, error = self._resolve_relation(mid, persist_pick=True)
+        if error:
+            return {"status": "error", "message": error}
+
+        result = self._probe_audio_for_relation(movie, relation)
+        self._record_audio_probe_stats(movie, relation, result, persist=True)
+        self._log_audio_probe_result(movie, relation, result)
+
+        return {
+            "status": "ok",
+            "movie_id": mid,
+            "name": movie.name,
+            "audio_check": result,
+        }
+
     def _movie_names(self, movie_ids):
         try:
             from apps.vod.models import Movie
@@ -1492,50 +1875,9 @@ class BridgeCore:
         return preferred
 
     def get_redirect_url(self, movie_id):
-        mid = str(movie_id)
-        if mid not in self._activated:
-            return None, "Movie not activated", None
-
-        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
-        if not dispatcharr_url:
-            return None, "Dispatcharr URL not configured", None
-
-        try:
-            from apps.vod.models import Movie
-            movie = Movie.objects.get(id=int(mid))
-        except Exception:
-            return None, "Movie not found", None
-
-        uuid = str(movie.uuid)
-        relations = list(movie.m3u_relations.all())
-        if not relations:
-            return None, "No stream mapping for movie", None
-
-        # Prefer the cached last-known-good relation if this movie has more than
-        # one mapping and a previous play already picked one that worked.
-        entry = self._activated.get(mid, {})
-        cached_stream_id = entry.get("stream_pick")
-        relation = relations[0]
-        if cached_stream_id is not None:
-            for r in relations:
-                if str(r.stream_id) == str(cached_stream_id):
-                    relation = r
-                    break
-
-        # The cached/default pick's account may be at its connection-pool
-        # capacity right now (e.g. another movie already holds the provider's
-        # only slot) — Dispatcharr's own proxy would 503 on this before ever
-        # opening a stream, which the stall watchdog can't see or react to
-        # (it only advances a pick that got as far as a buffering Plex
-        # session). Check real capacity here via Dispatcharr's own
-        # Redis-backed connection pool and, if the pick is full, fall
-        # through to the next relation with room instead of re-serving a
-        # guaranteed-503 pick on every retry.
-        relation = self._pick_relation_with_capacity(relations, relation)
-
-        entry["stream_pick"] = relation.stream_id
-        self._activated[mid] = entry
-        self._save_state()
+        movie, relation, _entry, error = self._resolve_relation(movie_id, persist_pick=True)
+        if error:
+            return None, error, None
 
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
@@ -1545,7 +1887,7 @@ class BridgeCore:
         # connection and then stalls/buffers (the actual common failure mode
         # here) — only the stall watchdog, which watches real Plex playback
         # state, can detect that. See mark_stream_bad() / _check_for_stalls().
-        return f"{dispatcharr_url}/proxy/vod/movie/{uuid}?stream_id={stream_id}", None, account_id
+        return self._build_dispatcharr_proxy_url(movie, relation), None, account_id
 
     def mark_stream_bad(self, movie_id, stream_id):
         """Advance the cached stream pick to the next available relation for a
