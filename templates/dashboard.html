@@ -105,11 +105,32 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .movie-info { padding: 0.4rem 0.5rem; }
 .movie-title { font-size: 0.75rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .movie-year { font-size: 0.65rem; color: var(--text2); }
-.movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #fff; font-size: 0.55rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #000; font-size: 0.55rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
 .activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
 .movie-card:hover .activate-btn { opacity: 1; }
 .reactivate-btn { position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--amber); font-size: 0.9rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; z-index: 2; }
 .movie-card:hover .reactivate-btn { opacity: 1; }
+.audio-btn {
+  position: absolute;
+  top: 4px;
+  right: 50px;
+  background: rgba(0,0,0,0.78);
+  border: none;
+  font-size: 0.8rem;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 3px 7px;
+  z-index: 3;
+  color: var(--amber);
+  opacity: 0.95;
+  transition: transform 0.15s, background 0.15s, color 0.15s;
+}
+.audio-btn:hover { transform: translateY(-1px); }
+.audio-btn.ok { color: var(--green); }
+.audio-btn.missing { color: var(--amber); }
+.audio-btn.probe_failed { color: var(--amber); }
+.audio-btn.unknown { color: var(--amber); }
+.audio-btn svg { display: block; width: 14px; height: 14px; fill: currentColor; }
 
 /* Trailer + lang buttons — positioned above the info panel (title+year+lang ~72px) */
 .movie-card .trailer-btn,
@@ -220,8 +241,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .toast.closing { animation: toast-out 0.2s ease-in forwards; }
 
 /* Busy state — brief spinner on the element that triggered an in-flight action */
-.btn.is-busy, .activate-btn.is-busy, .reactivate-btn.is-busy { position: relative; color: transparent !important; pointer-events: none; }
-.btn.is-busy::after, .activate-btn.is-busy::after, .reactivate-btn.is-busy::after {
+.btn.is-busy, .activate-btn.is-busy, .reactivate-btn.is-busy, .audio-btn.is-busy { position: relative; color: transparent !important; pointer-events: none; }
+.btn.is-busy::after, .activate-btn.is-busy::after, .reactivate-btn.is-busy::after, .audio-btn.is-busy::after {
   content: ""; position: absolute; top: 50%; left: 50%; width: 14px; height: 14px;
   margin: -7px 0 0 -7px; border: 2px solid rgba(255,255,255,0.35); border-top-color: currentColor;
   border-radius: 50%; animation: spin 0.6s linear infinite; color: var(--accent);
@@ -733,9 +754,18 @@ async function loadMovies(page) {
     const reactivateBtn = m.activated
       ? `<button class="reactivate-btn" onclick="event.stopPropagation();quickReactivate('${m.id}', this)" title="Reactivate (fixes stuck/dead stream)">&#8635;</button>`
       : '';
+    const audio = m.audio_check || null;
+    const audioStatus = audio && audio.status ? audio.status : 'unknown';
+    const providerText = audio && audio.provider_name ? ` via ${audio.provider_name}` : '';
+    const streamText = audio && audio.stream_id ? ` (stream ${audio.stream_id})` : '';
+    const audioMessage = audio && audio.message ? audio.message : 'Click to check audio on the current provider stream';
+    const audioBtn = m.activated
+      ? `<button class="audio-btn ${audioStatus}" onclick="event.stopPropagation();quickAudioCheck('${m.id}', this)" title="Audio check${providerText}${streamText}: ${audioMessage}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3.23v17.54c0 .4-.46.62-.78.37L7.68 17H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3.68l5.54-4.14c.32-.25.78-.02.78.37ZM16.5 8.5a1 1 0 0 1 1.41 0A5 5 0 0 1 19.4 12a5 5 0 0 1-1.49 3.5 1 1 0 1 1-1.41-1.41A3 3 0 0 0 17.4 12a3 3 0 0 0-.9-2.09 1 1 0 0 1 0-1.41Zm2.83-2.83a1 1 0 0 1 1.41 0A9 9 0 0 1 23.4 12a9 9 0 0 1-2.66 6.33 1 1 0 1 1-1.41-1.41A7 7 0 0 0 21.4 12a7 7 0 0 0-2.07-4.91 1 1 0 0 1 0-1.42Z"/></svg></button>`
+      : '';
 
     return `<div class="movie-card ${sel}" onclick="toggleSelect('${m.id}')" title="${m.name}${m.year ? ' ('+m.year+')' : ''}">
       ${actBadge}
+      ${audioBtn}
       <button class="activate-btn" onclick="event.stopPropagation();quickActivate('${m.id}',${m.activated},this)" title="${m.activated?'Deactivate':'Activate'}">${m.activated?'⚡':'⚡'}</button>
       ${reactivateBtn}
       ${trailerBtn}
@@ -857,6 +887,36 @@ async function quickReactivate(id, btnEl) {
   loadSummary();
 }
 
+async function quickAudioCheck(id, btnEl) {
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const data = await api('/api/movies/check-audio', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movie_ids: [id] }),
+    });
+    if (data.status === 'error') {
+      showToast('Audio check failed', data.message || 'Unknown error', 'error');
+      return;
+    }
+
+    const check = data.audio_check || {};
+    const status = check.status || 'unknown';
+    const provider = check.provider_name || 'unknown provider';
+    const streamId = check.stream_id ? `stream ${check.stream_id}` : 'unknown stream';
+    const detail = check.message || 'Audio check completed';
+    const codecs = (check.audio_codecs || []).length ? ` | codecs: ${(check.audio_codecs || []).join(', ')}` : '';
+    const toastKind = status === 'ok' ? 'success' : status === 'unknown' ? 'loading' : 'error';
+    showToast(`Audio ${status}`, `${provider} / ${streamId} | ${detail}${codecs}`, toastKind);
+    loadMovies(currentPage);
+    if (document.getElementById('pane-health').classList.contains('active')) loadHealth();
+  } catch (e) {
+    showToast('Audio check failed', String(e), 'error');
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
 async function reactivateSelected(btnEl) {
   if (selectedMovies.size === 0) return;
   await runMovieAction(btnEl, '/api/movies/reactivate', [...selectedMovies], 'Reactivate');
@@ -960,6 +1020,12 @@ function renderMaintenance(m) {
     ? `${lastRemoved.checked} checked, ${lastRemoved.removed} removed — ${timeAgo(lastRemoved.ts)}`
     : 'not run yet';
   rows.push(`<div class="health-item"><span>Removed (missing from catalog)<br>${namesLine(lastRemoved && lastRemoved.removed_names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.removed_total||0} total — last: ${removedDetail}</span></div>`);
+
+  const lastAudio = m.last_audio_check;
+  const audioDetail = lastAudio
+    ? `${lastAudio.status} via ${escapeHtml(lastAudio.provider || 'unknown provider')} (stream ${escapeHtml(String(lastAudio.stream_id || '?'))}) — ${timeAgo(lastAudio.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Audio Checks</span><span style="font-size:0.75rem;color:var(--text2)">${m.audio_checked_total||0} total, ${m.audio_missing_total||0} missing — last: ${audioDetail}</span></div>`);
 
   body.innerHTML = rows.join('');
 }

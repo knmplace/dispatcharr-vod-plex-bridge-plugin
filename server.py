@@ -207,6 +207,10 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.reactivate_movies(body))
 
+    if path == "/api/movies/check-audio" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.check_movie_audio(body))
+
     if path == "/api/strm/generate" and method == "POST":
         count = bridge.generate_strm_files(settings, logger)
         return _json_response(start_response, {"status": "ok", "count": count})
@@ -277,6 +281,9 @@ def _serve_dashboard(environ, start_response):
         start_response("200 OK", [
             ("Content-Type", "text/html; charset=utf-8"),
             ("Content-Length", str(len(body))),
+            ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+            ("Pragma", "no-cache"),
+            ("Expires", "0"),
         ])
         return [body]
     except FileNotFoundError:
@@ -314,6 +321,9 @@ def _json_response(start_response, data, status=200):
         ("Content-Type", "application/json"),
         ("Content-Length", str(len(body))),
         ("Access-Control-Allow-Origin", "*"),
+        ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+        ("Pragma", "no-cache"),
+        ("Expires", "0"),
     ])
     return [body]
 
