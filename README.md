@@ -128,10 +128,6 @@ vod_plex_bridge/
     └── dashboard.html  # Web dashboard (Browse, Streams, Health tabs)
 ```
 
-## Troubleshooting
-
-See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — covers the common "activated a movie, STRM files exist, but Plex doesn't show it" scenario.
-
 ## Known Limitations
 
 - **No connection gating** — bulk activation + Plex scan can trigger many provider connections. Recommend setting Plex library analysis to Manual.
