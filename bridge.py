@@ -207,6 +207,13 @@ class BridgeCore:
                     except Exception as e:
                         logger.error(f"Scheduled stream-pick refresh error: {e}")
 
+            # Background stream revalidation is disabled entirely (feature
+            # flagged off pending investigation into a suspected link with
+            # Dispatcharr VOD proxy connections getting stuck at near-zero
+            # progress — see PLUGIN_SUMMARY.md incident log, 2026-07-11).
+            # Deliberately does not read revalidation_interval_secs at all
+            # so a stray configure_plugin write can't silently re-enable it.
+
     def _check_for_stalls(self):
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
