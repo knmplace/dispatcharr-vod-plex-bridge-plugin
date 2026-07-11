@@ -481,13 +481,6 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       </div>
     </div>
 
-    <div class="panel">
-      <div class="panel-header">Actions</div>
-      <div class="panel-body" style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-        <button class="btn btn-green" onclick="generateStrm()">Generate STRMs</button>
-        <button class="btn btn-primary" onclick="scanPlex()">Scan Plex Library</button>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -1064,16 +1057,6 @@ function renderMaintenance(m) {
 }
 
 // Actions
-async function generateStrm() {
-  const data = await api('/api/strm/generate', { method: 'POST' });
-  alert(data.count !== undefined ? `Generated ${data.count} STRM files` : data.message || data.error);
-}
-
-async function scanPlex() {
-  const data = await api('/api/plex/scan', { method: 'POST' });
-  alert(data.message || data.error || 'Done');
-}
-
 // Utils
 function formatBytes(b) {
   if (b < 1024) return b + ' B';

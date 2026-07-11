@@ -170,22 +170,6 @@
       "button_label": "Status",
       "button_variant": "outline",
       "button_color": "blue"
-    },
-    {
-      "id": "generate_strm",
-      "label": "Generate STRM Files",
-      "description": "Generate .strm and .nfo files for all activated movies.",
-      "button_label": "Generate STRMs",
-      "button_variant": "filled",
-      "button_color": "green"
-    },
-    {
-      "id": "scan_plex",
-      "label": "Scan Plex Library",
-      "description": "Trigger a Plex library scan to pick up new STRM files.",
-      "button_label": "Scan Plex",
-      "button_variant": "outline",
-      "button_color": "blue"
     }
   ]
 }
