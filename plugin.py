@@ -92,8 +92,6 @@ class Plugin:
             "stop_server": self._stop_server,
             "server_status": self._server_status,
             "open_dashboard": self._open_dashboard,
-            "generate_strm": self._generate_strm,
-            "scan_plex": self._scan_plex,
         }
 
         handler = handlers.get(action)
@@ -257,41 +255,3 @@ class Plugin:
             "url": f"http://{host}:{port}/",
         }
 
-    def _generate_strm(self, settings, log):
-        with _server_lock:
-            if not _server_instance or not _server_instance.is_running():
-                return {"status": "error", "message": "Server not running. Start it first."}
-            instance = _server_instance
-        count = instance.generate_strm_files(settings, log)
-        return {
-            "status": "ok",
-            "message": f"Generated {count} STRM files.",
-        }
-
-    def _scan_plex(self, settings, log):
-        plex_url = settings.get("plex_url", "")
-        plex_token = settings.get("plex_token", "")
-        section = settings.get("plex_library_section", 7)
-
-        if not plex_url or not plex_token:
-            return {
-                "status": "error",
-                "message": "Plex URL and token required. Configure in settings.",
-            }
-
-        import requests
-
-        try:
-            resp = requests.get(
-                f"{plex_url}/library/sections/{section}/refresh",
-                headers={"X-Plex-Token": plex_token},
-                timeout=10,
-            )
-            if resp.status_code < 300:
-                return {"status": "ok", "message": "Plex library scan triggered."}
-            return {
-                "status": "error",
-                "message": f"Plex returned HTTP {resp.status_code}",
-            }
-        except Exception as e:
-            return {"status": "error", "message": f"Plex scan failed: {e}"}
