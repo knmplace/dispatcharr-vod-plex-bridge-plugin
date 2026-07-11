@@ -8,6 +8,8 @@ import threading
 import time
 from collections import deque
 
+import requests
+
 logger = logging.getLogger("vod_plex_bridge.bridge")
 
 LANG_NAMES = {
@@ -936,8 +938,6 @@ class BridgeCore:
         return {"lang_status": self._lang_status, "running": self._lang_detect_running}
 
     def _tmdb_lookup_language(self, tmdb_id, api_key, read_token=None):
-        import requests
-
         url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
         headers = {}
         params = {}
@@ -1142,8 +1142,6 @@ class BridgeCore:
         plex_token = settings.get("plex_token", "")
         if plex_url and plex_token:
             try:
-                import requests
-
                 resp = requests.get(
                     f"{plex_url}/library/sections",
                     headers={"X-Plex-Token": plex_token},
@@ -1167,7 +1165,6 @@ class BridgeCore:
             return {"sessions": [], "error": "Plex not configured"}
 
         try:
-            import requests
             from xml.etree import ElementTree
 
             resp = requests.get(
@@ -1213,34 +1210,6 @@ class BridgeCore:
             return {"sessions": sessions}
         except Exception as e:
             return {"sessions": [], "error": str(e)}
-
-    def activate_movies(self, body):
-        movie_ids = body.get("movie_ids", [])
-        if not movie_ids:
-            return {"status": "error", "message": "No movie_ids provided"}
-
-        activated = []
-        for mid in movie_ids:
-            mid = str(mid)
-            if mid not in self._activated:
-                self._activated[mid] = {"activated_at": time.time(), "audio_checks": {}}
-                activated.append(mid)
-
-        self._save_state()
-
-        if activated:
-            strm_count = self._generate_strm_for_movies(activated)
-            self._save_state()
-            self._trigger_plex_scan()
-            names = self._movie_names(activated)
-            titles = ", ".join(f'"{n}"' for n in names)
-            self._log_event(
-                "info",
-                f"Activated {len(activated)} movie(s): {titles} — generated {strm_count} STRM file(s)",
-            )
-            return {"status": "ok", "activated": len(activated), "strm_generated": strm_count, "names": names}
-
-        return {"status": "ok", "activated": 0, "names": []}
 
     def deactivate_movies(self, body):
         movie_ids = body.get("movie_ids", [])
@@ -1377,7 +1346,6 @@ class BridgeCore:
         if not plex_url or not plex_token:
             return
         try:
-            import requests
             requests.get(
                 f"{plex_url}/library/sections/{section}/refresh",
                 headers={"X-Plex-Token": plex_token},
@@ -1394,7 +1362,6 @@ class BridgeCore:
         if not plex_url or not plex_token:
             return 0
         try:
-            import requests
             resp = requests.get(
                 f"{plex_url}/library/sections/{section}/all",
                 params={"X-Plex-Token": plex_token},
@@ -2020,8 +1987,6 @@ class BridgeCore:
             return {"status": "error", "message": "Plex not configured"}
 
         try:
-            import requests
-
             resp = requests.get(
                 f"{plex_url}/library/sections/{section}/refresh",
                 headers={"X-Plex-Token": plex_token},

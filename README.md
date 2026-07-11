@@ -48,7 +48,6 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 - **Plex Now Playing** — Monitor active Plex sessions from the dashboard (bridge vs local content)
 - **Health Checks** — Dispatcharr DB and Plex connectivity status
 - **Catalog Summary** — Category chips with movie counts, quick-filter on click
-- **Zero Dependencies** — Uses Python stdlib only (no pip installs needed)
 
 ## Requirements
 
@@ -56,6 +55,7 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 - Plex Media Server
 - rclone installed on the Plex server (for the HTTP mount)
 - The plugin's HTTP port must be accessible from the Plex server
+- `requests` Python package (already present in Dispatcharr's container — no extra install needed for a standard Dispatcharr deployment)
 
 ## Installation
 
