@@ -334,18 +334,23 @@ class BridgeCore:
         )
 
     def _auto_refresh_stream_picks(self, refresh_secs):
-        """Scheduled light-touch refresh: clear the cached stream_pick for any
-        activated movie whose last refresh is older than the configured
-        interval, so the next play re-resolves via _pick_relation_with_capacity
-        instead of reusing a pick that may have quietly gone stale.
+        """Scheduled refresh: clear the cached stream_pick for any activated
+        movie whose last refresh is older than the configured interval, then
+        resolve the new pick and audio-probe it once (same ffprobe check as
+        the manual Audio Check button) so a stream_id that has gone dead
+        since activation — e.g. a provider M3U refresh silently rewriting or
+        orphaning the relation Dispatcharr had on file — gets caught and
+        auto-advanced here instead of surfacing only when a human notices
+        Plex playback is broken.
 
-        Deliberately does NOT probe stream liveness (HEAD checks gave false
-        positives in v0.1.18/v0.1.19 — a provider can accept a connection and
-        then stall, which a HEAD can't see) and does NOT touch STRM files or
-        the Plex library entry — this is scheduled/unattended, so it should
-        never risk deleting a movie or disrupting an in-progress watch. The
-        heavier full deactivate+reactivate remains a manual, deliberate action
-        via reactivate_movies().
+        This does NOT probe on every play (get_redirect_url stays untouched —
+        rclone calls it on every Range/seek request, and a probe there would
+        reintroduce the connection-holding/provider-churn problems that got
+        head/tail caching and per-request liveness probing reverted in
+        v0.1.6/v0.1.7/v0.1.9). One probe per movie per refresh interval is the
+        bounded cost accepted here. Does not touch STRM files or the Plex
+        library entry — the heavier full deactivate+reactivate remains a
+        manual, deliberate action via reactivate_movies().
 
         Movies currently in an active Plex session are skipped for this pass
         (checked again next cycle) rather than interrupting playback by
@@ -369,14 +374,18 @@ class BridgeCore:
         refreshed = 0
         skipped_playing = 0
         refreshed_mids = []
+        audio_failed_mids = []
         for mid in due:
             if mid in playing_mids:
                 skipped_playing += 1
                 continue
 
-            if self._refresh_stream_pick(mid):
+            outcome = self._refresh_stream_pick(mid)
+            if outcome:
                 refreshed += 1
                 refreshed_mids.append(mid)
+                if outcome.get("audio_status") not in ("ok", None):
+                    audio_failed_mids.append(mid)
 
             if self._watchdog_stop.wait(self.STREAM_REFRESH_DELAY_SECS):
                 break
@@ -385,6 +394,7 @@ class BridgeCore:
         self._maint_stats["last_auto_refresh"] = {
             "ts": time.time(), "refreshed": refreshed, "skipped_playing": skipped_playing,
             "names": self._movie_names(refreshed_mids),
+            "audio_failed_names": self._movie_names(audio_failed_mids),
         }
         self._save_state()
 
@@ -394,19 +404,61 @@ class BridgeCore:
             f"Scheduled stream refresh: {len(due)} movie(s) due ({titles}), {refreshed} "
             f"refreshed, {skipped_playing} skipped (currently playing)",
         )
+        if audio_failed_mids:
+            bad_titles = ", ".join(f'"{n}"' for n in self._movie_names(audio_failed_mids))
+            self._log_event(
+                "warn",
+                f"Scheduled refresh: {len(audio_failed_mids)} movie(s) had no working audio "
+                f"on every stream tried and could not be auto-fixed: {bad_titles}",
+            )
 
     def _refresh_stream_pick(self, mid):
-        """Clear the cached stream_pick for one movie so the next play
-        re-resolves fresh (honoring provider capacity via
-        _pick_relation_with_capacity in get_redirect_url). Returns True if a
-        pick was cleared."""
+        """Clear the cached stream_pick for one movie, resolve a fresh pick,
+        and audio-probe it — auto-advancing through the movie's other
+        M3UMovieRelation options (mirrors mark_stream_bad's advance logic) if
+        the first pick fails, so a dead stream_id doesn't just get silently
+        re-cached. Returns a dict with the outcome, or False if the movie
+        isn't activated / has no stream mapping."""
         entry = self._activated.get(mid)
         if entry is None:
             return False
         entry.pop("stream_pick", None)
         entry["last_refreshed"] = time.time()
         self._activated[mid] = entry
-        return True
+
+        try:
+            from apps.vod.models import Movie
+            movie = Movie.objects.get(id=int(mid))
+        except Exception:
+            return {"audio_status": None}
+
+        relations = list(movie.m3u_relations.all())
+        if not relations:
+            return {"audio_status": None}
+
+        tried_ids = set()
+        result = None
+        relation = None
+        for _ in range(len(relations)):
+            _movie, relation, _entry, error = self._resolve_relation(mid, persist_pick=True)
+            if error or relation is None:
+                break
+            if str(relation.stream_id) in tried_ids:
+                break
+            tried_ids.add(str(relation.stream_id))
+
+            result = self._probe_audio_for_relation(movie, relation)
+            self._record_audio_probe_stats(movie, relation, result, persist=False)
+            self._log_audio_probe_result(movie, relation, result)
+
+            if result.get("status") == "ok":
+                break
+
+            # Probe failed — advance past this relation and try the next one.
+            if not self.mark_stream_bad(mid, relation.stream_id):
+                break
+
+        return {"audio_status": result.get("status") if result else None}
 
     def _currently_playing_movie_ids(self):
         plex_url = self.settings.get("plex_url", "")
@@ -428,10 +480,11 @@ class BridgeCore:
         return playing
 
     def refresh_movies(self, body):
-        """Manual per-card/bulk 'Refresh' — same light touch as the scheduled
-        job (clear cached stream_pick only), but on demand and without the
-        currently-playing skip, since a manual click is an explicit user
-        request for this specific movie right now."""
+        """Manual per-card/bulk 'Refresh' — same as the scheduled job (clear
+        cached stream_pick, resolve fresh, audio-probe, auto-advance on
+        failure), but on demand and without the currently-playing skip, since
+        a manual click is an explicit user request for this specific movie
+        right now."""
         movie_ids = body.get("movie_ids", [])
         refreshed = [str(mid) for mid in movie_ids if self._refresh_stream_pick(str(mid))]
         if refreshed:
@@ -679,6 +732,7 @@ class BridgeCore:
             page = int(query.get("page", [1])[0])
             per_page = int(query.get("per_page", [50])[0])
             search = query.get("search", [""])[0]
+            director = query.get("director", [""])[0]
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
             languages = [v for v in query.get("language", []) if v]
@@ -688,6 +742,9 @@ class BridgeCore:
 
             if search:
                 qs = qs.filter(name__icontains=search)
+
+            if director:
+                qs = qs.filter(custom_properties__director__icontains=director)
 
             if languages:
                 wanted_ids = [
@@ -727,12 +784,14 @@ class BridgeCore:
                 except Exception:
                     pass
                 trailer_key = None
+                director_name = None
                 try:
                     cp = getattr(m, "custom_properties", None) or {}
                     if isinstance(cp, str):
                         import json as _json
                         cp = _json.loads(cp)
                     trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
+                    director_name = cp.get("director") or None
                 except Exception:
                     pass
 
@@ -749,6 +808,7 @@ class BridgeCore:
                         "uuid": str(getattr(m, "uuid", "")),
                         "activated": mid in self._activated,
                         "trailer_key": trailer_key,
+                        "director": director_name,
                         "language": self._languages.get(mid),
                         "audio_check": self._current_audio_summary(mid) if mid in self._activated else None,
                     }
@@ -776,6 +836,7 @@ class BridgeCore:
             from apps.vod.models import Movie
 
             search = query.get("search", [""])[0]
+            director = query.get("director", [""])[0]
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
             languages = [v for v in query.get("language", []) if v]
@@ -783,6 +844,8 @@ class BridgeCore:
             qs = Movie.objects.all()
             if search:
                 qs = qs.filter(name__icontains=search)
+            if director:
+                qs = qs.filter(custom_properties__director__icontains=director)
             if languages:
                 wanted_ids = [
                     int(mid) for mid, lang in self._languages.items()

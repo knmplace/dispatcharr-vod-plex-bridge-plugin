@@ -80,6 +80,11 @@ a { color: var(--accent); text-decoration: none; }
 .search-input { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; color: var(--text); font-size: 0.85rem; flex: 1; outline: none; }
 .search-input:focus { border-color: var(--accent); }
 select.search-input { flex: 0 0 auto; min-width: 140px; }
+.search-input-wrap { position: relative; display: flex; }
+.search-input-wrap .search-input { width: 100%; padding-right: 1.8rem; }
+.search-input-clear { position: absolute; right: 0.4rem; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text2); font-size: 1rem; line-height: 1; cursor: pointer; padding: 0.15rem 0.3rem; display: none; }
+.search-input-clear:hover { color: var(--text); }
+.search-input-wrap.has-value .search-input-clear { display: block; }
 
 /* Multi-select dropdown */
 .ms-dropdown { position: relative; flex: 0 0 auto; min-width: 160px; }
@@ -347,7 +352,18 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
             <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
           </div>
           <div class="search-bar">
-            <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." onkeyup="if(event.key==='Enter')searchMovies()">
+            <div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:200px;">
+              <label for="searchInput" style="font-size:0.72rem;color:var(--text);font-weight:600;">Search Movies</label>
+              <div class="search-input-wrap" id="searchInputWrap">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." oninput="onSearchBoxInput('searchInput')" onkeyup="if(event.key==='Enter')searchMovies()">
+                <button type="button" class="search-input-clear" onclick="clearSearchBox('searchInput')" title="Clear">&times;</button>
+              </div>
+              <label for="directorInput" style="font-size:0.72rem;color:var(--text);font-weight:600;margin-top:4px;">Search Directors</label>
+              <div class="search-input-wrap" id="directorInputWrap">
+                <input type="text" class="search-input" id="directorInput" placeholder="Search directors..." oninput="onSearchBoxInput('directorInput')" onkeyup="if(event.key==='Enter')searchMovies()">
+                <button type="button" class="search-input-clear" onclick="clearSearchBox('directorInput')" title="Clear">&times;</button>
+              </div>
+            </div>
             <div class="ms-dropdown" id="provDropdown">
               <div class="ms-toggle" onclick="toggleMsPanel('prov')">
                 <span id="provLabel">All Providers</span>
@@ -711,6 +727,7 @@ function filterByCategory(catId) {
 async function loadMovies(page) {
   currentPage = page || 1;
   const search = document.getElementById('searchInput').value;
+  const director = document.getElementById('directorInput').value;
   const ppSel = document.getElementById('perPageSel');
   const perPage = parseInt(ppSel.value) || 0;
   const activatedOnly = document.getElementById('activatedFilter').checked;
@@ -719,6 +736,7 @@ async function loadMovies(page) {
   if (perPage > 0) url += `&per_page=${perPage}`;
   else url += '&per_page=999999';
   if (search) url += `&search=${encodeURIComponent(search)}`;
+  if (director) url += `&director=${encodeURIComponent(director)}`;
   const provP = msParams('prov');
   if (provP) url += '&' + provP;
   const catP = msParams('cat');
@@ -793,6 +811,19 @@ async function loadMovies(page) {
 
 function searchMovies() { loadMovies(1); }
 
+function onSearchBoxInput(inputId) {
+  const input = document.getElementById(inputId);
+  const wrap = document.getElementById(inputId + 'Wrap');
+  wrap.classList.toggle('has-value', input.value.length > 0);
+}
+
+function clearSearchBox(inputId) {
+  const input = document.getElementById(inputId);
+  input.value = '';
+  document.getElementById(inputId + 'Wrap').classList.remove('has-value');
+  searchMovies();
+}
+
 function onActivatedFilterChange() {
   const activatedOnly = document.getElementById('activatedFilter').checked;
   document.getElementById('reactivateSelectedBtn').style.display = activatedOnly ? '' : 'none';
@@ -822,8 +853,10 @@ function updateSelectionUI() {
 
 async function selectAllMovies() {
   const search = document.getElementById('searchInput').value;
+  const director = document.getElementById('directorInput').value;
   let url = '/api/movies/all-ids?';
   if (search) url += `search=${encodeURIComponent(search)}&`;
+  if (director) url += `director=${encodeURIComponent(director)}&`;
   const provP = msParams('prov');
   if (provP) url += provP + '&';
   const catP = msParams('cat');
@@ -1023,7 +1056,7 @@ function renderMaintenance(m) {
 
   const lastAudio = m.last_audio_check;
   const audioDetail = lastAudio
-    ? `${lastAudio.status} via ${escapeHtml(lastAudio.provider || 'unknown provider')} (stream ${escapeHtml(String(lastAudio.stream_id || '?'))}) — ${timeAgo(lastAudio.ts)}`
+    ? `"${escapeHtml(lastAudio.name || '#' + lastAudio.movie_id)}" — ${lastAudio.status} via ${escapeHtml(lastAudio.provider || 'unknown provider')} (stream ${escapeHtml(String(lastAudio.stream_id || '?'))}) — ${timeAgo(lastAudio.ts)}`
     : 'not run yet';
   rows.push(`<div class="health-item"><span>Audio Checks</span><span style="font-size:0.75rem;color:var(--text2)">${m.audio_checked_total||0} total, ${m.audio_missing_total||0} missing — last: ${audioDetail}</span></div>`);
 
