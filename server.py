@@ -257,14 +257,14 @@ def _dispatch(environ, start_response, server, bridge, settings):
 
         client_ip = environ.get("REMOTE_ADDR", "unknown")
 
-        redirect_url, error, account_id = bridge.get_redirect_url(movie_id)
+        redirect_url, error, account_id, stream_id = bridge.get_redirect_url(movie_id)
         if error:
             status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
             bridge.log_play_request(movie_id, client_ip, ok=False, detail=error)
             return _text_response(start_response, status, error)
 
         logger.info(f"302 redirect: movie {movie_id} -> {redirect_url}")
-        bridge.log_play_request(movie_id, client_ip, ok=True, detail=None, account_id=account_id)
+        bridge.log_play_request(movie_id, client_ip, ok=True, detail=None, account_id=account_id, stream_id=stream_id)
         start_response("302 Found", [("Location", redirect_url)])
         return [b""]
 

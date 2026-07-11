@@ -77,6 +77,7 @@ class BridgeCore:
         self._lang_status = ""
         self._stall_watch = {}  # movie_id -> {"view_offset": int, "since": float}
         self._stall_last_switch = {}  # movie_id -> timestamp of last auto-advance
+        self._last_play_log = {}  # (movie_id, stream_id) -> timestamp of last logged redirect
         self._watchdog_thread = None
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
@@ -1245,14 +1246,14 @@ class BridgeCore:
         os.makedirs(strm_dir, exist_ok=True)
 
         count = 0
-        try:
-            from apps.vod.models import Movie
-            for mid in movie_ids:
-                try:
-                    movie = Movie.objects.get(id=int(mid))
-                except Movie.DoesNotExist:
-                    continue
+        from apps.vod.models import Movie
+        for mid in movie_ids:
+            try:
+                movie = Movie.objects.get(id=int(mid))
+            except Movie.DoesNotExist:
+                continue
 
+            try:
                 name = self._clean_title(movie.name)
                 year = getattr(movie, "year", None)
                 folder_name = f"{name} ({year})" if year else name
@@ -1272,8 +1273,9 @@ class BridgeCore:
                     self._activated[mid]["strm_folder"] = folder_name
                 count += 1
                 logger.info(f"STRM generated: {folder_name}")
-        except Exception as e:
-            logger.error(f"STRM generation error: {e}")
+            except Exception as e:
+                logger.error(f"STRM generation failed for movie {mid} ({movie.name}): {e}")
+                self._log_event("error", f'STRM generation failed for "{movie.name}" (id={mid}): {e}')
         return count
 
     def _get_dispatcharr_stream_url(self, movie, settings=None):
@@ -1535,7 +1537,14 @@ class BridgeCore:
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
 
-    def log_play_request(self, movie_id, client_ip, ok, detail=None, account_id=None):
+    # Repeated redirects for the same (movie_id, stream_id) within this window
+    # are collapsed into a single activity-log line — rclone re-hits
+    # get_redirect_url() on every Range/seek request during one playback, so
+    # without this a single movie can produce dozens of near-identical
+    # "redirect OK" lines that bury real signal in the activity log.
+    PLAY_LOG_DEDUP_SECS = 60
+
+    def log_play_request(self, movie_id, client_ip, ok, detail=None, account_id=None, stream_id=None):
         mid = str(movie_id)
         try:
             from apps.vod.models import Movie
@@ -1544,10 +1553,16 @@ class BridgeCore:
             name = f"#{mid}"
 
         if ok:
+            key = (mid, str(stream_id))
+            now = time.time()
+            last = self._last_play_log.get(key)
+            if last is not None and (now - last) < self.PLAY_LOG_DEDUP_SECS:
+                return
+            self._last_play_log[key] = now
             via = f" (via {self._account_name(account_id)})" if account_id else ""
-            self._log_event("info", f"Play request: \"{name}\" from {client_ip} — redirect OK{via}")
+            self._log_event("info", f"Play request: \"{name}\" (id={mid}) from {client_ip} — redirect OK{via}")
         else:
-            self._log_event("error", f"Play request: \"{name}\" from {client_ip} — FAILED: {detail}")
+            self._log_event("error", f"Play request: \"{name}\" (id={mid}) from {client_ip} — FAILED: {detail}")
 
     def _account_name(self, account_id):
         try:
@@ -1569,10 +1584,12 @@ class BridgeCore:
             from apps.vod.models import Movie
             movie = Movie.objects.get(id=int(mid))
         except Exception:
+            logger.warning(f"Movie not found: id={mid}")
             return None, None, None, "Movie not found"
 
         relations = list(movie.m3u_relations.all())
         if not relations:
+            logger.warning(f"No stream mapping for movie {mid} ({movie.name})")
             return movie, None, None, "No stream mapping for movie"
 
         entry = self._activated.get(mid, {})
@@ -1907,7 +1924,7 @@ class BridgeCore:
     def get_redirect_url(self, movie_id):
         movie, relation, _entry, error = self._resolve_relation(movie_id, persist_pick=True)
         if error:
-            return None, error, None
+            return None, error, None, None
 
         stream_id = relation.stream_id
         account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
@@ -1917,7 +1934,7 @@ class BridgeCore:
         # connection and then stalls/buffers (the actual common failure mode
         # here) — only the stall watchdog, which watches real Plex playback
         # state, can detect that. See mark_stream_bad() / _check_for_stalls().
-        return self._build_dispatcharr_proxy_url(movie, relation), None, account_id
+        return self._build_dispatcharr_proxy_url(movie, relation), None, account_id, stream_id
 
     def mark_stream_bad(self, movie_id, stream_id):
         """Advance the cached stream pick to the next available relation for a
@@ -1930,7 +1947,8 @@ class BridgeCore:
         try:
             from apps.vod.models import Movie
             movie = Movie.objects.get(id=int(mid))
-        except Exception:
+        except Exception as e:
+            logger.warning(f"mark_stream_bad: movie {mid} lookup failed: {e}")
             return False
 
         relations = list(movie.m3u_relations.all())
@@ -1953,7 +1971,8 @@ class BridgeCore:
         try:
             from apps.vod.models import Movie
             movie = Movie.objects.get(id=int(mid))
-        except Exception:
+        except Exception as e:
+            logger.warning(f"get_movie_info: movie {mid} lookup failed: {e}")
             return None
 
         info = {
