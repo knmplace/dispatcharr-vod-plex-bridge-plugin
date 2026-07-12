@@ -5,3 +5,4 @@ PLUGIN_SUMMARY_ARCHIVE_*.md
 SERIES_IMPLEMENTATION_PLAN.md
 __pycache__/
 *.pyc
+logs/

@@ -78,6 +78,9 @@ class BridgeCore:
         self._stall_watch = {}  # movie_id -> {"view_offset": int, "since": float}
         self._stall_last_switch = {}  # movie_id -> timestamp of last auto-advance
         self._last_play_log = {}  # (movie_id, stream_id) -> timestamp of last logged redirect
+        self._redirect_locks = {}  # movie_id -> threading.Lock, serializes concurrent get_redirect_url calls
+        self._redirect_locks_guard = threading.Lock()  # protects _redirect_locks dict itself
+        self._recent_redirects = {}  # movie_id -> (timestamp, redirect_url, error, account_id, stream_id)
         self._watchdog_thread = None
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
@@ -1209,9 +1212,13 @@ class BridgeCore:
                     session["bitrate"] = media.get("bitrate", "")
 
                     part = media.find("Part")
-                    if part is not None:
-                        file_path = part.get("file", "")
-                        session["is_bridge"] = "vod-bridge" in file_path
+                    file_path = part.get("file", "") if part is not None else ""
+                    if "vod-plugin" in file_path:
+                        session["is_bridge"] = True
+                    elif file_path:
+                        session["is_bridge"] = False
+                    else:
+                        session["is_bridge"] = self._match_session_to_movie(session) is not None
 
                 sessions.append(session)
 
@@ -1457,6 +1464,8 @@ class BridgeCore:
     def _clean_title(self, name):
         name = re.sub(r"\s*\[.*?\]", "", name)
         name = re.sub(r"\s*\((?:4K|HDR|UHD|FHD|HD|SD)\)", "", name, flags=re.I)
+        name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
+        name = re.sub(r"\s*-\s*\d{4}\s*$", "", name)
         name = re.sub(r'[<>:"/\\|?*]', "", name)
         return name.strip()
 
@@ -1648,6 +1657,30 @@ class BridgeCore:
             result["message"] = "Dispatcharr URL not configured"
             return result
 
+        # Dispatcharr's VOD proxy always 301s this URL to a session-scoped
+        # one (e.g. .../movie/{uuid}/vod_<session>?stream_id=...) before it
+        # actually claims a connection slot. Left alone, ffprobe follows
+        # that redirect itself — closing its first connection and opening a
+        # second — so a single logical probe costs two capacity slots on
+        # the provider. The 301 lookup itself is a cheap, bodyless Django
+        # route (no slot claimed), so resolve it here and hand ffprobe the
+        # final URL directly to collapse the probe back to one connection.
+        session_id = None
+        try:
+            resp = requests.get(url, allow_redirects=False, stream=True, timeout=5)
+            if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                location = resp.headers["Location"]
+                if location.startswith("/"):
+                    base = url.split("/proxy/vod/", 1)[0]
+                    location = base + location
+                url = location
+                m = re.search(r"/(vod_[^/?]+)", location)
+                if m:
+                    session_id = m.group(1)
+            resp.close()
+        except Exception:
+            pass  # fall back to the unresolved URL; ffprobe will follow the redirect itself
+
         cmd = [
             ffprobe,
             "-v", "error",
@@ -1660,50 +1693,95 @@ class BridgeCore:
         ]
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=12,
-                check=False,
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                result["status"] = "probe_failed"
+                result["message"] = "ffprobe timed out while probing the stream"
+                return result
+            except Exception as e:
+                result["status"] = "probe_failed"
+                result["message"] = f"ffprobe execution failed: {e}"
+                return result
+
+            if proc.returncode != 0:
+                result["status"] = "probe_failed"
+                result["message"] = (proc.stderr or proc.stdout or "ffprobe failed").strip()[:240]
+                return result
+
+            try:
+                data = json.loads(proc.stdout or "{}")
+            except Exception as e:
+                result["status"] = "probe_failed"
+                result["message"] = f"Invalid ffprobe JSON: {e}"
+                return result
+
+            streams = data.get("streams", []) or []
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            video_streams = [s for s in streams if s.get("codec_type") == "video"]
+            audio_codecs = sorted({s.get("codec_name", "") for s in audio_streams if s.get("codec_name")})
+
+            result["audio_stream_count"] = len(audio_streams)
+            result["video_stream_count"] = len(video_streams)
+            result["audio_codecs"] = audio_codecs
+            result["format_name"] = ((data.get("format") or {}).get("format_name") or "")
+            result["status"] = "ok" if audio_streams else "missing"
+            result["message"] = (
+                f"Detected {len(audio_streams)} audio stream(s)"
+                if audio_streams else
+                "No audio streams detected"
             )
-        except subprocess.TimeoutExpired:
-            result["status"] = "probe_failed"
-            result["message"] = "ffprobe timed out while probing the stream"
             return result
-        except Exception as e:
-            result["status"] = "probe_failed"
-            result["message"] = f"ffprobe execution failed: {e}"
-            return result
-
-        if proc.returncode != 0:
-            result["status"] = "probe_failed"
-            result["message"] = (proc.stderr or proc.stdout or "ffprobe failed").strip()[:240]
-            return result
-
-        try:
-            data = json.loads(proc.stdout or "{}")
-        except Exception as e:
-            result["status"] = "probe_failed"
-            result["message"] = f"Invalid ffprobe JSON: {e}"
-            return result
-
-        streams = data.get("streams", []) or []
-        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-        video_streams = [s for s in streams if s.get("codec_type") == "video"]
-        audio_codecs = sorted({s.get("codec_name", "") for s in audio_streams if s.get("codec_name")})
-
-        result["audio_stream_count"] = len(audio_streams)
-        result["video_stream_count"] = len(video_streams)
-        result["audio_codecs"] = audio_codecs
-        result["format_name"] = ((data.get("format") or {}).get("format_name") or "")
-        result["status"] = "ok" if audio_streams else "missing"
-        result["message"] = (
-            f"Detected {len(audio_streams)} audio stream(s)"
-            if audio_streams else
-            "No audio streams detected"
-        )
-        return result
+        finally:
+            # ffprobe's connection is short-lived, but Dispatcharr's Redis
+            # session hash (what Plex's Active Connections reads from)
+            # otherwise lingers for up to ~57 minutes holding a real slot.
+            # The stop-signal key (what stop_vod_client sets) is only ever
+            # checked inside an active streaming loop every 100 chunks, so
+            # it never fires for a probe this small. Call the connection
+            # manager's own cleanup directly instead — the same call
+            # cleanup_stale_persistent_connections() makes once a
+            # connection is confirmed idle.
+            if session_id:
+                try:
+                    from apps.proxy.vod_proxy.multi_worker_connection_manager import (
+                        MultiWorkerVODConnectionManager,
+                        RedisBackedVODConnection,
+                    )
+                    manager = MultiWorkerVODConnectionManager.get_instance()
+                    # Dispatcharr's own active_streams decrement
+                    # (decrement_active_streams_and_check) can silently no-op
+                    # under lock contention -- observed live: two of a
+                    # probe's three internal range-seek requests raced for
+                    # the same per-session lock, both lost, and the
+                    # documented "safe default" on lock-loss is to leave
+                    # active_streams un-decremented ("assume streams
+                    # remain"). That permanently strands this session above
+                    # 0 with no natural path back down, so
+                    # cleanup_persistent_connection() would refuse to delete
+                    # it forever. We know definitively this probe-owned
+                    # session has no real viewer by the time ffprobe exits,
+                    # so force active_streams to 0 directly before cleanup.
+                    conn = RedisBackedVODConnection(session_id, manager.redis_client)
+                    state = conn._get_connection_state()
+                    if state and state.active_streams > 0:
+                        if conn._acquire_lock():
+                            try:
+                                state = conn._get_connection_state()
+                                if state and state.active_streams > 0:
+                                    state.active_streams = 0
+                                    conn._save_connection_state(state)
+                            finally:
+                                conn._release_lock()
+                    manager.cleanup_persistent_connection(session_id)
+                except Exception as e:
+                    logger.debug(f"Could not clean up probe session {session_id}: {e}")
 
     def check_movie_audio(self, body):
         movie_ids = body.get("movie_ids", [])
@@ -1781,6 +1859,12 @@ class BridgeCore:
             chosen_relation = None
             audio_checks = {}
             for relation in relations:
+                if not self._account_has_capacity(relation.m3u_account_id):
+                    logger.info(
+                        f"Skipping audio probe for movie {mid} via account "
+                        f"{relation.m3u_account_id} — no free connection slot"
+                    )
+                    continue
                 result = self._probe_audio_for_relation(movie, relation)
                 audio_checks[str(relation.stream_id)] = result
                 self._record_audio_probe_stats(movie, relation, result, persist=False)
@@ -1928,20 +2012,67 @@ class BridgeCore:
 
         return preferred
 
-    def get_redirect_url(self, movie_id):
-        movie, relation, _entry, error = self._resolve_relation(movie_id, persist_pick=True)
-        if error:
-            return None, error, None, None
+    # How long a resolved redirect for a movie is reused for duplicate/rapid
+    # follow-up requests, instead of re-resolving and issuing a fresh 302.
+    # rclone (and Plex probing behavior) can fire several near-simultaneous
+    # requests for the same movie+range; without this each one independently
+    # races Dispatcharr's proxy for a provider connection slot, and any that
+    # lose get a 429/503 and retry immediately — a self-inflicted request
+    # storm on the same already-at-capacity provider. Coalescing them behind
+    # one lock means only one request per movie resolves/redirects at a time;
+    # the rest wait briefly and reuse that result instead of piling on.
+    REDIRECT_COALESCE_SECS = 3
 
-        stream_id = relation.stream_id
-        account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
-        # Bare Dispatcharr URL, no pre-resolution and no liveness probe here —
-        # a HEAD request against Dispatcharr's proxy doesn't open a real
-        # streaming connection, so it can't catch a provider that accepts the
-        # connection and then stalls/buffers (the actual common failure mode
-        # here) — only the stall watchdog, which watches real Plex playback
-        # state, can detect that. See mark_stream_bad() / _check_for_stalls().
-        return self._build_dispatcharr_proxy_url(movie, relation), None, account_id, stream_id
+    def _get_redirect_lock(self, movie_id):
+        with self._redirect_locks_guard:
+            lock = self._redirect_locks.get(movie_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._redirect_locks[movie_id] = lock
+            return lock
+
+    # rclone's VFS read-ahead opens several concurrent connections for
+    # different byte ranges of the *same* file within milliseconds of each
+    # other — the coalescing cache above correctly gives them all the same
+    # resolved stream, but each one still gets its own immediate 302 and
+    # independently races Dispatcharr's proxy for a connection slot right
+    # after. If the account is already out of room when a burst duplicate
+    # (a cache hit, not the first resolution) comes through, redirecting it
+    # immediately is a guaranteed 503 — so stagger it briefly instead, on
+    # the chance an earlier connection in the same burst finishes seating
+    # or drops before this one reaches Dispatcharr.
+    REDIRECT_BURST_STAGGER_SECS = 0.4
+
+    def get_redirect_url(self, movie_id):
+        mid = str(movie_id)
+        lock = self._get_redirect_lock(mid)
+
+        with lock:
+            cached = self._recent_redirects.get(mid)
+            if cached and (time.time() - cached[0]) < self.REDIRECT_COALESCE_SECS:
+                _, redirect_url, error, account_id, stream_id = cached
+                if redirect_url and account_id and not self._account_has_capacity(account_id):
+                    time.sleep(self.REDIRECT_BURST_STAGGER_SECS)
+                return redirect_url, error, account_id, stream_id
+
+            movie, relation, _entry, error = self._resolve_relation(movie_id, persist_pick=True)
+            if error:
+                result = (None, error, None, None)
+                self._recent_redirects[mid] = (time.time(), *result)
+                return result
+
+            stream_id = relation.stream_id
+            account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
+            # Bare Dispatcharr URL, no pre-resolution and no liveness probe here —
+            # a HEAD request against Dispatcharr's proxy doesn't open a real
+            # streaming connection, so it can't catch a provider that accepts the
+            # connection and then stalls/buffers (the actual common failure mode
+            # here) — only the stall watchdog, which watches real Plex playback
+            # state, can detect that. See mark_stream_bad() / _check_for_stalls().
+            redirect_url = self._build_dispatcharr_proxy_url(movie, relation)
+            result = (redirect_url, None, account_id, stream_id)
+            self._recent_redirects[mid] = (time.time(), *result)
+            return result
 
     def mark_stream_bad(self, movie_id, stream_id):
         """Advance the cached stream pick to the next available relation for a
