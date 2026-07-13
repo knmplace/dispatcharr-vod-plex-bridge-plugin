@@ -37,7 +37,7 @@ a { color: var(--accent); text-decoration: none; }
 .header-stats .stat-val { color: var(--text); font-weight: 600; }
 
 /* Tabs */
-.tabs { display: flex; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); }
+.tabs { display: flex; align-items: center; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); }
 .tab { padding: 0.6rem 1.2rem; cursor: pointer; color: var(--text2); font-size: 0.85rem; border-bottom: 2px solid transparent; transition: all 0.15s; position: relative; }
 .tab:hover { color: var(--text); background: var(--surface2); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -48,7 +48,8 @@ a { color: var(--accent); text-decoration: none; }
 .tab-pane { display: none; }
 .tab-pane.active { display: block; }
 
-/* Pinned browse sub-header (catalog summary + movie filters) */
+/* Pinned browse sub-header (movie filters/search only — catalog summary
+   scrolls away normally above it, then this locks to the top). */
 .browse-pinned { position: sticky; top: calc(var(--header-h, 0px) + var(--tabs-h, 0px)); z-index: 80; background: var(--bg); padding-top: 1rem; margin: 0 -1.2rem; padding-left: 1.2rem; padding-right: 1.2rem; }
 .browse-pinned .panel:last-child { margin-bottom: 0.8rem; }
 
@@ -101,7 +102,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .ms-item .ms-item-count { color: var(--text2); margin-left: auto; font-size: 0.7rem; }
 
 /* Movie Grid */
-.movie-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.8rem; }
+.movie-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); gap: 0.8rem; }
 .movie-card { background: var(--surface2); border-radius: var(--radius); overflow: hidden; position: relative; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s; }
 .movie-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .movie-card.activated { box-shadow: 0 0 0 2px var(--green); }
@@ -227,12 +228,6 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .health-dot.error { background: var(--red); }
 .health-dot.unconfigured { background: var(--text2); }
 
-/* Summary grid */
-.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.5rem; }
-.summary-card { background: var(--surface2); border-radius: var(--radius); padding: 0.6rem; text-align: center; }
-.summary-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
-.summary-label { font-size: 0.7rem; color: var(--text2); margin-top: 0.2rem; }
-
 /* Toasts */
 #toastStack { position: fixed; bottom: 1rem; right: 1rem; z-index: 999; display: flex; flex-direction: column; gap: 0.5rem; max-width: 360px; }
 .toast { background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); padding: 0.6rem 0.8rem; font-size: 0.8rem; box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: toast-in 0.15s ease-out; }
@@ -299,6 +294,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
+    <span>Categories: <span class="stat-val" id="hdrCategories">-</span></span>
   </div>
 </div>
 
@@ -315,18 +311,6 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="browse-pinned" id="browsePinned">
       <div class="panel">
         <div class="panel-header">
-          <span>Catalog Summary</span>
-          <button class="btn btn-outline btn-sm" onclick="loadSummary(this)">Refresh</button>
-        </div>
-        <div class="panel-body">
-          <div class="summary-grid" id="summaryGrid">
-            <div class="loading"><span class="spinner"></span> Loading...</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-header">
           <span>Movies</span>
           <div style="display:flex;gap:0.3rem;align-items:center;">
             <button class="btn btn-primary btn-sm" onclick="selectAllMovies()">Select All</button>
@@ -338,7 +322,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
         </div>
         <div class="panel-body">
           <!-- Language detection bar -->
-          <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;padding:0.4rem 0.6rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+          <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem;padding:0.4rem 0.6rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap;">
             <span style="font-size:0.75rem;color:var(--text2);white-space:nowrap;">&#127760; Language Detection:</span>
             <select id="langLimitSel" class="search-input" style="flex:0 0 auto;min-width:130px;font-size:0.75rem;padding:0.25rem 0.4rem;">
               <option value="activated">Activated Only</option>
@@ -349,21 +333,23 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
               <option value="0">All (~6h)</option>
             </select>
             <button class="btn btn-sm" id="detectLangBtn" onclick="detectAllLanguages()" style="background:var(--amber);color:#000;border-color:var(--amber);white-space:nowrap;">Detect Now</button>
-            <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
-          </div>
-          <div class="search-bar">
-            <div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:200px;">
+            <div style="display:flex;flex-direction:column;gap:2px;width:160px;">
               <label for="searchInput" style="font-size:0.72rem;color:var(--text);font-weight:600;">Search Movies</label>
               <div class="search-input-wrap" id="searchInputWrap">
                 <input type="text" class="search-input" id="searchInput" placeholder="Search movies..." oninput="onSearchBoxInput('searchInput')" onkeyup="if(event.key==='Enter')searchMovies()">
                 <button type="button" class="search-input-clear" onclick="clearSearchBox('searchInput')" title="Clear">&times;</button>
               </div>
-              <label for="directorInput" style="font-size:0.72rem;color:var(--text);font-weight:600;margin-top:4px;">Search Directors</label>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:2px;width:160px;">
+              <label for="directorInput" style="font-size:0.72rem;color:var(--text);font-weight:600;">Search Directors</label>
               <div class="search-input-wrap" id="directorInputWrap">
                 <input type="text" class="search-input" id="directorInput" placeholder="Search directors..." oninput="onSearchBoxInput('directorInput')" onkeyup="if(event.key==='Enter')searchMovies()">
                 <button type="button" class="search-input-clear" onclick="clearSearchBox('directorInput')" title="Clear">&times;</button>
               </div>
             </div>
+            <span id="langMessage" style="display:none;font-size:0.72rem;color:var(--amber);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+          </div>
+          <div class="search-bar">
             <div class="ms-dropdown" id="provDropdown">
               <div class="ms-toggle" onclick="toggleMsPanel('prov')">
                 <span id="provLabel">All Providers</span>
@@ -666,13 +652,7 @@ async function loadSummary(btn) {
     const data = await api('/api/catalog/summary');
     document.getElementById('hdrTotal').textContent = data.total || 0;
     document.getElementById('hdrActivated').textContent = data.activated || 0;
-
-    const grid = document.getElementById('summaryGrid');
-    grid.innerHTML = `
-      <div class="summary-card"><div class="summary-val">${data.total||0}</div><div class="summary-label">Total Movies</div></div>
-      <div class="summary-card"><div class="summary-val">${data.activated||0}</div><div class="summary-label">Activated</div></div>
-      <div class="summary-card"><div class="summary-val">${(data.categories||[]).length}</div><div class="summary-label">Categories</div></div>
-    `;
+    document.getElementById('hdrCategories').textContent = (data.categories||[]).length;
 
     // Category chips
     const catList = document.getElementById('catList');
@@ -687,8 +667,6 @@ async function loadSummary(btn) {
     await loadCategories();
   } catch (e) {
     console.error('loadSummary failed', e);
-    const grid = document.getElementById('summaryGrid');
-    if (grid) grid.innerHTML = '<div class="empty">Failed to load catalog summary — check plugin logs</div>';
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = origLabel; }
   }
