@@ -1,6 +1,6 @@
 # VOD To Plex — Plugin Summary
 
-> Plugin running inside Dispatcharr container on .94.
+> Plugin running inside Dispatcharr container on .245.
 > History: [2026-07-13 archive](PLUGIN_SUMMARY_ARCHIVE_20260713.md) (v0.1.24 detail, 2026-07-11
 > Incident Log, Channel Maintenance/Architecture/Key Files/rclone reference) |
 > [2026-07-09 archive](PLUGIN_SUMMARY_ARCHIVE_20260709.md) (v0.1.22 full feature
@@ -11,14 +11,14 @@
 ## Deploy Process — Follow Every Step, Every Time
 
 0. **Auth: use the SSH key, never `.ssh.env` password auth.** `pscp -i "C:\Users\knmfl\.ssh\kid_rsa.ppk" -P 22 ...` /
-   `plink -i "C:\Users\knmfl\.ssh\kid_rsa.ppk" -P 22 -batch root@192.168.1.94 "..."`.
+   `plink -i "C:\Users\knmfl\.ssh\kid_rsa.ppk" -P 22 -batch root@192.168.1.245 "..."`.
    Exception: `.109` (Plex host) refuses the key — needs password auth from `.ssh.env`, but only
    use that on `.109` specifically, never elsewhere. See `feedback-deploy-auth-use-ssh-key` and
    `plex-host-109-ssh-access` in Claude's cross-session memory.
-1. `pscp -i kid_rsa.ppk` each changed file to `.94:/tmp/` individually — one command per file.
+1. `pscp -i kid_rsa.ppk` each changed file to `.245:/tmp/` individually — one command per file.
 2. `docker cp` each file from `/tmp/` into the container — one `plink -i kid_rsa.ppk` call per
    file, not batched. Chain `docker cp && chown 1000:1000 && echo COPY_OK` and check for `COPY_OK`.
-3. Clear `__pycache__`: `docker exec dispatcharr-IPTV2-94 find /data/plugins/vod_plex_bridge/ -name __pycache__ -exec rm -rf {} +`
+3. Clear `__pycache__`: `docker exec dispatcharr-IPTV2-245 find /data/plugins/vod_plex_bridge/ -name __pycache__ -exec rm -rf {} +`
 4. **Verify with md5sum** — container vs. local for every changed file. All hashes must match.
 5. Tell the user a Portainer restart is required — do not restart the container yourself.
 6. After the user confirms restart, verify the fix behaves as expected before considering it done.
@@ -45,8 +45,35 @@ $zip.Dispose()
 **Always verify**: `unzip -q <zip> -d /tmp/verify && find /tmp/verify -type f` — confirm
 `templates/dashboard.html` exists nested, no backslash warnings.
 
-## Current State (2026-07-13)
+## Current State (2026-07-16)
 
+- **v0.1.27**: resume/seek reliability fix + Bug Report export feature.
+  - **Resume-after-stop playback fix**: a user reported a movie that stopped playing
+    partway through in Plex, and resuming just buffered indefinitely instead of picking
+    back up — had to restart from the beginning. Root cause: `REDIRECT_COALESCE_SECS`
+    (3s) could reuse a cached redirect for a provider connection that had already
+    dropped, so the resumed Range request got routed to a dead connection instead of a
+    fresh one. Fix: narrowed the coalesce window to 1s (still enough to dedupe rclone's
+    millisecond-scale VFS read-ahead bursts, the original reason it existed — confirmed
+    via `git log -S`), and `get_redirect_url()` now checks whether the cached account
+    currently has free capacity; if it does (implying the prior connection already
+    ended), it re-resolves a fresh redirect instead of reusing the stale cached one.
+    Deliberately did NOT re-add session tracking/liveness probes — those were tried and
+    reverted in v0.1.6-9 for causing worse connection-holding/provider-churn problems
+    (see Pending #3 below); this fix stays within the existing "no plugin-side HTTP call
+    on the hot path" architecture.
+  - **Bug Report / "Bundle Logs" export**: new `/api/bug-report?hours=N` endpoint and
+    dashboard panel (Health tab) that packages the plugin's own activity log into a
+    downloadable zip for a configurable window (4h/24h/72h/7 days), so a user can send
+    diagnostic info back without needing shell/SSH access. **Hard requirement**: the
+    export never contains real feed URLs or provider names — `bridge.py` now sanitizes
+    every log line before it's written into the zip (`_sanitize_log_text()` regex-redacts
+    URLs to `http://example.com/redacted`, `_build_provider_scrub_map()` maps real M3U
+    account names to deterministic placeholders `Provider 1`, `Provider 2`, ... ordered
+    by account ID). This scrubbing happens automatically, by default, with no opt-out.
+  - **Also in this pass**: corrected the Dispatcharr host's container name in
+    docs — it's `dispatcharr-IPTV2-245` (renamed to match the 2026-07-16 host IP move
+    from .94 to .245), not `dispatcharr-IPTV2-94` as briefly documented mid-move.
 - **STRM orphan-folder cleanup + investigation (no code/version change)**: user reported 4
   movies (12 Rounds, Stolen, Gunner, Aftermath) with live playback issues; investigated request
   patterns, ruled out `_revalidate_activated_streams()` as a live cause (confirmed disabled via
@@ -66,7 +93,7 @@ $zip.Dispose()
   automatic detection/cleanup for this going forward — deferred, not yet implemented. Full
   findings logged as a comment on bead `3vo`.
 - **v0.1.26 is current and fully reconciled** — git (tagged `v0.1.26`), GitHub Release (zip
-  asset, marked Latest via .NET ZipArchive method, verified clean), and `.94` all match.
+  asset, marked Latest via .NET ZipArchive method, verified clean), and `.245` all match.
   Connection-capacity reliability pass: fixed `is_bridge` session-detection (was matching a
   stale mount name so the stall watchdog never fired), fixed an ffprobe audio-probe connection
   leak (was costing 2 provider slots instead of 1), added redirect coalescing for
@@ -100,11 +127,11 @@ plugin/vod-plex-bridge/
 └── templates/dashboard.html — Browse/Streams/Health UI
 ```
 - Repo: `https://github.com/knmplace/dispatcharr-vod-plex-bridge-plugin`
-- Container: `dispatcharr-IPTV2-94` | Port: 8888 | Dashboard: `http://192.168.1.94:8888/`
+- Container: `dispatcharr-IPTV2-245` | Port: 8888 | Dashboard: `http://192.168.1.245:8888/`
 - Server start is MANUAL — click "Start Server" after enabling the plugin
 
 ## Pending
-1. **EPG brown channels on .94** — assignments exist in DB, sources healthy, program records may
+1. **EPG brown channels on .245** — assignments exist in DB, sources healthy, program records may
    be stale. Next: check EPG program records for those epg_data_ids, or force re-import.
 2. Series support (after movies stable) — **ON HOLD**: Plex probes during library scan trigger
    real provider connections for episodes same as movies, unresolved.
@@ -123,6 +150,6 @@ plugin/vod-plex-bridge/
 
 ## rclone on .109 (plugin mount)
 `rclone-vodplugin.service` → `/mnt/vod-plugin`, remote `vodplugin` →
-`http://192.168.1.94:8888/vod/`. Flags: `--allow-other --read-only --vfs-cache-mode off
+`http://192.168.1.245:8888/vod/`. Flags: `--allow-other --read-only --vfs-cache-mode off
 --dir-cache-time 1m --poll-interval 0`. **DO NOT add** `--vfs-read-chunk-size` or
 `--vfs-cache-mode full` — these hold connections open.

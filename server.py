@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from io import BytesIO
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, unquote
@@ -218,6 +219,15 @@ def _dispatch(environ, start_response, server, bridge, settings):
     if path == "/api/plex/scan" and method == "POST":
         return _json_response(start_response, bridge.trigger_plex_scan(settings))
 
+    if path == "/api/bug-report" and method == "GET":
+        query = _parse_query(environ)
+        try:
+            hours = float(query.get("hours", ["24"])[0])
+        except (ValueError, TypeError):
+            hours = 24.0
+        hours = max(1.0, min(hours, 24 * 7))
+        return _bug_report_response(start_response, bridge, hours)
+
     # --- VOD filesystem ---
     if path == "/vod":
         start_response("301 Moved Permanently", [("Location", "/vod/")])
@@ -269,6 +279,45 @@ def _dispatch(environ, start_response, server, bridge, settings):
         return [b""]
 
     return _text_response(start_response, 404, "Not found")
+
+
+def _bug_report_response(start_response, bridge, hours):
+    """Build a small zip containing sanitized recent activity-log lines and
+    stream it back as a download. Sanitizing (URL/provider-name scrubbing)
+    happens inside bridge.build_bug_report_bundle() before any of this text
+    reaches the zip, so nothing unsanitized is ever written to the archive."""
+    import io
+    import zipfile
+
+    lines = bridge.build_bug_report_bundle(hours)
+    header = (
+        f"VOD To Plex bug report\n"
+        f"Generated: {_now_str()}\n"
+        f"Window: last {hours:g} hour(s)\n"
+        f"Plugin version: {_plugin_version()}\n"
+        f"Entries: {len(lines)}\n"
+        f"Provider names and URLs have been replaced with placeholders.\n"
+        f"{'-' * 60}\n"
+    )
+    body_text = header + ("\n".join(lines) if lines else "(no activity in this window)")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("activity_log.txt", body_text)
+    zip_bytes = buf.getvalue()
+
+    filename = f"vod-plex-bridge-bug-report-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    start_response("200 OK", [
+        ("Content-Type", "application/zip"),
+        ("Content-Length", str(len(zip_bytes))),
+        ("Content-Disposition", f'attachment; filename="{filename}"'),
+        ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+    ])
+    return [zip_bytes]
+
+
+def _now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _serve_dashboard(environ, start_response):

@@ -467,6 +467,29 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       </div>
     </div>
 
+    <div class="panel">
+      <div class="panel-header">
+        <span>Bug Report</span>
+      </div>
+      <div class="panel-body">
+        <p style="font-size:0.8rem;color:var(--text2);margin:0 0 0.75rem;">
+          Downloads a zip of recent activity-log entries to share when reporting an issue.
+          Provider names and any URLs are automatically replaced with generic placeholders
+          before the file is built — nothing identifying is included.
+        </p>
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+          <label for="bugReportHours" style="font-size:0.8rem;color:var(--text2);">Window:</label>
+          <select id="bugReportHours" class="search-input" style="width:auto;">
+            <option value="4">Last 4 hours</option>
+            <option value="24" selected>Last 24 hours</option>
+            <option value="72">Last 3 days</option>
+            <option value="168">Last 7 days</option>
+          </select>
+          <button class="btn btn-outline btn-sm" onclick="downloadBugReport()">Bundle Logs</button>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -964,6 +987,11 @@ function startStreamRefresh() {
 }
 function stopStreamRefresh() {
   if (streamRefreshTimer) { clearInterval(streamRefreshTimer); streamRefreshTimer = null; }
+}
+
+function downloadBugReport() {
+  const hours = document.getElementById('bugReportHours').value;
+  window.location.href = `${BASE}/api/bug-report?hours=${encodeURIComponent(hours)}`;
 }
 
 // Health
