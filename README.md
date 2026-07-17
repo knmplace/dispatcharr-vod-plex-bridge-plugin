@@ -130,9 +130,9 @@ vod_plex_bridge/
 
 ## Known Limitations
 
-- **No connection gating** — bulk activation + Plex scan can trigger many provider connections. Recommend setting Plex library analysis to Manual.
-- **Movies only** — series support is planned
-- **No provider fallback** — uses the first available stream per movie
+- **Connection gating is partial** — activation and playback now check Dispatcharr's connection pool for free capacity before picking a stream (`_account_has_capacity`), and stall detection auto-advances to another stream on repeated failures (`mark_stream_bad`). Bulk activation + a Plex library scan can still momentarily burst past comfortable levels before gating catches up; setting Plex library analysis to Manual is still recommended for large batches.
+- **Movies only** — series support is on hold; Plex probes during library scans trigger real provider connections for episodes the same as movies, which needs its own solution before this ships
+- **Provider fallback exists but is capacity/stall-driven, not preference-ordered** — `_pick_relation_with_capacity()` will switch to another stream for the same movie if the preferred account has no free capacity or the current stream stalls out, but it doesn't rank providers by quality/preference — it takes the first one with room
 - **No error screens** — provider errors return HTTP status codes, not user-friendly video messages
 
 ## Changelog
