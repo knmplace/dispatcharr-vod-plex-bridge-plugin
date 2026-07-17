@@ -160,6 +160,52 @@ class BridgeCore:
         self._save_activity_log()
         return {"status": "ok"}
 
+    # Matches http(s):// URLs anywhere in a log line — activity-log text
+    # never contains raw provider stream URLs today (see server.py's
+    # redirect logging, which goes to the stdlib logger instead), but this
+    # is a content-based scrub rather than one that trusts that staying
+    # true, so a future log line that does embed one is still caught.
+    _URL_RE = re.compile(r"https?://\S+")
+
+    def _sanitize_log_text(self, text, provider_map):
+        text = self._URL_RE.sub("http://example.com/redacted", text)
+        for real_name, placeholder in provider_map.items():
+            if real_name:
+                text = text.replace(real_name, placeholder)
+        return text
+
+    def _build_provider_scrub_map(self):
+        """Map each M3U account's real name to a stable-within-this-export
+        placeholder ("Provider 1", "Provider 2", ...), ordered by account id
+        so the mapping is deterministic for a given catalog."""
+        try:
+            from apps.m3u.models import M3UAccount
+            accounts = list(M3UAccount.objects.order_by("id").values_list("name", flat=True))
+        except Exception:
+            accounts = []
+        return {name: f"Provider {i + 1}" for i, name in enumerate(accounts) if name}
+
+    def build_bug_report_bundle(self, hours):
+        """Return a sanitized snapshot of recent activity-log entries as a
+        list of plain-text lines, newest last. Provider/M3U account names are
+        replaced with generic placeholders and any literal URL is replaced
+        with an example.com placeholder before this ever leaves the process
+        — the caller (server.py) writes these lines straight into the
+        exported zip with no further access to the unsanitized text."""
+        provider_map = self._build_provider_scrub_map()
+        cutoff = time.time() - (hours * 3600)
+
+        lines = []
+        for entry in self._activity_log:
+            if entry.get("ts", 0) < cutoff:
+                continue
+            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("ts", 0)))
+            level = str(entry.get("level", "info")).upper()
+            message = self._sanitize_log_text(str(entry.get("message", "")), provider_map)
+            lines.append(f"[{ts_str}] {level}: {message}")
+
+        return lines
+
     def _start_stall_watchdog(self):
         self._watchdog_thread = threading.Thread(
             target=self._stall_watchdog_loop,
@@ -2014,14 +2060,18 @@ class BridgeCore:
 
     # How long a resolved redirect for a movie is reused for duplicate/rapid
     # follow-up requests, instead of re-resolving and issuing a fresh 302.
-    # rclone (and Plex probing behavior) can fire several near-simultaneous
-    # requests for the same movie+range; without this each one independently
-    # races Dispatcharr's proxy for a provider connection slot, and any that
-    # lose get a 429/503 and retry immediately — a self-inflicted request
-    # storm on the same already-at-capacity provider. Coalescing them behind
-    # one lock means only one request per movie resolves/redirects at a time;
-    # the rest wait briefly and reuse that result instead of piling on.
-    REDIRECT_COALESCE_SECS = 3
+    # rclone's VFS read-ahead fires several near-simultaneous requests for
+    # different byte ranges of the same file within milliseconds of each
+    # other; without this each one independently races Dispatcharr's proxy
+    # for a provider connection slot, and any that lose get a 429/503 and
+    # retry immediately — a self-inflicted request storm on the same
+    # already-at-capacity provider. Coalescing them behind one lock means
+    # only one request per movie resolves/redirects at a time; the rest wait
+    # briefly and reuse that result instead of piling on. Kept short (well
+    # above the read-ahead burst window, well below a deliberate pause/stop
+    # then resume) so a genuine resume click after playback stalled/died
+    # doesn't get chained to a redirect resolved for the dead connection.
+    REDIRECT_COALESCE_SECS = 1
 
     def _get_redirect_lock(self, movie_id):
         with self._redirect_locks_guard:
@@ -2051,9 +2101,21 @@ class BridgeCore:
             cached = self._recent_redirects.get(mid)
             if cached and (time.time() - cached[0]) < self.REDIRECT_COALESCE_SECS:
                 _, redirect_url, error, account_id, stream_id = cached
-                if redirect_url and account_id and not self._account_has_capacity(account_id):
-                    time.sleep(self.REDIRECT_BURST_STAGGER_SECS)
-                return redirect_url, error, account_id, stream_id
+                if redirect_url and account_id:
+                    if self._account_has_capacity(account_id):
+                        # A slot is free even though this account was picked
+                        # (and presumably still holding a connection) as
+                        # recently as REDIRECT_COALESCE_SECS ago — the prior
+                        # connection must have already dropped. Reusing the
+                        # cached redirect here would hand a resuming client
+                        # back the same now-dead connection instead of a
+                        # fresh one, so fall through and re-resolve instead.
+                        pass
+                    else:
+                        time.sleep(self.REDIRECT_BURST_STAGGER_SECS)
+                        return redirect_url, error, account_id, stream_id
+                else:
+                    return redirect_url, error, account_id, stream_id
 
             movie, relation, _entry, error = self._resolve_relation(movie_id, persist_pick=True)
             if error:
