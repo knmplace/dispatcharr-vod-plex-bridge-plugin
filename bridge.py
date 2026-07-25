@@ -56,6 +56,21 @@ class BridgeCore:
     # runs unattended and shouldn't disrupt Plex watch state on a schedule.
     DEFAULT_STREAM_REFRESH_INTERVAL_DAYS = 7
 
+    # Interval (seconds) between maintenance-cycle sweeps that backfill
+    # confirmed_size (Plex's own recorded file size, read back via its API)
+    # for any activated movie that doesn't have one yet — catches movies
+    # activated before this feature existed, and any fast-path miss below.
+    # 600s (10 min) is frequent enough that a missed fast-path pick-up still
+    # self-heals well inside the ~18-20 min window Plex's own re-scan timer
+    # runs on (see bead npx size-mismatch investigation).
+    SIZE_RECONCILE_INTERVAL_SECS = 600
+
+    # Fast path after activation: Plex analyzes a freshly-added item almost
+    # immediately (observed ~13s for a real title), so poll a few times at
+    # increasing delay rather than waiting for the next maintenance sweep.
+    # Gives up after ~2 min and leaves it to the maintenance sweep.
+    SIZE_RECONCILE_FAST_PATH_DELAYS_SECS = (20, 20, 20, 30, 30)
+
     # Delay between each movie's refresh within one scheduled pass, so a
     # library-wide refresh doesn't burst requests against providers all at
     # once — spreads them out the same way a human clicking through movies
@@ -86,6 +101,7 @@ class BridgeCore:
         self._watchdog_ticks = 0
         self._last_removed_check = 0.0
         self._last_stream_refresh_check = 0.0
+        self._last_size_reconcile = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
         # Running counters surfaced on the Health tab so cleanup/refresh
         # activity is visible without digging through the activity log.
@@ -102,6 +118,7 @@ class BridgeCore:
             "last_reactivate": None,      # {"ts", "reactivated", "names"}
             "last_removed_check": None,   # {"ts", "checked", "removed", "removed_names"}
             "last_audio_check": None,     # {"ts", "movie_id", "name", "stream_id", "provider", "status"}
+            "last_size_reconcile": None,  # {"ts", "checked", "confirmed", "names"}
         }
 
     def initialize(self):
@@ -262,6 +279,13 @@ class BridgeCore:
             # progress — see PLUGIN_SUMMARY.md incident log, 2026-07-11).
             # Deliberately does not read revalidation_interval_secs at all
             # so a stray configure_plugin write can't silently re-enable it.
+
+            if now - self._last_size_reconcile >= self.SIZE_RECONCILE_INTERVAL_SECS:
+                self._last_size_reconcile = now
+                try:
+                    self._reconcile_all_confirmed_sizes()
+                except Exception as e:
+                    logger.error(f"Size reconcile sweep error: {e}")
 
     def _check_for_stalls(self):
         plex_url = self.settings.get("plex_url", "")
@@ -1466,6 +1490,125 @@ class BridgeCore:
             logger.error(f"Plex removal failed: {e}")
             return 0
 
+    def _fetch_plex_movie_sizes(self, movie_ids=None):
+        """Query Plex's own library JSON and return {movie_id_str: size_bytes}
+        for whatever it has actually recorded for each item's Part. Used to
+        reconcile our declared Content-Length with what Plex believes it is,
+        which is what its periodic scan compares against — a mismatch there
+        is what triggers a "changed size" Turbo analysis (a real provider
+        connection through the rclone mount) even with nobody watching.
+
+        movie_ids=None fetches sizes for every matched item in the library
+        section (used by the maintenance sweep); pass a list to limit the
+        match set (used by the post-activation fast path).
+        """
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        section = self.settings.get("plex_library_section", 7)
+        if not plex_url or not plex_token:
+            return {}
+        try:
+            resp = requests.get(
+                f"{plex_url}/library/sections/{section}/all",
+                params={"X-Plex-Token": plex_token},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Plex library query failed: {resp.status_code}")
+                return {}
+
+            items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+            id_set = {str(mid) for mid in movie_ids} if movie_ids is not None else None
+            sizes = {}
+
+            for item in items:
+                parts = item.get("Media", [{}])[0].get("Part", [])
+                for part in parts:
+                    filename = part.get("file", "")
+                    m = re.search(r'[/\\](\d+)\.(mkv|mp4)$', filename)
+                    if not m:
+                        m = re.search(r'\[(\d+)\]\.(mkv|mp4)$', filename)
+                    if not m:
+                        continue
+                    mid = m.group(1)
+                    if id_set is not None and mid not in id_set:
+                        continue
+                    size = part.get("size")
+                    if size:
+                        sizes[mid] = int(size)
+                    break
+
+            return sizes
+        except Exception as e:
+            logger.error(f"Plex size query failed: {e}")
+            return {}
+
+    def _reconcile_confirmed_size(self, movie_id):
+        """Fetch Plex's recorded size for one movie and store it as
+        confirmed_size if found. Returns True if a size was stored."""
+        mid = str(movie_id)
+        sizes = self._fetch_plex_movie_sizes([mid])
+        size = sizes.get(mid)
+        if not size:
+            return False
+        entry = self._activated.get(mid)
+        if entry is None:
+            return False
+        if entry.get("confirmed_size") == size:
+            return False
+        entry["confirmed_size"] = size
+        self._save_state()
+        logger.info(f"Confirmed Plex size for movie {mid}: {size} bytes")
+        return True
+
+    def _size_reconcile_fast_path(self, movie_id):
+        """Background retry loop started right after activation. Plex
+        usually finishes analyzing a freshly-scanned item within seconds,
+        so poll a few times before leaving it to the periodic maintenance
+        sweep (_reconcile_all_confirmed_sizes)."""
+        for delay in self.SIZE_RECONCILE_FAST_PATH_DELAYS_SECS:
+            time.sleep(delay)
+            try:
+                if self._reconcile_confirmed_size(movie_id):
+                    return
+            except Exception as e:
+                logger.error(f"Fast-path size reconcile error for movie {movie_id}: {e}")
+
+    def _reconcile_all_confirmed_sizes(self):
+        """Maintenance-cycle sweep: backfill confirmed_size for every
+        activated movie that doesn't have one yet, including movies
+        activated before this feature existed (their estimated_size is
+        frozen at a stale/placeholder value that Plex will never match)."""
+        missing = [
+            mid for mid, entry in self._activated.items()
+            if not entry.get("confirmed_size")
+        ]
+        if not missing:
+            return
+        sizes = self._fetch_plex_movie_sizes(missing)
+        confirmed = 0
+        names = []
+        for mid in missing:
+            size = sizes.get(mid)
+            if not size:
+                continue
+            entry = self._activated.get(mid)
+            if entry is None or entry.get("confirmed_size") == size:
+                continue
+            entry["confirmed_size"] = size
+            confirmed += 1
+            names.append(entry.get("strm_folder") or mid)
+        if confirmed:
+            self._save_state()
+            logger.info(f"Size reconcile sweep: confirmed {confirmed}/{len(missing)} movies")
+        self._maint_stats["last_size_reconcile"] = {
+            "ts": time.time(),
+            "checked": len(missing),
+            "confirmed": confirmed,
+            "names": names,
+        }
+
     def generate_strm_files(self, settings, log):
         strm_dir = settings.get("strm_output_dir", "/data/strm")
         port = int(settings.get("http_port", 8888))
@@ -1928,10 +2071,13 @@ class BridgeCore:
                 failed_names.append(movie.name)
                 continue
 
+            estimated_size = self._resolve_estimated_size(movie, relations)
+
             self._activated[mid] = {
                 "activated_at": time.time(),
                 "audio_checks": audio_checks,
                 "stream_pick": chosen_relation.stream_id,
+                "estimated_size": estimated_size,
             }
             activated.append(mid)
             activated_names.append(movie.name)
@@ -1942,6 +2088,12 @@ class BridgeCore:
             strm_count = self._generate_strm_for_movies(activated)
             self._save_state()
             self._trigger_plex_scan()
+            for mid in activated:
+                threading.Thread(
+                    target=self._size_reconcile_fast_path,
+                    args=(mid,),
+                    daemon=True,
+                ).start()
             names = activated_names or self._movie_names(activated)
             titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
@@ -2192,10 +2344,96 @@ class BridgeCore:
         return info
 
     def _estimate_size(self, movie):
+        # Plex's own recorded size (confirmed_size, read back via its API
+        # after it finishes analyzing the file — see _reconcile_confirmed_size)
+        # is ground truth and always wins: it's the exact value Plex compares
+        # against on every periodic scan, so serving it back guarantees no
+        # "changed size" mismatch, which is what triggers a Turbo
+        # re-analysis (a real provider connection through the rclone mount)
+        # every ~18-20 min even with nobody watching (see bead npx).
+        #
+        # Bitrate-derived size (cached at activation in
+        # self._activated[mid]["estimated_size"]) is a fallback used until
+        # Plex has confirmed a size of its own — it's an estimate, not
+        # exact, so it does NOT reliably prevent the mismatch on its own
+        # (proven live: Anaconda's bitrate estimate of 1,443,180,000 never
+        # matched Plex's actual 1,289,110,670 and kept re-triggering).
+        entry = self._activated.get(str(movie.id))
+        if entry:
+            if entry.get("confirmed_size"):
+                return int(entry["confirmed_size"])
+            if entry.get("estimated_size"):
+                return int(entry["estimated_size"])
+
         duration = getattr(movie, "duration_secs", None)
         if duration and duration > 0:
             return int(duration) * 250000
         return 2 * 1024 * 1024 * 1024
+
+    def _estimate_size_from_bitrate(self, bitrate_kbps, duration_secs):
+        """bytes = kbps * 1000 / 8 * seconds. Returns None if either input
+        is missing/non-positive."""
+        if not bitrate_kbps or bitrate_kbps <= 0:
+            return None
+        if not duration_secs or duration_secs <= 0:
+            return None
+        return int(bitrate_kbps * 1000 / 8 * duration_secs)
+
+    def _resolve_estimated_size(self, movie, relations):
+        """Try every M3U relation for this movie until one returns a usable
+        bitrate (provider-dependent — the same movie may have bitrate via
+        one account and not another, see bead npx). Returns a bitrate-based
+        byte estimate, or None if no relation ever supplies bitrate (in
+        which case _estimate_size() falls back to the duration/placeholder
+        guess on every call — cheap, no need to cache a miss)."""
+        movie.refresh_from_db()
+        duration_secs = getattr(movie, "duration_secs", None)
+
+        for relation in relations:
+            bitrate = self._fetch_relation_bitrate(relation, force_refresh=False)
+            if bitrate is None:
+                continue
+            if not duration_secs:
+                movie.refresh_from_db()
+                duration_secs = getattr(movie, "duration_secs", None)
+            size = self._estimate_size_from_bitrate(bitrate, duration_secs)
+            if size:
+                logger.info(
+                    f"Movie {movie.id}: estimated size {size} bytes from "
+                    f"bitrate {bitrate}kbps via relation {relation.id} "
+                    f"(account {relation.m3u_account_id})"
+                )
+                return size
+
+        logger.info(
+            f"Movie {movie.id}: no relation returned bitrate info — "
+            f"falling back to placeholder size estimate"
+        )
+        return None
+
+    def _fetch_relation_bitrate(self, relation, force_refresh=False):
+        """Metadata-only Xtream get_vod_info() call via Dispatcharr's own
+        apps.vod.tasks.refresh_movie_advanced_data — no stream connection,
+        no provider slot consumed. Returns bitrate in kbps, or None if the
+        provider doesn't supply it for this relation. Bitrate availability
+        is per-provider, not just per-movie (e.g. the same title may report
+        bitrate via one M3U account but not another), so callers should try
+        every relation for a movie rather than stopping at the first one."""
+        try:
+            from apps.vod.tasks import refresh_movie_advanced_data
+            refresh_movie_advanced_data(relation.id, force_refresh=force_refresh)
+            relation.refresh_from_db()
+        except Exception as e:
+            logger.debug(f"_fetch_relation_bitrate: refresh failed for relation {relation.id}: {e}")
+            return None
+
+        detailed = (relation.custom_properties or {}).get("detailed_info", {})
+        bitrate = detailed.get("bitrate")
+        try:
+            bitrate = float(bitrate) if bitrate else None
+        except (TypeError, ValueError):
+            bitrate = None
+        return bitrate if bitrate and bitrate > 0 else None
 
     def trigger_plex_scan(self, settings):
         plex_url = settings.get("plex_url", "")

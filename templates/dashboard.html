@@ -1059,6 +1059,12 @@ function renderMaintenance(m) {
     : 'not run yet';
   rows.push(`<div class="health-item"><span>Audio Checks</span><span style="font-size:0.75rem;color:var(--text2)">${m.audio_checked_total||0} total, ${m.audio_missing_total||0} missing — last: ${audioDetail}</span></div>`);
 
+  const lastSizeReconcile = m.last_size_reconcile;
+  const sizeReconcileDetail = lastSizeReconcile
+    ? `${lastSizeReconcile.checked} checked, ${lastSizeReconcile.confirmed} confirmed — ${timeAgo(lastSizeReconcile.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Plex Size Reconcile<br>${namesLine(lastSizeReconcile && lastSizeReconcile.names)}</span><span style="font-size:0.75rem;color:var(--text2)">last: ${sizeReconcileDetail}</span></div>`);
+
   body.innerHTML = rows.join('');
 }
 

@@ -137,6 +137,12 @@ vod_plex_bridge/
 
 ## Changelog
 
+### v0.1.28 (2026-07-25)
+- **Fixed recurring re-analysis loop on activated movies** — Plex was periodically re-opening a real provider connection to already-activated, unwatched movies roughly every 18-20 minutes. Root cause: Plex compares the file size we declare in our HTTP response against the size it previously recorded for that file, and re-runs a full "Turbo analysis" (with a real streamed connection) whenever they don't match. Our previous fix (v0.1.27-era bitrate-based size estimate) narrowed the gap but couldn't guarantee an exact match, since it's a mathematical approximation and Plex requires bit-for-bit agreement with its own database.
+- **New: `confirmed_size` — ground-truth size reconciliation** — the plugin now reads back Plex's own recorded file size for each activated movie (the same value Plex already computed and trusts) and serves that instead of the bitrate estimate once it's known. Since the number being compared is Plex's own value read back to itself, it can never mismatch. Populated by two triggers: a fast background check shortly after each new activation (picks up Plex's real size within about a minute in practice), and a periodic maintenance sweep (every 10 minutes) that backfills any activated movie still missing a confirmed size — including titles activated before this fix existed.
+- **Dashboard**: new "Plex Size Reconcile" row on the Health tab's maintenance panel showing the last sweep's checked/confirmed counts.
+- **Net effect**: previously-activated, unwatched movies no longer trigger repeat re-analysis passes or the provider connections that come with them.
+
 ### v0.1.16 (2026-07-07)
 - **Fixed Provider/Category/Language dropdowns showing only one entry on desktop** — the base `.panel` CSS rule had `overflow: hidden` (originally just to round the panel's corners), but the Provider/Category/Language multi-select dropdowns are absolutely-positioned popouts that live inside a `.panel` — so their ancestor's `overflow: hidden` clipped the dropdown to the panel's own box, hiding everything past the first row even though the panel-body's own `max-height: 300px; overflow-y: auto` was configured correctly. Data was never the problem (the `/api/providers` endpoint always returned the full list). Fixed by moving `overflow: hidden` out of the base `.panel` rule and into an opt-in `.panel.clip` class for the one panel (Proxy Logs) that actually still needs edge clipping — dropdowns now expand and scroll properly on desktop.
 
