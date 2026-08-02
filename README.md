@@ -61,14 +61,6 @@ Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcha
 
 See **[INSTALL.md](INSTALL.md)** for full step-by-step setup: installing the plugin, configuring settings, exposing the port, setting up rclone on the Plex server, creating the Plex library, and finding your Plex Library Section ID.
 
-## Included Tooling
-
-This repository also includes **RCLONE MANAGER**, a browser-based companion app for managing persistent `rclone` remotes and mounts.
-
-- Source: [rclone_mount_manager](./rclone_mount_manager/)
-- Deploy guide: [RCLONE_MANAGER_DEPLOY.md](./RCLONE_MANAGER_DEPLOY.md)
-- Supported host modes: standard Linux with `systemd`, and Unraid with a platform-specific install path
-
 ## Usage
 
 1. Open the dashboard at `http://<host-ip>:<port>/`
