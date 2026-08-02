@@ -160,6 +160,18 @@ class Plugin:
                     "message": f"Port {port} is already in use by another process. "
                                 f"Check Status, or stop the existing process first.",
                 }
+            except Exception as e:
+                # Anything other than a port conflict here (DB not ready,
+                # bad settings, template/import errors) happens before the
+                # bridge's own activity log exists, so this is the only
+                # place a remote user without shell access can learn why
+                # Start Server silently failed — always log it, regardless
+                # of the debug_connections toggle.
+                log.error(f"VOD To Plex: server start failed: {e}", exc_info=True)
+                return {
+                    "status": "error",
+                    "message": f"Server failed to start: {e}",
+                }
 
             _server_instance = candidate
             _server_thread = threading.Thread(
@@ -169,6 +181,8 @@ class Plugin:
             )
             _server_thread.start()
             log.info(f"VOD To Plex server started on port {port}")
+            if candidate._bridge is not None:
+                candidate._bridge._log_event("info", f"Server started on port {port}")
             return {
                 "status": "ok",
                 "message": f"Server started on port {port}. Dashboard: http://{settings.get('dashboard_host', 'localhost')}:{port}/",
@@ -181,7 +195,15 @@ class Plugin:
         global _server_instance, _server_thread
         with _server_lock:
             if _server_instance is not None:
-                _server_instance.shutdown()
+                try:
+                    _server_instance.shutdown()
+                except Exception as e:
+                    # Same rationale as the start-path Exception branch above:
+                    # log unconditionally, since this is happening on the way
+                    # down and the activity log may not get another chance to
+                    # record it. Still clear tracked state below so the plugin
+                    # doesn't get stuck believing a dead server is running.
+                    log.error(f"VOD To Plex: error while stopping server: {e}", exc_info=True)
                 _server_instance = None
                 _server_thread = None
                 log.info("VOD To Plex server stopped")

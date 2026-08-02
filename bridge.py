@@ -827,7 +827,9 @@ class BridgeCore:
             from apps.vod.models import Movie
 
             return Movie.objects.count()
-        except Exception:
+        except Exception as e:
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"Catalog count query failed: {e}")
             return 0
 
     def get_catalog_summary(self):
@@ -836,6 +838,8 @@ class BridgeCore:
             total = Movie.objects.count()
         except Exception as e:
             logger.error(f"Movie count error: {e}")
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"Catalog summary count query failed: {e}")
             total = 0
 
         activated = len(self._activated)
@@ -856,6 +860,8 @@ class BridgeCore:
                 )
         except Exception as e:
             logger.error(f"Category summary error: {e}")
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"Category summary query failed: {e}")
 
         return {
             "total": total,
@@ -961,6 +967,8 @@ class BridgeCore:
             }
         except Exception as e:
             logger.error(f"list_movies error: {e}")
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"list_movies query failed: {e}")
             return {"movies": [], "total": 0, "error": str(e)}
 
     def list_activated(self):
@@ -1287,8 +1295,12 @@ class BridgeCore:
                     "status": "ok" if resp.status_code < 300 else "error",
                     "http_status": resp.status_code,
                 }
+                if settings.get("debug_connections"):
+                    self._log_event("debug", f"Health check -> Plex {plex_url}: HTTP {resp.status_code}")
             except Exception as e:
                 checks["plex"] = {"status": "error", "message": str(e)}
+                if settings.get("debug_connections"):
+                    self._log_event("debug", f"Health check -> Plex {plex_url} failed: {e}")
         else:
             checks["plex"] = {"status": "unconfigured"}
 
@@ -1309,6 +1321,8 @@ class BridgeCore:
                 timeout=5,
             )
             if resp.status_code != 200:
+                if settings.get("debug_connections"):
+                    self._log_event("debug", f"Plex sessions -> {plex_url} failed: HTTP {resp.status_code}")
                 return {"sessions": [], "error": f"HTTP {resp.status_code}"}
 
             root = ElementTree.fromstring(resp.text)
@@ -1349,6 +1363,8 @@ class BridgeCore:
 
             return {"sessions": sessions}
         except Exception as e:
+            if settings.get("debug_connections"):
+                self._log_event("debug", f"Plex sessions -> {plex_url} failed: {e}")
             return {"sessions": [], "error": str(e)}
 
     def deactivate_movies(self, body):
@@ -2504,9 +2520,13 @@ class BridgeCore:
                 headers={"X-Plex-Token": plex_token},
                 timeout=10,
             )
+            if settings.get("debug_connections"):
+                self._log_event("debug", f"Plex scan trigger -> {plex_url} section {section}: HTTP {resp.status_code}")
             return {
                 "status": "ok" if resp.status_code < 300 else "error",
                 "http_status": resp.status_code,
             }
         except Exception as e:
+            if settings.get("debug_connections"):
+                self._log_event("debug", f"Plex scan trigger -> {plex_url} section {section} failed: {e}")
             return {"status": "error", "message": str(e)}

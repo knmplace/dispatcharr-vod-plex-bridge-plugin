@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -89,6 +89,13 @@
       "label": "Streaming",
       "type": "info",
       "description": "Playback uses 302 redirect to Dispatcharr's native VOD proxy. No streaming configuration needed — Dispatcharr handles connections, Range requests, and session management."
+    },
+    {
+      "id": "debug_connections",
+      "label": "Debug: Log Connections & Server Errors",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Logs server start/stop errors and every connection to/from Dispatcharr and Plex (inbound VOD requests, outbound Plex API calls, redirect resolution) to the dashboard's Logs tab. Useful for diagnosing setup issues remotely. Generates a lot of log entries — leave off unless troubleshooting."
     },
     {
       "id": "_section_maintenance",

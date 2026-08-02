@@ -93,8 +93,10 @@ def _create_app(server, bridge, settings):
     def app(environ, start_response):
         try:
             return _dispatch(environ, start_response, server, bridge, settings)
-        except Exception:
+        except Exception as e:
             logger.exception("Unhandled error in request dispatch")
+            path = unquote(environ.get("PATH_INFO", "/"))
+            bridge._log_event("error", f"Unhandled error on {path}: {e}")
             return _text_response(start_response, 500, "Internal server error")
         finally:
             try:
@@ -109,6 +111,10 @@ def _create_app(server, bridge, settings):
 def _dispatch(environ, start_response, server, bridge, settings):
     method = environ["REQUEST_METHOD"]
     path = unquote(environ.get("PATH_INFO", "/"))
+
+    if settings.get("debug_connections") and path not in ("/api/ping",):
+        client_ip = environ.get("REMOTE_ADDR", "unknown")
+        bridge._log_event("debug", f"Inbound {method} {path} from {client_ip}")
 
     if path == "/api/ping" and method == "GET":
         return _json_response(start_response, {"plugin": "vod_plex_bridge"})
@@ -271,10 +277,14 @@ def _dispatch(environ, start_response, server, bridge, settings):
         if error:
             status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
             bridge.log_play_request(movie_id, client_ip, ok=False, detail=error)
+            if settings.get("debug_connections"):
+                bridge._log_event("debug", f"Redirect failed for movie {movie_id} (client {client_ip}): {error}")
             return _text_response(start_response, status, error)
 
         logger.info(f"302 redirect: movie {movie_id} -> {redirect_url}")
         bridge.log_play_request(movie_id, client_ip, ok=True, detail=None, account_id=account_id, stream_id=stream_id)
+        if settings.get("debug_connections"):
+            bridge._log_event("debug", f"Outbound redirect: movie {movie_id} -> {redirect_url} (client {client_ip})")
         start_response("302 Found", [("Location", redirect_url)])
         return [b""]
 
