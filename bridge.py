@@ -83,6 +83,20 @@ class BridgeCore:
     # activity rotates through its history faster than a quiet one.
     ACTIVITY_LOG_MAXLEN = 500
 
+    # _last_play_log, _redirect_locks, _recent_redirects, and
+    # _stall_last_switch all gain one entry per distinct movie (or
+    # movie+stream) ever played/redirected/stalled, and — unlike
+    # _stall_watch, which self-prunes every watchdog tick — nothing ever
+    # removed entries from them, so a long-lived server process accumulated
+    # one permanently-retained dict entry per title touched over its entire
+    # uptime. Each is only ever read via a short time-window comparison
+    # (PLAY_LOG_DEDUP_SECS / REDIRECT_COALESCE_SECS / STALL_COOLDOWN_SECS,
+    # all well under an hour), so anything older than this is guaranteed
+    # stale for every one of those checks and safe to drop. Swept once per
+    # watchdog tick alongside _check_for_stalls().
+    STALE_TRACKING_ENTRY_MAXAGE_SECS = 3600
+    STALE_TRACKING_SWEEP_INTERVAL_SECS = 600
+
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
@@ -102,6 +116,7 @@ class BridgeCore:
         self._last_removed_check = 0.0
         self._last_stream_refresh_check = 0.0
         self._last_size_reconcile = 0.0
+        self._last_tracking_sweep = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
         # Running counters surfaced on the Health tab so cleanup/refresh
         # activity is visible without digging through the activity log.
@@ -287,6 +302,13 @@ class BridgeCore:
                 except Exception as e:
                     logger.error(f"Size reconcile sweep error: {e}")
 
+            if now - self._last_tracking_sweep >= self.STALE_TRACKING_SWEEP_INTERVAL_SECS:
+                self._last_tracking_sweep = now
+                try:
+                    self._prune_stale_tracking_entries()
+                except Exception as e:
+                    logger.error(f"Stale tracking sweep error: {e}")
+
     def _check_for_stalls(self):
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
@@ -342,6 +364,39 @@ class BridgeCore:
         for mid in list(self._stall_watch.keys()):
             if mid not in seen_mids:
                 self._stall_watch.pop(mid, None)
+
+    def _prune_stale_tracking_entries(self):
+        """Evict entries older than STALE_TRACKING_ENTRY_MAXAGE_SECS from the
+        per-movie tracking dicts that otherwise only ever grow (see the
+        comment on STALE_TRACKING_ENTRY_MAXAGE_SECS). Each dict's own
+        consumer only ever compares against a much shorter window, so
+        nothing this old can still be "live" for any of them."""
+        cutoff = time.time() - self.STALE_TRACKING_ENTRY_MAXAGE_SECS
+
+        for mid, ts in list(self._stall_last_switch.items()):
+            if ts < cutoff:
+                self._stall_last_switch.pop(mid, None)
+
+        for key, ts in list(self._last_play_log.items()):
+            if ts < cutoff:
+                self._last_play_log.pop(key, None)
+
+        for mid, cached in list(self._recent_redirects.items()):
+            if cached[0] < cutoff:
+                self._recent_redirects.pop(mid, None)
+
+        # _redirect_locks holds live threading.Lock objects with no
+        # timestamp of their own, so age can't be judged directly. Instead,
+        # only drop a lock if it's currently free (a non-blocking acquire
+        # succeeds) — that means no in-flight get_redirect_url() call is
+        # using it right now, so it's safe to discard; a future call for
+        # that movie just creates a fresh one. A lock that's actually held
+        # is left alone regardless of how long it's been in the dict.
+        with self._redirect_locks_guard:
+            for mid, lock in list(self._redirect_locks.items()):
+                if lock.acquire(blocking=False):
+                    lock.release()
+                    self._redirect_locks.pop(mid, None)
 
     def _reconcile_removed_movies(self):
         """Clean up activated movies that no longer exist in Dispatcharr's VOD
