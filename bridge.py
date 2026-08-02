@@ -835,7 +835,14 @@ class BridgeCore:
     def get_catalog_summary(self):
         try:
             from apps.vod.models import Movie
+            import django
             total = Movie.objects.count()
+            if self.settings.get("debug_connections"):
+                try:
+                    db_name = django.db.connection.settings_dict.get("NAME", "?")
+                except Exception:
+                    db_name = "?"
+                self._log_event("debug", f"Catalog summary: Movie.objects.count()={total} (db={db_name})")
         except Exception as e:
             logger.error(f"Movie count error: {e}")
             if self.settings.get("debug_connections"):
@@ -858,6 +865,8 @@ class BridgeCore:
                         "count": cat.movie_count,
                     }
                 )
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"Catalog summary: {len(categories)} categor(y/ies) with movies")
         except Exception as e:
             logger.error(f"Category summary error: {e}")
             if self.settings.get("debug_connections"):
@@ -916,6 +925,14 @@ class BridgeCore:
 
             qs = qs.order_by("name")
             total = qs.count()
+            if self.settings.get("debug_connections"):
+                self._log_event(
+                    "debug",
+                    f"list_movies: total={total} page={page} per_page={per_page} "
+                    f"filters(search={bool(search)}, director={bool(director)}, "
+                    f"providers={provider_ids}, categories={category_ids}, "
+                    f"languages={languages}, activated_only={bool(activated_only)})",
+                )
 
             offset = (page - 1) * per_page
             movies = []
