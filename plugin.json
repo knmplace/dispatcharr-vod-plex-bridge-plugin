@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -96,6 +96,15 @@
       "type": "boolean",
       "default": false,
       "help_text": "Logs server start/stop errors and every connection to/from Dispatcharr and Plex (inbound VOD requests, outbound Plex API calls, redirect resolution) to the dashboard's Logs tab. Useful for diagnosing setup issues remotely. Generates a lot of log entries — leave off unless troubleshooting."
+    },
+    {
+      "id": "max_concurrent_per_title",
+      "label": "Max Concurrent Connections Per Title",
+      "type": "number",
+      "default": 2,
+      "help_text": "Caps how many simultaneous real Dispatcharr VOD connections a single movie or episode can hold. rclone's VFS mount can re-open a file's stream several times over the course of one watch (not just a millisecond read-ahead burst) — each open is a separate real provider connection unless capped here. Extra sessions beyond the limit are force-dropped, keeping the most recently active ones, both when a new stream is requested AND on an ongoing ~10s background sweep (so connections opened outside the normal redirect flow, e.g. rclone re-hitting an already-issued redirect URL directly, still get caught). Set too high (or 0 to disable) relative to what your IPTV provider actually allows and you WILL hammer their concurrent-connection limit — most providers cap total simultaneous streams per account (commonly 1-3), and every activated title sharing that account competes for the same pool, so this should generally match or sit under your provider's per-account connection limit, not just what feels reasonable for one show.",
+      "min": 0,
+      "max": 10
     },
     {
       "id": "_section_maintenance",

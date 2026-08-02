@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from email.utils import formatdate
 from io import BytesIO
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, unquote
@@ -237,6 +238,10 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.deactivate_episodes(body))
 
+    if path == "/api/episodes/reactivate" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.reactivate_episodes(body))
+
     if path == "/api/health" and method == "GET":
         return _json_response(start_response, bridge.health_check(settings))
 
@@ -305,6 +310,91 @@ def _dispatch(environ, start_response, server, bridge, settings):
         ])
         return [body]
 
+    # --- Series VOD filesystem (separate endpoint/mount from /vod/ so Plex's
+    # Movies library scan root never sees a Series/Season/Episode subtree --
+    # see CLAUDE.md "Series Support") ---
+    if path == "/vod-series":
+        start_response("301 Moved Permanently", [("Location", "/vod-series/")])
+        return [b""]
+
+    if path.startswith("/vod-series/"):
+        subpath = path[len("/vod-series/"):]
+        if subpath == "" or subpath.endswith("/"):
+            if method == "HEAD":
+                start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+                return [b""]
+            html = bridge.list_series_vod_directory(subpath)
+            body = html.encode("utf-8")
+            start_response("200 OK", [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ])
+            return [body]
+
+        if subpath.endswith(".nfo"):
+            file_bytes, mtime, error = bridge.read_series_vod_file(subpath)
+            if error:
+                return _text_response(start_response, 404, "Not found")
+            # rclone's http backend reads a file's modtime from this header
+            # (not from the directory listing HTML) -- without it every
+            # series file reads back as rclone's zero-epoch sentinel, which
+            # makes Plex's TV scanner treat the season/series folder as
+            # permanently unchanged and skip walking it (bead za8).
+            headers = [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(file_bytes))),
+                ("Last-Modified", formatdate(mtime, usegmt=True)),
+            ]
+            if method == "HEAD":
+                start_response("200 OK", headers)
+                return [b""]
+            start_response("200 OK", headers)
+            return [file_bytes]
+
+        if subpath.endswith(".mkv") or subpath.endswith(".mp4"):
+            # Synthetic entry -- mirrors the movies /vod/ .mkv route and the
+            # existing /vod/episode/ route: fake HEAD metadata, then a 302
+            # redirect to Dispatcharr's real proxy stream on GET. No file
+            # exists on disk for these; list_series_vod_directory() only
+            # advertises them in the listing (bead za8 -- real .strm files
+            # scanned/matched fine but failed Plex's "get a decision" step).
+            filename = subpath.rsplit("/", 1)[-1]
+            episode_id = _extract_movie_id(filename)
+            if not episode_id:
+                return _text_response(start_response, 404, "Not found")
+
+            if method == "HEAD":
+                info = bridge.get_episode_info(episode_id)
+                if not info:
+                    return _text_response(start_response, 404, "Not found")
+                headers = [
+                    ("Accept-Ranges", "bytes"),
+                    ("Content-Type", info.get("content_type", "video/x-matroska")),
+                ]
+                file_size = info.get("file_size")
+                if file_size:
+                    headers.append(("Content-Length", str(file_size)))
+                start_response("200 OK", headers)
+                return [b""]
+
+            client_ip = environ.get("REMOTE_ADDR", "unknown")
+            redirect_url, error, account_id, stream_id = bridge.get_episode_redirect_url(episode_id)
+            if error:
+                status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
+                bridge.log_episode_play_request(episode_id, client_ip, ok=False, detail=error)
+                if settings.get("debug_connections"):
+                    bridge._log_event("debug", f"Redirect failed for episode {episode_id} (client {client_ip}): {error}")
+                return _text_response(start_response, status, error)
+
+            logger.info(f"302 redirect: episode {episode_id} -> {redirect_url}")
+            bridge.log_episode_play_request(episode_id, client_ip, ok=True, detail=None, account_id=account_id, stream_id=stream_id)
+            if settings.get("debug_connections"):
+                bridge._log_event("debug", f"Outbound redirect: episode {episode_id} -> {redirect_url} (client {client_ip})")
+            start_response("302 Found", [("Location", redirect_url)])
+            return [b""]
+
+        return _text_response(start_response, 404, "Not found")
+
     if path.startswith("/vod/episode/"):
         filename = path[len("/vod/episode/"):]
         episode_id = _extract_movie_id(filename)
@@ -312,10 +402,17 @@ def _dispatch(environ, start_response, server, bridge, settings):
             return _text_response(start_response, 404, "Not found")
 
         if method == "HEAD":
-            start_response("200 OK", [
+            info = bridge.get_episode_info(episode_id)
+            if not info:
+                return _text_response(start_response, 404, "Not found")
+            headers = [
                 ("Accept-Ranges", "bytes"),
-                ("Content-Type", "video/x-matroska"),
-            ])
+                ("Content-Type", info.get("content_type", "video/x-matroska")),
+            ]
+            file_size = info.get("file_size")
+            if file_size:
+                headers.append(("Content-Length", str(file_size)))
+            start_response("200 OK", headers)
             return [b""]
 
         client_ip = environ.get("REMOTE_ADDR", "unknown")

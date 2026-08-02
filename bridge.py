@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from datetime import datetime
 
 import requests
 
@@ -113,10 +114,14 @@ class BridgeCore:
         self._redirect_locks = {}  # movie_id -> threading.Lock, serializes concurrent get_redirect_url calls
         self._redirect_locks_guard = threading.Lock()  # protects _redirect_locks dict itself
         self._recent_redirects = {}  # movie_id -> (timestamp, redirect_url, error, account_id, stream_id)
+        self._episode_redirect_locks = {}  # episode_id -> threading.Lock, mirrors _redirect_locks for episodes
+        self._episode_redirect_locks_guard = threading.Lock()
+        self._recent_episode_redirects = {}  # episode_id -> (timestamp, redirect_url, error, account_id, stream_id)
         self._watchdog_thread = None
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
         self._last_removed_check = 0.0
+        self._last_removed_episode_check = 0.0
         self._last_stream_refresh_check = 0.0
         self._last_size_reconcile = 0.0
         self._last_tracking_sweep = 0.0
@@ -256,6 +261,11 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"Stall watchdog error: {e}")
 
+            try:
+                self._enforce_max_concurrent_globally()
+            except Exception as e:
+                logger.error(f"Global max-concurrent sweep error: {e}")
+
             self._watchdog_ticks += 1
             try:
                 interval = int(self.settings.get(
@@ -273,6 +283,13 @@ class BridgeCore:
                     self._reconcile_removed_movies()
                 except Exception as e:
                     logger.error(f"Removed-movie reconciliation error: {e}")
+
+            if now - self._last_removed_episode_check >= interval:
+                self._last_removed_episode_check = now
+                try:
+                    self._reconcile_removed_episodes()
+                except Exception as e:
+                    logger.error(f"Removed-episode reconciliation error: {e}")
 
             try:
                 refresh_days = float(self.settings.get(
@@ -304,6 +321,10 @@ class BridgeCore:
                     self._reconcile_all_confirmed_sizes()
                 except Exception as e:
                     logger.error(f"Size reconcile sweep error: {e}")
+                try:
+                    self._reconcile_all_confirmed_episode_sizes()
+                except Exception as e:
+                    logger.error(f"Episode size reconcile sweep error: {e}")
 
             if now - self._last_tracking_sweep >= self.STALE_TRACKING_SWEEP_INTERVAL_SECS:
                 self._last_tracking_sweep = now
@@ -401,6 +422,16 @@ class BridgeCore:
                     lock.release()
                     self._redirect_locks.pop(mid, None)
 
+        for eid, cached in list(self._recent_episode_redirects.items()):
+            if cached[0] < cutoff:
+                self._recent_episode_redirects.pop(eid, None)
+
+        with self._episode_redirect_locks_guard:
+            for eid, lock in list(self._episode_redirect_locks.items()):
+                if lock.acquire(blocking=False):
+                    lock.release()
+                    self._episode_redirect_locks.pop(eid, None)
+
     def _reconcile_removed_movies(self):
         """Clean up activated movies that no longer exist in Dispatcharr's VOD
         catalog (e.g. dropped by an M3U account refresh).
@@ -472,6 +503,89 @@ class BridgeCore:
             "warn",
             f"Cleanup check: {len(activated_ids)} activated movie(s) checked, "
             f"{len(removed)} removed ({titles}) — no longer in Dispatcharr's catalog",
+        )
+
+    def _reconcile_removed_episodes(self):
+        """Mirrors _reconcile_removed_movies() for episodes/series. Dispatcharr
+        can drop or renumber Episode/Series rows on an M3U/VOD catalog
+        refresh (observed live: a series' id and all its episode ids changed
+        entirely, then the whole series vanished from the catalog on a later
+        refresh) — without this check a stale self._episodes_activated entry
+        just points at nothing forever: dead STRM files on disk, a stale Plex
+        entry, and "Series Activated: N" in the dashboard header for a title
+        Activated Only search can never find.
+        """
+        if not self._episodes_activated:
+            return
+
+        try:
+            from apps.vod.models import Episode
+        except Exception:
+            return
+
+        activated_ids = [int(eid) for eid in self._episodes_activated.keys() if eid.isdigit()]
+        if not activated_ids:
+            return
+
+        existing_ids = set(
+            str(i) for i in Episode.objects.filter(id__in=activated_ids).values_list("id", flat=True)
+        )
+        removed = [eid for eid in self._episodes_activated.keys() if eid not in existing_ids]
+
+        if not removed:
+            self._maint_stats["last_removed_episode_check"] = {
+                "ts": time.time(), "checked": len(activated_ids), "removed": 0,
+            }
+            self._save_state()
+            self._log_event(
+                "info",
+                f"Cleanup check: {len(activated_ids)} activated episode(s) checked, none removed",
+            )
+            return
+
+        removed_names = [
+            f"{self._episodes_activated[eid].get('series_name', '?')} "
+            f"S{self._episodes_activated[eid].get('season_number', '?')}"
+            f"E{self._episodes_activated[eid].get('episode_number', '?')}"
+            for eid in removed
+        ]
+
+        logger.warning(
+            f"Reconciliation: {len(removed)} activated episode(s) no longer in "
+            f"Dispatcharr's VOD catalog — removing: {removed}"
+        )
+
+        removal_info = {
+            eid: (
+                self._episodes_activated[eid].get("category_id"),
+                self._episodes_activated[eid].get("strm_folder"),
+                self._episodes_activated[eid].get("strm_stem"),
+            )
+            for eid in removed
+        }
+        plex_match_info = {eid: self._episodes_activated[eid] for eid in removed}
+
+        self._remove_strm_for_episodes(removal_info)
+        plex_removed = self._plex_delete_episodes(plex_match_info)
+
+        for eid in removed:
+            self._episodes_activated.pop(eid, None)
+
+        self._maint_stats["removed_episode_total"] = (
+            self._maint_stats.get("removed_episode_total", 0) + len(removed)
+        )
+        self._maint_stats["last_removed_episode_check"] = {
+            "ts": time.time(), "checked": len(activated_ids), "removed": len(removed),
+            "removed_names": removed_names, "plex_removed": plex_removed,
+        }
+        self._save_state()
+
+        titles = ", ".join(f'"{n}"' for n in removed_names)
+        self._log_event(
+            "warn",
+            f"Cleanup check: {len(activated_ids)} activated episode(s) checked, "
+            f"{len(removed)} removed ({titles}) — no longer in Dispatcharr's catalog "
+            f"({plex_removed} removed from Plex)",
         )
 
     def _auto_refresh_stream_picks(self, refresh_secs):
@@ -1142,6 +1256,19 @@ class BridgeCore:
 
     # --- Series / Season / Episode browse ---
 
+    def _activated_series_episode_counts(self):
+        """series_id (str) -> count of currently-activated episodes, derived
+        from self._episodes_activated (keyed by episode_id, each entry
+        carrying series_id) -- there's no per-series activated flag, only
+        per-episode, so callers needing series-level activated state
+        (badges, Activated Only filter) aggregate through this."""
+        counts = {}
+        for entry in self._episodes_activated.values():
+            sid = entry.get("series_id")
+            if sid:
+                counts[sid] = counts.get(sid, 0) + 1
+        return counts
+
     def list_series(self, query):
         try:
             from apps.vod.models import Series
@@ -1151,6 +1278,9 @@ class BridgeCore:
             search = query.get("search", [""])[0]
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
+            activated_only = query.get("activated_only", [""])[0]
+
+            activated_counts = self._activated_series_episode_counts()
 
             qs = Series.objects.all()
 
@@ -1166,6 +1296,13 @@ class BridgeCore:
                 qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
             elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
+
+            if activated_only:
+                activated_ids = [int(sid) for sid in activated_counts.keys() if sid.isdigit()]
+                if activated_ids:
+                    qs = qs.filter(id__in=activated_ids)
+                else:
+                    qs = qs.none()
 
             qs = qs.order_by("name")
             total = qs.count()
@@ -1209,6 +1346,7 @@ class BridgeCore:
                         "uuid": str(getattr(s, "uuid", "")),
                         "episode_count": getattr(s, "episode_count", None),
                         "trailer_key": trailer_key,
+                        "activated_episode_count": activated_counts.get(sid, 0),
                     }
                 )
 
@@ -1302,6 +1440,7 @@ class BridgeCore:
                         "episode_number": ep.episode_number,
                         "tmdb_id": getattr(ep, "tmdb_id", None),
                         "provider_count": len(relations),
+                        "activated": eid in self._episodes_activated,
                     }
                 )
 
@@ -1405,7 +1544,7 @@ class BridgeCore:
                 "stream_pick": chosen_relation.stream_id,
                 "category_id": category["id"],
                 "series_id": str(episode.series_id),
-                "series_name": episode.series.name,
+                "series_name": self._clean_title(episode.series.name),
                 "season_number": episode.season_number,
                 "episode_number": episode.episode_number,
             }
@@ -1419,6 +1558,12 @@ class BridgeCore:
             strm_count = self._generate_strm_for_episodes(activated, category)
             self._save_state()
             self._trigger_plex_scan(section=category["plex_library_section"])
+            for eid in activated:
+                threading.Thread(
+                    target=self._size_reconcile_fast_path_episode,
+                    args=(eid,),
+                    daemon=True,
+                ).start()
             titles = ", ".join(f'"{n}"' for n in activated_names)
             self._log_event(
                 "info",
@@ -1442,20 +1587,108 @@ class BridgeCore:
             "failed_names": failed_names,
         }
 
+    def reactivate_episodes(self, body):
+        """Manual 'Reactivate' for already-activated episodes, mirroring
+        reactivate_movies(): clears the cached stream_pick and rewrites
+        NFO/tvshow.nfo in place, but does NOT touch Plex (no delete, no
+        scan) — Plex picks up the on-disk change on its own next scan.
+
+        Exists because activate_episodes() silently skips any eid already
+        in self._episodes_activated (`if eid in self._episodes_activated:
+        continue`), so re-clicking "Activate" on an already-activated series
+        is a complete no-op: no STRM/NFO regen, no tvshow.nfo backfill for
+        series activated before that fix existed, and critically no Plex
+        scan trigger — which looked like "activating does nothing" and
+        "no call to Plex is happening" from the dashboard, when actually
+        activate was just refusing to do anything a second time."""
+        episode_ids = [str(eid) for eid in body.get("episode_ids", [])]
+        targets = [eid for eid in episode_ids if eid in self._episodes_activated]
+        if not targets:
+            return {"status": "ok", "reactivated": 0, "names": []}
+
+        try:
+            from apps.vod.models import Episode
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        for eid in targets:
+            entry = self._episodes_activated[eid]
+            try:
+                episode = Episode.objects.select_related("series").get(id=int(eid))
+            except Episode.DoesNotExist:
+                continue
+            relations = list(episode.m3u_relations.all())
+            if not relations:
+                continue
+            preferred = relations[0]
+            cached_stream_id = entry.get("stream_pick")
+            if cached_stream_id is not None:
+                for r in relations:
+                    if str(r.stream_id) == str(cached_stream_id):
+                        preferred = r
+                        break
+            relation = self._pick_relation_with_capacity(relations, preferred)
+            entry["stream_pick"] = relation.stream_id
+
+        self._save_state()
+
+        by_category = {}
+        for eid in targets:
+            cat_id = self._episodes_activated[eid].get("category_id")
+            by_category.setdefault(cat_id, []).append(eid)
+
+        strm_count = 0
+        for cat_id, eids in by_category.items():
+            category = self._resolve_series_category(cat_id)
+            if category is None:
+                continue
+            strm_count += self._generate_strm_for_episodes(eids, category)
+        self._save_state()
+
+        reactivated = len(targets)
+        names = [
+            f'{self._episodes_activated[eid].get("series_name", "?")} '
+            f'S{self._episodes_activated[eid].get("season_number", "?")}'
+            f'E{self._episodes_activated[eid].get("episode_number", "?")}'
+            for eid in targets
+        ]
+        self._maint_stats["reactivated_episode_total"] = (
+            self._maint_stats.get("reactivated_episode_total", 0) + reactivated
+        )
+        self._maint_stats["last_reactivate_episode"] = {
+            "ts": time.time(), "reactivated": reactivated, "names": names,
+        }
+        self._save_state()
+
+        titles = ", ".join(f'"{n}"' for n in names)
+        self._log_event(
+            "info",
+            f"Reactivated {reactivated} episode(s): {titles} — NFO refreshed, Plex untouched",
+        )
+        return {"status": "ok", "reactivated": reactivated, "names": names}
+
     def _generate_strm_for_episodes(self, episode_ids, category):
-        """Batched in chunks of EPISODE_STRM_BATCH_SIZE with a short delay
-        between chunks, so a large series/season activate-all doesn't write
-        hundreds of STRM files (and implicitly demand a Plex scan) in one
-        instant -- the batching half of the safety valve alongside the
-        capacity gate above and the single-scan Plex lock."""
+        """Creates the real Series/Season directories (required so Plex's TV
+        agent can identify series/season from the folder structure) and a
+        real .nfo per episode, but no .strm file -- the episode's .mkv entry
+        is synthesized on the fly by list_series_vod_directory() from
+        self._episodes_activated, same as movies' list_vod_directory().
+        A real .strm file previously served here made Plex's "get a decision"
+        step fail for playback even after the folder scanned/matched fine;
+        switching to a synthetic .mkv + 302 redirect mirrors the movies path,
+        which has no such issue (bead za8).
+
+        Batched in chunks of EPISODE_STRM_BATCH_SIZE with a short delay
+        between chunks, so a large series/season activate-all doesn't demand
+        a Plex scan all at once -- the batching half of the safety valve
+        alongside the capacity gate above and the single-scan Plex lock."""
         base_dir = self._series_category_path(category["strm_folder"])
-        port = int(self.settings.get("http_port", 8888))
-        host = self.settings.get("dashboard_host", "127.0.0.1")
         os.makedirs(base_dir, exist_ok=True)
 
         from apps.vod.models import Episode
 
         count = 0
+        nfo_written_for = set()
         for batch_start in range(0, len(episode_ids), self.EPISODE_STRM_BATCH_SIZE):
             batch = episode_ids[batch_start : batch_start + self.EPISODE_STRM_BATCH_SIZE]
             for eid in batch:
@@ -1468,29 +1701,31 @@ class BridgeCore:
                     series_name = self._clean_title(episode.series.name)
                     year = getattr(episode.series, "year", None)
                     series_folder_name = f"{series_name} ({year})" if year else series_name
+                    series_dir = os.path.join(base_dir, series_folder_name)
                     season_folder_name = f"Season {episode.season_number:02d}"
-                    folder = os.path.join(base_dir, series_folder_name, season_folder_name)
+                    folder = os.path.join(series_dir, season_folder_name)
                     os.makedirs(folder, exist_ok=True)
 
+                    if series_folder_name not in nfo_written_for:
+                        self._write_tvshow_nfo(episode.series, series_dir, clean_title=series_name)
+                        nfo_written_for.add(series_folder_name)
+
+                    ep_label = f"S{episode.season_number:02d}E{episode.episode_number:02d}"
                     ep_title = self._clean_title(episode.name) if episode.name else ""
-                    file_stem = f"{series_folder_name} - S{episode.season_number:02d}E{episode.episode_number:02d}"
+                    ep_title = self._strip_episode_name_prefix(ep_title, series_name, ep_label)
+                    file_stem = f"{series_folder_name} - {ep_label}"
                     if ep_title:
                         file_stem += f" - {ep_title}"
 
-                    strm_url = f"http://{host}:{port}/vod/episode/{eid}.mkv"
-                    strm_path = os.path.join(folder, f"{file_stem}.strm")
-                    with open(strm_path, "w") as f:
-                        f.write(strm_url)
-
-                    self._write_episode_nfo(episode, folder, file_stem)
+                    self._write_episode_nfo(episode, folder, file_stem, clean_title=ep_title)
 
                     if eid in self._episodes_activated:
                         self._episodes_activated[eid]["strm_folder"] = os.path.join(
-                            series_folder_name, season_folder_name
+                            category["strm_folder"], series_folder_name, season_folder_name
                         )
                         self._episodes_activated[eid]["strm_stem"] = file_stem
                     count += 1
-                    logger.info(f"Episode STRM generated: {file_stem}")
+                    logger.info(f"Episode folder/NFO generated: {file_stem}")
                 except Exception as e:
                     logger.error(f"Episode STRM generation failed for {eid}: {e}")
                     self._log_event("error", f"Episode STRM generation failed for id={eid}: {e}")
@@ -1501,12 +1736,13 @@ class BridgeCore:
 
         return count
 
-    def _write_episode_nfo(self, episode, folder, file_stem):
+    def _write_episode_nfo(self, episode, folder, file_stem, clean_title=None):
         nfo_path = os.path.join(folder, f"{file_stem}.nfo")
+        title = clean_title if clean_title is not None else (episode.name or "")
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             "<episodedetails>",
-            f"  <title>{self._xml_escape(episode.name or '')}</title>",
+            f"  <title>{self._xml_escape(title)}</title>",
             f"  <season>{episode.season_number}</season>",
             f"  <episode>{episode.episode_number}</episode>",
         ]
@@ -1530,12 +1766,59 @@ class BridgeCore:
         except Exception as e:
             logger.error(f"Episode NFO write failed for {file_stem}: {e}")
 
+    def _write_tvshow_nfo(self, series, series_dir, clean_title=None):
+        """Series-level identity anchor for Plex's TV agent. Without a
+        tvshow.nfo at the show's root folder, Plex has only the folder name
+        and thin per-episode metadata to identify each show in a shared
+        library section -- observed live: activating a second, unrelated
+        show into the same "Comedy" Plex section caused Plex to attribute
+        its episodes to the first show already in that library instead of
+        creating its own show entry, because nothing pinned each folder to
+        a distinct show identity. Written once per series folder (skipped
+        if already present) alongside the per-episode NFOs."""
+        nfo_path = os.path.join(series_dir, "tvshow.nfo")
+        if os.path.exists(nfo_path):
+            return
+        title = clean_title if clean_title is not None else (getattr(series, "name", "") or "")
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            "<tvshow>",
+            f"  <title>{self._xml_escape(title)}</title>",
+        ]
+        year = getattr(series, "year", None)
+        if year:
+            lines.append(f"  <year>{year}</year>")
+        desc = getattr(series, "description", "")
+        if desc:
+            lines.append(f"  <plot>{self._xml_escape(desc)}</plot>")
+        genre = getattr(series, "genre", "")
+        if genre:
+            for g in str(genre).split(","):
+                g = g.strip()
+                if g:
+                    lines.append(f"  <genre>{self._xml_escape(g)}</genre>")
+        rating = getattr(series, "rating", None)
+        if rating:
+            lines.append(f"  <rating>{rating}</rating>")
+        tmdb_id = getattr(series, "tmdb_id", None)
+        if tmdb_id:
+            lines.append(f"  <uniqueid type=\"tmdb\" default=\"true\">{tmdb_id}</uniqueid>")
+        lines.append("</tvshow>")
+
+        try:
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            logger.info(f"tvshow.nfo written for {title}")
+        except Exception as e:
+            logger.error(f"tvshow.nfo write failed for {title}: {e}")
+
     def deactivate_episodes(self, body):
         episode_ids = body.get("episode_ids", [])
         deactivated = []
         # (category_id, folder_rel, file_stem) captured before delete since
         # removal needs the category's base strm_folder to build the path.
         removal_info = {}
+        plex_match_info = {}
         for eid in episode_ids:
             eid = str(eid)
             if eid in self._episodes_activated:
@@ -1545,19 +1828,92 @@ class BridgeCore:
                     entry.get("strm_folder"),
                     entry.get("strm_stem"),
                 )
+                plex_match_info[eid] = entry
                 del self._episodes_activated[eid]
                 deactivated.append(eid)
 
         self._save_state()
 
+        plex_removed = 0
         if deactivated:
             self._remove_strm_for_episodes(removal_info)
+            plex_removed = self._plex_delete_episodes(plex_match_info)
             self._log_event(
                 "info",
-                f"Deactivated {len(deactivated)} episode(s)",
+                f"Deactivated {len(deactivated)} episode(s) — removed {plex_removed} from Plex",
             )
 
-        return {"status": "ok", "deactivated": len(deactivated)}
+        return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
+
+    def _plex_delete_episodes(self, plex_match_info):
+        """Mirrors _plex_delete_movies() for episodes. Episode STRM filenames
+        don't embed the episode id (unlike movies' {id}.mkv), so matching is
+        by series name + season/episode number against Plex's own episode
+        metadata (grandparentTitle/parentIndex/index) instead of filename
+        regex. Grouped per plex_library_section since each Series Settings
+        category can point at a different Plex TV library."""
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token:
+            return 0
+
+        by_section = {}
+        for eid, entry in plex_match_info.items():
+            category = self._resolve_series_category(entry.get("category_id"))
+            section = category["plex_library_section"] if category else None
+            if section in (None, "", self.PLEX_SECTION_UNSET):
+                continue
+            by_section.setdefault(section, []).append(entry)
+
+        removed = 0
+        for section, entries in by_section.items():
+            try:
+                resp = requests.get(
+                    f"{plex_url}/library/sections/{section}/all",
+                    params={"X-Plex-Token": plex_token, "type": "4"},
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
+                    continue
+
+                items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+                wanted = {
+                    (e.get("series_name", ""), str(e.get("season_number", "")), str(e.get("episode_number", "")))
+                    for e in entries
+                }
+                logger.info(f"Plex episode delete: wanted={wanted}")
+                logger.info(
+                    "Plex episode delete: available="
+                    + str([(it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index")) for it in items])
+                )
+
+                for item in items:
+                    key = (
+                        item.get("grandparentTitle", ""),
+                        str(item.get("parentIndex", "")),
+                        str(item.get("index", "")),
+                    )
+                    if key not in wanted:
+                        continue
+                    rating_key = item.get("ratingKey")
+                    title = item.get("title", "?")
+                    del_resp = requests.delete(
+                        f"{plex_url}/library/metadata/{rating_key}",
+                        params={"X-Plex-Token": plex_token},
+                        timeout=10,
+                    )
+                    if del_resp.status_code in (200, 204):
+                        removed += 1
+                        logger.info(f"Plex: deleted episode {title} (key {rating_key})")
+                    else:
+                        logger.warning(f"Plex delete episode {title} returned {del_resp.status_code}")
+            except Exception as e:
+                logger.error(f"Plex episode removal failed for section {section}: {e}")
+
+        logger.info(f"Plex cleanup: removed {removed} episode(s)")
+        return removed
 
     def _remove_strm_for_episodes(self, removal_info):
         import shutil as _shutil
@@ -1568,21 +1924,20 @@ class BridgeCore:
                 logger.warning(f"Episode STRM removal skipped for {eid}: no known folder/category")
                 continue
             try:
-                base_dir = self._series_category_path(category["strm_folder"])
-                folder = os.path.join(base_dir, folder_rel)
+                series_root = self._series_category_path("")
+                category_base = self._series_category_path(category["strm_folder"])
+                folder = os.path.join(series_root, folder_rel)
                 if file_stem:
-                    strm_path = os.path.join(folder, f"{file_stem}.strm")
                     nfo_path = os.path.join(folder, f"{file_stem}.nfo")
-                    for p in (strm_path, nfo_path):
-                        if os.path.exists(p):
-                            os.remove(p)
+                    if os.path.exists(nfo_path):
+                        os.remove(nfo_path)
                     # Clean up the season/series folders if now empty, but
                     # never delete the shared category base_dir itself.
                     try:
                         season_dir = folder
                         os.rmdir(season_dir)
                         series_dir = os.path.dirname(season_dir)
-                        if os.path.abspath(series_dir) != os.path.abspath(base_dir):
+                        if os.path.abspath(series_dir) != os.path.abspath(category_base):
                             os.rmdir(series_dir)
                     except OSError:
                         pass  # not empty -- other episodes still activated
@@ -1590,43 +1945,244 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"Episode STRM removal error for {eid}: {e}")
 
-    def get_episode_redirect_url(self, episode_id):
+    def get_episode_info(self, episode_id):
+        """Mirrors get_movie_info() -- Plex's analyzer HEAD-probes this URL
+        during library scan and needs a real Content-Length or it concludes
+        the file has no video/audio stream and marks it unplayable (movies
+        already did this via _estimate_size(); episodes never did, which is
+        why series episodes showed up in Plex but wouldn't play)."""
         eid = str(episode_id)
         if eid not in self._episodes_activated:
-            return None, "Episode not activated", None, None
-
-        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
-        if not dispatcharr_url:
-            return None, "Dispatcharr URL not configured", None, None
+            return None
 
         try:
             from apps.vod.models import Episode
             episode = Episode.objects.get(id=int(eid))
-        except Exception:
-            return None, "Episode not found", None, None
+        except Exception as e:
+            logger.warning(f"get_episode_info: episode {eid} lookup failed: {e}")
+            return None
 
-        relations = list(episode.m3u_relations.all())
-        if not relations:
-            return None, "No stream mapping for episode", None, None
+        info = {
+            "name": episode.name,
+            "uuid": str(episode.uuid),
+            "content_type": "video/x-matroska",
+            "file_size": self._estimate_episode_size(episode),
+        }
 
-        entry = self._episodes_activated.get(eid, {})
-        cached_stream_id = entry.get("stream_pick")
-        relation = relations[0]
-        if cached_stream_id is not None:
-            for r in relations:
-                if str(r.stream_id) == str(cached_stream_id):
-                    relation = r
-                    break
+        relation = episode.m3u_relations.first()
+        if relation:
+            info["stream_id"] = relation.stream_id
+            ext = getattr(relation, "container_extension", None) or "mkv"
+            if ext.lstrip(".") == "mp4":
+                info["content_type"] = "video/mp4"
 
-        relation = self._pick_relation_with_capacity(relations, relation)
-        entry["stream_pick"] = relation.stream_id
-        self._episodes_activated[eid] = entry
+        return info
+
+    def _estimate_episode_size(self, episode):
+        # Same ground-truth-first pattern as movies' _estimate_size(): once
+        # Plex has analyzed the episode and reported back its own size, serve
+        # that back so Content-Length never mismatches what Plex already
+        # recorded, which is what triggers an unwanted re-analysis pass.
+        entry = self._episodes_activated.get(str(episode.id))
+        if entry and entry.get("confirmed_size"):
+            return int(entry["confirmed_size"])
+
+        duration = getattr(episode, "duration_secs", None)
+        if duration and duration > 0:
+            return int(duration) * 250000
+        return 2 * 1024 * 1024 * 1024
+
+    def _fetch_plex_episode_sizes(self, episode_ids=None):
+        """Mirrors _fetch_plex_movie_sizes() for episodes. Episode STRM
+        filenames don't embed the episode id, so matching is by series name +
+        season/episode number (grandparentTitle/parentIndex/index) against
+        Plex's own episode metadata, grouped per plex_library_section since
+        each Series Settings category can point at a different Plex library.
+
+        episode_ids=None fetches sizes for every matched episode across all
+        known categories (maintenance sweep); pass a list to limit the match
+        set (post-activation fast path)."""
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token:
+            return {}
+
+        wanted_ids = {str(eid) for eid in episode_ids} if episode_ids is not None else None
+        by_section = {}
+        for eid, entry in self._episodes_activated.items():
+            if wanted_ids is not None and eid not in wanted_ids:
+                continue
+            category = self._resolve_series_category(entry.get("category_id"))
+            section = category["plex_library_section"] if category else None
+            if section in (None, "", self.PLEX_SECTION_UNSET):
+                continue
+            by_section.setdefault(section, []).append((eid, entry))
+
+        sizes = {}
+        for section, pairs in by_section.items():
+            try:
+                resp = requests.get(
+                    f"{plex_url}/library/sections/{section}/all",
+                    params={"X-Plex-Token": plex_token, "type": "4"},
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
+                    continue
+
+                items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+                by_key = {}
+                for it in items:
+                    key = (it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index"))
+                    by_key[key] = it
+
+                for eid, entry in pairs:
+                    key = (entry.get("series_name", ""), entry.get("season_number"), entry.get("episode_number"))
+                    item = by_key.get(key)
+                    if not item:
+                        continue
+                    parts = item.get("Media", [{}])[0].get("Part", [])
+                    if parts and parts[0].get("size"):
+                        sizes[eid] = int(parts[0]["size"])
+            except Exception as e:
+                logger.error(f"Plex episode size query failed for section {section}: {e}")
+
+        return sizes
+
+    def _reconcile_confirmed_episode_size(self, episode_id):
+        """Fetch Plex's recorded size for one episode and store it as
+        confirmed_size if found. Returns True if a size was stored."""
+        eid = str(episode_id)
+        sizes = self._fetch_plex_episode_sizes([eid])
+        size = sizes.get(eid)
+        if not size:
+            return False
+        entry = self._episodes_activated.get(eid)
+        if entry is None:
+            return False
+        if entry.get("confirmed_size") == size:
+            return False
+        entry["confirmed_size"] = size
         self._save_state()
+        logger.info(f"Confirmed Plex size for episode {eid}: {size} bytes")
+        return True
 
-        stream_id = relation.stream_id
-        account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
-        redirect_url = self._build_episode_proxy_url(episode, relation)
-        return redirect_url, None, account_id, stream_id
+    def _size_reconcile_fast_path_episode(self, episode_id):
+        """Background retry loop started right after episode activation,
+        mirroring _size_reconcile_fast_path() for movies."""
+        for delay in self.SIZE_RECONCILE_FAST_PATH_DELAYS_SECS:
+            time.sleep(delay)
+            try:
+                if self._reconcile_confirmed_episode_size(episode_id):
+                    return
+            except Exception as e:
+                logger.error(f"Fast-path size reconcile error for episode {episode_id}: {e}")
+
+    def _reconcile_all_confirmed_episode_sizes(self):
+        """Maintenance-cycle sweep: backfill confirmed_size for every
+        activated episode that doesn't have one yet."""
+        missing = [
+            eid for eid, entry in self._episodes_activated.items()
+            if not entry.get("confirmed_size")
+        ]
+        if not missing:
+            return
+        sizes = self._fetch_plex_episode_sizes(missing)
+        confirmed = 0
+        for eid in missing:
+            size = sizes.get(eid)
+            if not size:
+                continue
+            entry = self._episodes_activated.get(eid)
+            if entry is None or entry.get("confirmed_size") == size:
+                continue
+            entry["confirmed_size"] = size
+            confirmed += 1
+        if confirmed:
+            self._save_state()
+            logger.info(f"Episode size reconcile sweep: confirmed {confirmed}/{len(missing)} episodes")
+
+    def _get_episode_redirect_lock(self, episode_id):
+        with self._episode_redirect_locks_guard:
+            lock = self._episode_redirect_locks.get(episode_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._episode_redirect_locks[episode_id] = lock
+            return lock
+
+    def get_episode_redirect_url(self, episode_id):
+        # Mirrors get_redirect_url()'s coalesce/stagger pattern -- rclone's
+        # VFS read-ahead opens several concurrent range requests for the
+        # same episode file within milliseconds (synthetic .mkv entries hit
+        # this exactly like movies' real ones do), and without coalescing
+        # each one independently resolves its own stream pick and races
+        # Dispatcharr for a connection slot, producing rapid vod_start/stop
+        # churn and multiple simultaneous real provider connections for one
+        # episode (observed live: 2 concurrent rclone connections for
+        # #BringBackAlice S01E01, tens of start/stop cycles within a minute).
+        eid = str(episode_id)
+        lock = self._get_episode_redirect_lock(eid)
+
+        with lock:
+            cached = self._recent_episode_redirects.get(eid)
+            if cached and (time.time() - cached[0]) < self.REDIRECT_COALESCE_SECS:
+                _, redirect_url, error, account_id, stream_id = cached
+                if redirect_url and account_id:
+                    if self._account_has_capacity(account_id):
+                        pass
+                    else:
+                        time.sleep(self.REDIRECT_BURST_STAGGER_SECS)
+                        return redirect_url, error, account_id, stream_id
+                else:
+                    return redirect_url, error, account_id, stream_id
+
+            if eid not in self._episodes_activated:
+                result = (None, "Episode not activated", None, None)
+                self._recent_episode_redirects[eid] = (time.time(), *result)
+                return result
+
+            dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
+            if not dispatcharr_url:
+                result = (None, "Dispatcharr URL not configured", None, None)
+                self._recent_episode_redirects[eid] = (time.time(), *result)
+                return result
+
+            try:
+                from apps.vod.models import Episode
+                episode = Episode.objects.get(id=int(eid))
+            except Exception:
+                result = (None, "Episode not found", None, None)
+                self._recent_episode_redirects[eid] = (time.time(), *result)
+                return result
+
+            relations = list(episode.m3u_relations.all())
+            if not relations:
+                result = (None, "No stream mapping for episode", None, None)
+                self._recent_episode_redirects[eid] = (time.time(), *result)
+                return result
+
+            entry = self._episodes_activated.get(eid, {})
+            cached_stream_id = entry.get("stream_pick")
+            relation = relations[0]
+            if cached_stream_id is not None:
+                for r in relations:
+                    if str(r.stream_id) == str(cached_stream_id):
+                        relation = r
+                        break
+
+            relation = self._pick_relation_with_capacity(relations, relation)
+            entry["stream_pick"] = relation.stream_id
+            self._episodes_activated[eid] = entry
+            self._save_state()
+
+            stream_id = relation.stream_id
+            account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
+            redirect_url = self._build_episode_proxy_url(episode, relation)
+            result = (redirect_url, None, account_id, stream_id)
+            self._recent_episode_redirects[eid] = (time.time(), *result)
+            self._enforce_max_concurrent_for_content(episode.uuid)
+            return result
 
     def list_categories(self, query):
         try:
@@ -2403,6 +2959,27 @@ class BridgeCore:
         name = re.sub(r'[<>:"/\\|?*]', "", name)
         return name.strip()
 
+    def _strip_episode_name_prefix(self, name, series_name, ep_label):
+        """Dispatcharr's Episode.name sometimes already embeds 'SeriesName -
+        SxxEyy - ' as a prefix -- strip it so STRM/NFO filenames don't
+        duplicate the series/season/episode tag we add ourselves. Mirrors
+        dashboard.html's stripEpisodeNamePrefix() (JS side, for card titles).
+
+        series_name here is already year-stripped (via _clean_title), but
+        Dispatcharr's embedded prefix keeps the year (e.g. "Show (2018) -
+        S01E01 - ..."), so the year is optionally tolerated between the name
+        and the separator -- without it the prefix never matched and the
+        raw (still-prefixed) name fell through into the caller's file_stem,
+        duplicating "Show (2018) - S01E01" in the generated filename."""
+        if not name:
+            return ""
+        cleaned = name
+        series_esc = re.escape(series_name or "")
+        cleaned = re.sub(r"^\s*" + series_esc + r"(?:\s*\(\d{4}\))?\s*[-:]\s*", "", cleaned, flags=re.I)
+        ep_label_esc = re.escape(ep_label or "")
+        cleaned = re.sub(r"^\s*" + ep_label_esc + r"\s*[-:]\s*", "", cleaned, flags=re.I)
+        return cleaned.strip()
+
     def _write_nfo(self, movie, folder, folder_name):
         nfo_path = os.path.join(folder, f"{folder_name}.nfo")
         tmdb_id = getattr(movie, "tmdb_id", None)
@@ -2412,7 +2989,7 @@ class BridgeCore:
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             "<movie>",
-            f"  <title>{self._xml_escape(movie.name)}</title>",
+            f"  <title>{self._xml_escape(self._clean_title(movie.name))}</title>",
         ]
 
         year = getattr(movie, "year", None)
@@ -2486,6 +3063,99 @@ class BridgeCore:
             logger.error(f"VOD directory listing error: {e}")
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
+
+    def list_series_vod_directory(self, subpath=""):
+        """Nested HTML directory listing for the series/ tree, served at the
+        separate /vod-series/ endpoint (own rclone mount + Plex TV Shows
+        library) so series folders never appear inside the Movies library's
+        scan root -- Plex's Movies agent would otherwise misread a
+        Series/Season/Episode structure as a multi-part movie folder.
+        subpath is the URL path under /vod-series/ already stripped of that
+        prefix, e.g. "" (root), "comedy/", "comedy/1983 (2018)/Season 01/".
+
+        Directories and .nfo files are real, listed straight off disk. Each
+        episode's .mkv entry is synthetic -- built from self._episodes_activated,
+        the same DB-driven approach movies use in list_vod_directory() -- and
+        served via 302 redirect rather than being a real file on disk. A real
+        .strm file here previously made Plex's "get a decision" playback step
+        fail even after the folder scanned/matched fine (bead za8).
+
+        Each entry's real mtime is appended in Apache mod_autoindex style
+        (DD-Mon-YYYY HH:MM) after the anchor tag -- rclone's http backend
+        parses that trailing text to populate modtime for both files and
+        synthesized directory entries. Without it, rclone has no way to
+        learn a directory's mtime from an HTML listing and substitutes its
+        fixed 1999-12-31 sentinel for every dir, which makes Plex's TV
+        scanner think the season/series folder never changes and skip
+        walking it on every future scan (bead za8)."""
+        from urllib.parse import quote
+
+        base_dir = self._series_category_path("")
+        rel = subpath.strip("/")
+        target_dir = os.path.join(base_dir, rel) if rel else base_dir
+
+        real_base = os.path.abspath(base_dir)
+        real_target = os.path.abspath(target_dir)
+        if os.path.commonpath([real_base, real_target]) != real_base:
+            return "<html><body>\n</body></html>"
+
+        links = []
+        try:
+            entries = sorted(os.listdir(real_target))
+        except OSError:
+            entries = []
+
+        for entry in entries:
+            full = os.path.join(real_target, entry)
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(full)).strftime("%d-%b-%Y %H:%M")
+            except OSError:
+                mtime = ""
+            if os.path.isdir(full):
+                href = quote(entry) + "/"
+                links.append(f'<a href="{href}">{entry}/</a> {mtime}')
+            elif entry.endswith(".nfo"):
+                links.append(f'<a href="{quote(entry)}">{entry}</a> {mtime}')
+
+        now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
+        for eid, entry in self._episodes_activated.items():
+            if entry.get("strm_folder") != rel:
+                continue
+            stem = entry.get("strm_stem")
+            if not stem:
+                continue
+            fname = f"{stem} [{eid}].mkv"
+            links.append(f'<a href="{quote(fname)}">{fname}</a> {now_str}')
+
+        return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
+
+    def read_series_vod_file(self, subpath):
+        """Real file bytes + mtime for a .nfo under series/ -- unlike
+        episode .mkv entries (always a virtual 302 redirect target, see
+        list_series_vod_directory), .nfo files are actual files on disk that
+        rclone/Plex read directly.
+
+        mtime is returned so the route handler can send a real Last-Modified
+        header -- rclone's http backend gets a file's modtime from that
+        header (not from the directory listing HTML), and without it every
+        file reads back as rclone's zero-epoch sentinel, which makes Plex's
+        TV scanner treat the season/series folder as permanently unchanged
+        and skip walking it on every future scan (bead za8)."""
+        base_dir = self._series_category_path("")
+        real_base = os.path.abspath(base_dir)
+        target = os.path.abspath(os.path.join(base_dir, subpath.strip("/")))
+
+        if os.path.commonpath([real_base, target]) != real_base:
+            return None, None, "path escapes series root"
+        if not os.path.isfile(target):
+            return None, None, "not found"
+
+        try:
+            mtime = os.path.getmtime(target)
+            with open(target, "rb") as f:
+                return f.read(), mtime, None
+        except OSError as e:
+            return None, None, str(e)
 
     # Repeated redirects for the same (movie_id, stream_id) within this window
     # are collapsed into a single activity-log line — rclone re-hits
@@ -2931,6 +3601,160 @@ class BridgeCore:
         except Exception:
             return [f"#{m}" for m in movie_ids]
 
+    def _enforce_max_concurrent_for_content(self, content_uuid, new_session_hint=None):
+        """Force-drop older real Dispatcharr VOD connections for the same
+        movie/episode (by content_uuid) once more than
+        `max_concurrent_per_title` are open at once.
+
+        Exists because rclone's VFS re-opens a file's stream repeatedly over
+        the course of a single watch (not just the millisecond read-ahead
+        burst REDIRECT_COALESCE_SECS already absorbs) — each open independently
+        resolves through get_redirect_url/get_episode_redirect_url and gets
+        its own real Dispatcharr session, and those sessions are NOT
+        deduplicated by Dispatcharr itself. Observed live: 3 simultaneous
+        real sessions for one episode over about a minute, each logged as a
+        separate "Play request" and each holding its own provider connection
+        slot. Called right after a redirect is resolved (not before), so the
+        just-issued session is included in the scan and never mistaken for
+        one of the "older" ones to kill.
+
+        Keeps the newest N sessions (by last_activity), kills the rest via
+        Dispatcharr's own cleanup_persistent_connection (same call the ffprobe
+        audio-check path uses), which works even while a session is actively
+        streaming — unlike cleanup_stale_persistent_connections, which
+        refuses to touch anything with active_streams > 0.
+        """
+        try:
+            max_concurrent = int(self.settings.get("max_concurrent_per_title", 2) or 0)
+        except (TypeError, ValueError):
+            max_concurrent = 2
+        if max_concurrent <= 0:
+            return  # 0 = disabled, no enforcement
+
+        try:
+            from core.utils import RedisClient
+
+            redis_client = RedisClient.get_client()
+            if not redis_client:
+                return
+
+            pattern = "vod_persistent_connection:*"
+            cursor = 0
+            sessions = []  # (last_activity, session_id)
+            while True:
+                cursor, keys = redis_client.scan(cursor, match=pattern, count=100)
+                for key in keys:
+                    data = redis_client.hgetall(key)
+                    if not data:
+                        continue
+                    if data.get("content_uuid") != str(content_uuid):
+                        continue
+                    session_id = key.split(":", 1)[1] if ":" in key else key
+                    if isinstance(session_id, bytes):
+                        session_id = session_id.decode()
+                    try:
+                        last_activity = float(data.get("last_activity", 0))
+                    except (TypeError, ValueError):
+                        last_activity = 0.0
+                    sessions.append((last_activity, session_id))
+                if cursor == 0:
+                    break
+
+            self._drop_excess_sessions(content_uuid, sessions, max_concurrent)
+        except Exception as e:
+            logger.debug(f"Max-concurrent enforcement skipped for {content_uuid}: {e}")
+
+    def _drop_excess_sessions(self, content_uuid, sessions, max_concurrent):
+        """Shared by _enforce_max_concurrent_for_content (single-title,
+        request-triggered) and _enforce_max_concurrent_globally (periodic
+        sweep across all titles) -- keeps the newest max_concurrent sessions
+        (by last_activity) and force-drops the rest via Dispatcharr's own
+        cleanup_persistent_connection, which works even mid-stream."""
+        if len(sessions) <= max_concurrent:
+            return
+
+        try:
+            from apps.proxy.vod_proxy.multi_worker_connection_manager import (
+                MultiWorkerVODConnectionManager,
+            )
+        except Exception as e:
+            logger.debug(f"Max-concurrent enforcement skipped for {content_uuid}: {e}")
+            return
+
+        # Newest first: keep max_concurrent, drop the rest.
+        sessions.sort(key=lambda s: s[0], reverse=True)
+        to_drop = sessions[max_concurrent:]
+
+        manager = MultiWorkerVODConnectionManager.get_instance()
+        for _, session_id in to_drop:
+            try:
+                manager.cleanup_persistent_connection(session_id)
+                logger.info(
+                    f"Max-concurrent enforcement: dropped extra VOD session "
+                    f"{session_id} for content {content_uuid} "
+                    f"({len(sessions)} open, limit {max_concurrent})"
+                )
+            except Exception as e:
+                logger.warning(f"Max-concurrent enforcement: failed to drop {session_id}: {e}")
+
+    def _enforce_max_concurrent_globally(self):
+        """Periodic sweep (called from the stall watchdog loop, every ~10s)
+        that catches over-limit sessions _enforce_max_concurrent_for_content
+        misses: that function only runs inside get_redirect_url/
+        get_episode_redirect_url, which coalesces repeat requests within
+        REDIRECT_COALESCE_SECS and returns the cached redirect without
+        re-resolving -- so once rclone's VFS starts hammering Dispatcharr's
+        VOD proxy directly with the already-issued redirect URL (observed
+        live: a fresh real Dispatcharr connection roughly every 2-10 seconds
+        for the same episode, for minutes, well past the coalesce window),
+        nothing ever routes back through our redirect functions again to
+        trigger a fresh capacity check, and connections just pile up
+        unchecked. This sweep groups all live vod_persistent_connection
+        sessions by content_uuid regardless of how they were opened and
+        prunes each group down to max_concurrent_per_title."""
+        try:
+            max_concurrent = int(self.settings.get("max_concurrent_per_title", 2) or 0)
+        except (TypeError, ValueError):
+            max_concurrent = 2
+        if max_concurrent <= 0:
+            return
+
+        try:
+            from core.utils import RedisClient
+
+            redis_client = RedisClient.get_client()
+            if not redis_client:
+                return
+
+            pattern = "vod_persistent_connection:*"
+            cursor = 0
+            by_content = {}  # content_uuid -> [(last_activity, session_id), ...]
+            while True:
+                cursor, keys = redis_client.scan(cursor, match=pattern, count=100)
+                for key in keys:
+                    data = redis_client.hgetall(key)
+                    if not data:
+                        continue
+                    content_uuid = data.get("content_uuid")
+                    if not content_uuid:
+                        continue
+                    session_id = key.split(":", 1)[1] if ":" in key else key
+                    if isinstance(session_id, bytes):
+                        session_id = session_id.decode()
+                    try:
+                        last_activity = float(data.get("last_activity", 0))
+                    except (TypeError, ValueError):
+                        last_activity = 0.0
+                    by_content.setdefault(content_uuid, []).append((last_activity, session_id))
+                if cursor == 0:
+                    break
+
+            for content_uuid, sessions in by_content.items():
+                if len(sessions) > max_concurrent:
+                    self._drop_excess_sessions(content_uuid, sessions, max_concurrent)
+        except Exception as e:
+            logger.debug(f"Global max-concurrent sweep skipped: {e}")
+
     def _account_has_capacity(self, account_id):
         """True if the given M3U account's default active profile currently
         has a free connection slot, per Dispatcharr's own Redis-backed
@@ -3054,6 +3878,7 @@ class BridgeCore:
             redirect_url = self._build_dispatcharr_proxy_url(movie, relation)
             result = (redirect_url, None, account_id, stream_id)
             self._recent_redirects[mid] = (time.time(), *result)
+            self._enforce_max_concurrent_for_content(movie.uuid)
             return result
 
     def mark_stream_bad(self, movie_id, stream_id):

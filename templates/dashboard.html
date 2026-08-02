@@ -439,6 +439,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
               <button class="btn btn-outline btn-sm" onclick="clearAllSeriesSelections()">Clear All</button>
               <button class="btn btn-green btn-sm" id="activateSeriesSelectedBtn" onclick="activateSeriesSelected(this)">Activate Selected</button>
               <button class="btn btn-outline btn-sm" id="deactivateSeriesSelectedBtn" onclick="deactivateSeriesSelected(this)">Deactivate Selected</button>
+              <button class="btn btn-outline btn-sm" id="reactivateSeriesSelectedBtn" onclick="reactivateSeriesSelected(this)">Reactivate Selected</button>
             </div>
           </div>
           <div class="panel-body" id="seriesSearchBar">
@@ -467,6 +468,9 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
                 <option value="800">800</option>
                 <option value="1300">1300</option>
               </select>
+              <label style="font-size:0.75rem;color:var(--text2);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+                <input type="checkbox" id="seriesActivatedFilter" onchange="loadSeries(1)"> Activated Only
+              </label>
               <button class="btn btn-primary btn-sm" onclick="loadSeries(1)">Search</button>
             </div>
           </div>
@@ -879,6 +883,50 @@ async function deactivateSeriesSelected(btnEl) {
   }
 }
 
+async function reactivateSeriesSelected(btnEl) {
+  if (seriesSelection.size === 0) return;
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const episodeIds = await resolveSeriesSelectionToEpisodeIds();
+    const data = await api('/api/episodes/reactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode_ids: episodeIds }),
+    });
+    if (data.status === 'error') {
+      showToast('Reactivate failed', data.message || 'Unknown error', 'error');
+    } else {
+      showToast('Reactivate complete', namesPreview(data.names, data.reactivated), 'success');
+    }
+    clearAllSeriesSelections();
+    loadSummary();
+  } catch (e) {
+    showToast('Reactivate failed', String(e), 'error');
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
+async function quickReactivateEpisode(id, btnEl) {
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const data = await api('/api/episodes/reactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode_ids: [id] }),
+    });
+    if (data.status === 'error') {
+      showToast('Reactivate failed', data.message || 'Unknown error', 'error');
+    } else {
+      showToast('Reactivate complete', namesPreview(data.names, data.reactivated), 'success');
+    }
+  } catch (e) {
+    showToast('Reactivate failed', String(e), 'error');
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
 function seriesGoBack() {
   if (seriesNav.view === 'episodes') {
     seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null };
@@ -904,6 +952,7 @@ async function loadSeries(page) {
   if (provP) url += '&' + provP;
   const catP = msParams('seriesCat');
   if (catP) url += '&' + catP;
+  if (document.getElementById('seriesActivatedFilter').checked) url += '&activated_only=1';
 
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading series...</div>';
@@ -924,9 +973,13 @@ async function loadSeries(page) {
     const trailerBtn = s.trailer_key
       ? `<button class="trailer-btn" onclick="event.stopPropagation();playTrailer('${s.trailer_key}')" title="Watch trailer">&#9654;</button>`
       : '';
+    const actBadge = s.activated_episode_count > 0
+      ? `<span class="movie-badge">Active (${s.activated_episode_count})</span>`
+      : '';
     return `<div class="movie-card ${checked ? 'selected' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}">
       <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeHtml(s.id)}','${escapeHtml(s.name)}',null,null,this)">
       ${trailerBtn}
+      ${actBadge}
       ${poster}
       <div class="movie-info">
         <div class="movie-title">${escapeHtml(s.name)}</div>
@@ -1018,8 +1071,12 @@ async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
     const titleText = epLabel + (cleanName ? ' - ' + cleanName : '');
     const key = seriesSelKey('episode', seriesId, seasonNumber, ep.id);
     const checked = seriesSelection.has(key) ? 'checked' : '';
+    const reactivateBtn = ep.activated
+      ? `<button class="reactivate-btn" onclick="event.stopPropagation();quickReactivateEpisode('${ep.id}', this)" title="Reactivate (refresh NFO/stream pick without touching Plex)">&#8635;</button>`
+      : '';
     return `<div class="movie-card ${checked ? 'selected' : ''}" title="${escapeHtml(titleText)}">
       <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${seasonNumber},'${escapeHtml(ep.id)}',this)">
+      ${reactivateBtn}
       ${seriesPosterCardHtml(seriesPoster, epLabel)}
       <div class="movie-info">
         <div class="movie-title">${escapeHtml(titleText)}</div>
@@ -1036,7 +1093,10 @@ function stripEpisodeNamePrefix(name, seriesName, epLabel) {
   if (!name) return '';
   let cleaned = name;
   const seriesEsc = seriesName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  cleaned = cleaned.replace(new RegExp('^\\s*' + seriesEsc + '\\s*[-:]\\s*', 'i'), '');
+  // seriesName has no year, but the embedded prefix in `name` does (e.g.
+  // "Show (2018) - S01E01 - ..."), so tolerate an optional "(YYYY)" between
+  // the name and separator -- mirrors bridge.py's _strip_episode_name_prefix.
+  cleaned = cleaned.replace(new RegExp('^\\s*' + seriesEsc + '(?:\\s*\\(\\d{4}\\))?\\s*[-:]\\s*', 'i'), '');
   cleaned = cleaned.replace(new RegExp('^\\s*' + epLabel + '\\s*[-:]\\s*', 'i'), '');
   return cleaned.trim();
 }
