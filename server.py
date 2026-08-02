@@ -17,6 +17,14 @@ logger = logging.getLogger("vod_plex_bridge.server")
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# /api/ping is an internal liveness probe (see plugin.py's _is_our_server),
+# and /api/lang-status + /api/activity-log are polled by the dashboard's own
+# UI every 2-5s while open — logging those in debug_connections mode would
+# mean the Logs tab re-logs itself refreshing, drowning out the one-time
+# signal (like the actual catalog/movies calls) this debug mode exists to
+# surface.
+_NOISY_POLL_PATHS = ("/api/ping", "/api/lang-status", "/api/activity-log")
+
 
 class _ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
@@ -112,7 +120,7 @@ def _dispatch(environ, start_response, server, bridge, settings):
     method = environ["REQUEST_METHOD"]
     path = unquote(environ.get("PATH_INFO", "/"))
 
-    if settings.get("debug_connections") and path not in ("/api/ping",):
+    if settings.get("debug_connections") and path not in _NOISY_POLL_PATHS:
         client_ip = environ.get("REMOTE_ADDR", "unknown")
         bridge._log_event("debug", f"Inbound {method} {path} from {client_ip}")
 
