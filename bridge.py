@@ -100,6 +100,9 @@ class BridgeCore:
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
+        self._episodes_activated = {}  # episode_id (str) -> {activated_at, stream_pick, category_id, strm_folder}
+        self._series_categories = []  # [{id, name, strm_folder, plex_library_section}]
+        self._plex_scan_lock = threading.Lock()  # serializes _trigger_plex_scan calls (movies + series)
         self._languages = {}
         self._data_dir = "/data/vod-plex-bridge"
         self._lang_detect_running = False
@@ -707,7 +710,9 @@ class BridgeCore:
                 with open(state_file, "r") as f:
                     state = json.load(f)
                 self._activated = state.get("activated", {})
+                self._episodes_activated = state.get("episodes_activated", {})
                 self._maint_stats.update(state.get("maint_stats", {}))
+                self._series_categories = state.get("series_categories", [])
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
@@ -723,7 +728,12 @@ class BridgeCore:
         state_file = os.path.join(self._data_dir, "bridge_state.json")
         try:
             with open(state_file, "w") as f:
-                json.dump({"activated": self._activated, "maint_stats": self._maint_stats}, f)
+                json.dump({
+                "activated": self._activated,
+                "episodes_activated": self._episodes_activated,
+                "maint_stats": self._maint_stats,
+                "series_categories": self._series_categories,
+            }, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -875,6 +885,7 @@ class BridgeCore:
         return {
             "total": total,
             "activated": activated,
+            "series_activated": len(self._episodes_activated),
             "categories": categories,
         }
 
@@ -1030,6 +1041,593 @@ class BridgeCore:
         except Exception as e:
             return {"movie_ids": [], "error": str(e)}
 
+    # --- Series Categories (dashboard-managed settings, separate from
+    # plugin.json's single-value movie strm_output_dir/plex_library_section —
+    # this is a variable-length, user-managed list stored in bridge_state.json) ---
+
+    def list_series_categories(self):
+        return {
+            "categories": self._series_categories,
+            "base_path": self._series_category_path(""),
+        }
+
+    def _series_category_path(self, folder_name):
+        base = self.settings.get("strm_output_dir", "/data/plugin-strm")
+        return os.path.join(base, "series", folder_name)
+
+    def _clean_folder_name(self, raw):
+        name = (raw or "").strip().strip("/\\")
+        # Folder name only -- reject path separators/traversal so it can't
+        # escape the series/ subtree under strm_output_dir.
+        if not name or "/" in name or "\\" in name or ".." in name:
+            return None
+        return name
+
+    # Sentinel used when the caller leaves Plex Library Section ID blank at
+    # creation time (folder needs to exist before the Plex library can be
+    # pointed at it, so the real ID isn't known yet). Deliberately not 0 --
+    # some Plex setups could plausibly use a low section number, and 0 also
+    # reads as "falsy"/unset in a way that's easy to overlook.
+    PLEX_SECTION_UNSET = 999
+
+    def create_series_category(self, body):
+        name = (body.get("name") or "").strip()
+        folder_name = self._clean_folder_name(body.get("strm_folder"))
+        plex_library_section = body.get("plex_library_section")
+        if not name:
+            return {"status": "error", "error": "name is required"}
+        if not folder_name:
+            return {"status": "error", "error": "folder name is required (no slashes)"}
+        if plex_library_section in (None, ""):
+            plex_library_section = self.PLEX_SECTION_UNSET
+        else:
+            try:
+                plex_library_section = int(plex_library_section)
+            except (TypeError, ValueError):
+                return {"status": "error", "error": "plex_library_section must be a number"}
+
+        full_path = self._series_category_path(folder_name)
+        try:
+            os.makedirs(full_path, exist_ok=True)
+        except OSError as e:
+            return {"status": "error", "error": f"could not create folder: {e}"}
+
+        next_id = (max((c["id"] for c in self._series_categories), default=0)) + 1
+        entry = {
+            "id": next_id,
+            "name": name,
+            "strm_folder": folder_name,
+            "plex_library_section": plex_library_section,
+        }
+        self._series_categories.append(entry)
+        self._save_state()
+        return {"status": "ok", "category": entry}
+
+    def update_series_category(self, category_id, body):
+        entry = next((c for c in self._series_categories if c["id"] == category_id), None)
+        if entry is None:
+            return {"status": "error", "error": "category not found"}
+
+        if "name" in body:
+            name = (body.get("name") or "").strip()
+            if not name:
+                return {"status": "error", "error": "name is required"}
+            entry["name"] = name
+        if "strm_folder" in body:
+            folder_name = self._clean_folder_name(body.get("strm_folder"))
+            if not folder_name:
+                return {"status": "error", "error": "folder name is required (no slashes)"}
+            full_path = self._series_category_path(folder_name)
+            try:
+                os.makedirs(full_path, exist_ok=True)
+            except OSError as e:
+                return {"status": "error", "error": f"could not create folder: {e}"}
+            entry["strm_folder"] = folder_name
+        if "plex_library_section" in body:
+            try:
+                entry["plex_library_section"] = int(body.get("plex_library_section"))
+            except (TypeError, ValueError):
+                return {"status": "error", "error": "plex_library_section must be a number"}
+
+        self._save_state()
+        return {"status": "ok", "category": entry}
+
+    def delete_series_category(self, category_id):
+        before = len(self._series_categories)
+        self._series_categories = [c for c in self._series_categories if c["id"] != category_id]
+        if len(self._series_categories) == before:
+            return {"status": "error", "error": "category not found"}
+        self._save_state()
+        return {"status": "ok"}
+
+    # --- Series / Season / Episode browse ---
+
+    def list_series(self, query):
+        try:
+            from apps.vod.models import Series
+
+            page = int(query.get("page", [1])[0])
+            per_page = int(query.get("per_page", [50])[0])
+            search = query.get("search", [""])[0]
+            provider_ids = [v for v in query.get("provider_id", []) if v]
+            category_ids = [v for v in query.get("category_id", []) if v]
+
+            qs = Series.objects.all()
+
+            if search:
+                qs = qs.filter(name__icontains=search)
+
+            if provider_ids and category_ids:
+                qs = qs.filter(
+                    m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids],
+                    m3u_relations__category_id__in=[int(c) for c in category_ids],
+                ).distinct()
+            elif provider_ids:
+                qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
+            elif category_ids:
+                qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
+
+            qs = qs.order_by("name")
+            total = qs.count()
+            if self.settings.get("debug_connections"):
+                self._log_event(
+                    "debug",
+                    f"list_series: total={total} page={page} per_page={per_page} "
+                    f"filters(search={bool(search)}, providers={provider_ids}, categories={category_ids})",
+                )
+
+            offset = (page - 1) * per_page
+            series_list = []
+            for s in qs.select_related("logo")[offset : offset + per_page]:
+                sid = str(s.id)
+                poster = ""
+                try:
+                    if s.logo and s.logo.url:
+                        poster = s.logo.url
+                except Exception:
+                    pass
+                trailer_key = None
+                try:
+                    cp = getattr(s, "custom_properties", None) or {}
+                    if isinstance(cp, str):
+                        import json as _json
+                        cp = _json.loads(cp)
+                    trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
+                except Exception:
+                    cp = {}
+
+                series_list.append(
+                    {
+                        "id": sid,
+                        "name": s.name,
+                        "year": getattr(s, "year", None),
+                        "rating": getattr(s, "rating", None),
+                        "genre": getattr(s, "genre", ""),
+                        "tmdb_id": getattr(s, "tmdb_id", None),
+                        "poster": poster,
+                        "description": getattr(s, "description", ""),
+                        "uuid": str(getattr(s, "uuid", "")),
+                        "episode_count": getattr(s, "episode_count", None),
+                        "trailer_key": trailer_key,
+                    }
+                )
+
+            return {
+                "series": series_list,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "pages": (total + per_page - 1) // per_page,
+            }
+        except Exception as e:
+            logger.error(f"list_series error: {e}")
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"list_series query failed: {e}")
+            return {"series": [], "total": 0, "error": str(e)}
+
+    def _ensure_episodes_fetched(self, series):
+        """Mirror Dispatcharr's own on-demand episode fetch: episodes are not
+        synced during the normal VOD scan, only lazily when a series is opened
+        (Dispatcharr apps.vod.api_views series-info endpoint). Without this,
+        series.episodes.all() stays empty for anything not yet opened in
+        Dispatcharr's own UI."""
+        try:
+            relation = (
+                series.m3u_relations.filter(m3u_account__is_active=True)
+                .select_related("m3u_account")
+                .order_by("-m3u_account__priority", "id")
+                .first()
+            )
+            if not relation or not relation.m3u_account or not relation.m3u_account.is_active:
+                return
+            custom_props = relation.custom_properties or {}
+            if custom_props.get("episodes_fetched"):
+                return
+            from apps.vod.tasks import refresh_series_episodes
+
+            refresh_series_episodes(relation.m3u_account, series, relation.external_series_id)
+            series.refresh_from_db()
+        except Exception as e:
+            logger.error(f"_ensure_episodes_fetched error for series {series.id}: {e}")
+            if self.settings.get("debug_connections"):
+                self._log_event("debug", f"_ensure_episodes_fetched failed for series {series.id}: {e}")
+
+    def list_seasons(self, series_id):
+        try:
+            from apps.vod.models import Series
+
+            series = Series.objects.get(id=int(series_id))
+            self._ensure_episodes_fetched(series)
+            seasons = {}
+            for ep in series.episodes.all():
+                seasons.setdefault(ep.season_number, 0)
+                seasons[ep.season_number] += 1
+
+            return {
+                "series_id": str(series_id),
+                "series_name": series.name,
+                "seasons": [
+                    {"season_number": num, "episode_count": count}
+                    for num, count in sorted(seasons.items())
+                ],
+            }
+        except Exception as e:
+            logger.error(f"list_seasons error: {e}")
+            return {"seasons": [], "error": str(e)}
+
+    def list_episodes(self, series_id, season_number):
+        try:
+            from apps.vod.models import Series
+
+            series = Series.objects.get(id=int(series_id))
+            self._ensure_episodes_fetched(series)
+            qs = series.episodes.all()
+            if season_number is not None:
+                qs = qs.filter(season_number=int(season_number))
+            qs = qs.order_by("season_number", "episode_number")
+
+            episodes = []
+            for ep in qs:
+                eid = str(ep.id)
+                relations = list(ep.m3u_relations.all())
+                episodes.append(
+                    {
+                        "id": eid,
+                        "name": ep.name,
+                        "description": getattr(ep, "description", ""),
+                        "air_date": str(getattr(ep, "air_date", "") or ""),
+                        "rating": getattr(ep, "rating", None),
+                        "duration_secs": getattr(ep, "duration_secs", None),
+                        "season_number": ep.season_number,
+                        "episode_number": ep.episode_number,
+                        "tmdb_id": getattr(ep, "tmdb_id", None),
+                        "provider_count": len(relations),
+                    }
+                )
+
+            return {
+                "series_id": str(series_id),
+                "series_name": series.name,
+                "season_number": int(season_number) if season_number is not None else None,
+                "episodes": episodes,
+                "total": len(episodes),
+            }
+        except Exception as e:
+            logger.error(f"list_episodes error: {e}")
+            return {"episodes": [], "total": 0, "error": str(e)}
+
+    # --- Series / Episode activation ---
+    #
+    # Mirrors activate_movies/deactivate_movies, but activation is always
+    # scoped to a single destination Series Settings category (strm_folder +
+    # plex_library_section) chosen by the caller for the whole batch --
+    # series/episodes don't carry their own Plex-library mapping the way
+    # movies do via the single global setting. No per-episode audio probe
+    # (unlike movies) -- at series/season scale that would mean hundreds of
+    # ffprobe calls per activate-all, holding a real provider connection
+    # each time; capacity gating via _account_has_capacity is the safety
+    # valve here instead, same mechanism movies use before probing.
+
+    EPISODE_STRM_BATCH_SIZE = 50
+    EPISODE_STRM_BATCH_DELAY_SECS = 5
+
+    def _resolve_series_category(self, category_id):
+        try:
+            category_id = int(category_id)
+        except (TypeError, ValueError):
+            return None
+        return next((c for c in self._series_categories if c["id"] == category_id), None)
+
+    def _build_episode_proxy_url(self, episode, relation, settings=None):
+        s = settings if settings is not None else self.settings
+        dispatcharr_url = s.get("dispatcharr_url", "").rstrip("/")
+        if not dispatcharr_url:
+            return None
+        return f"{dispatcharr_url}/proxy/vod/episode/{episode.uuid}?stream_id={relation.stream_id}"
+
+    def activate_episodes(self, body):
+        episode_ids = body.get("episode_ids", [])
+        category_id = body.get("category_id")
+        if not episode_ids:
+            return {"status": "error", "message": "No episode_ids provided"}
+        if category_id is None:
+            return {"status": "error", "message": "category_id is required — choose a destination Series Settings category"}
+
+        category = self._resolve_series_category(category_id)
+        if category is None:
+            return {"status": "error", "message": "Destination category not found"}
+
+        try:
+            from apps.vod.models import Episode
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        activated = []
+        activated_names = []
+        failed = []
+        failed_names = []
+
+        for eid in episode_ids:
+            eid = str(eid)
+            if eid in self._episodes_activated:
+                continue
+
+            try:
+                episode = Episode.objects.select_related("series").get(id=int(eid))
+            except Exception:
+                failed.append({"id": eid, "name": f"#{eid}", "message": "Episode not found"})
+                failed_names.append(f"#{eid}")
+                continue
+
+            relations = list(episode.m3u_relations.all())
+            if not relations:
+                failed.append({"id": eid, "name": episode.name, "message": "No stream mapping for episode"})
+                failed_names.append(episode.name)
+                continue
+
+            chosen_relation = None
+            for relation in relations:
+                if self._account_has_capacity(relation.m3u_account_id):
+                    chosen_relation = relation
+                    break
+
+            if chosen_relation is None:
+                failed.append({
+                    "id": eid,
+                    "name": episode.name,
+                    "message": "No provider with a free connection slot right now",
+                })
+                failed_names.append(episode.name)
+                continue
+
+            self._episodes_activated[eid] = {
+                "activated_at": time.time(),
+                "stream_pick": chosen_relation.stream_id,
+                "category_id": category["id"],
+                "series_id": str(episode.series_id),
+                "series_name": episode.series.name,
+                "season_number": episode.season_number,
+                "episode_number": episode.episode_number,
+            }
+            activated.append(eid)
+            activated_names.append(f"{episode.series.name} S{episode.season_number:02d}E{episode.episode_number:02d}")
+
+        self._save_state()
+
+        strm_count = 0
+        if activated:
+            strm_count = self._generate_strm_for_episodes(activated, category)
+            self._save_state()
+            self._trigger_plex_scan(section=category["plex_library_section"])
+            titles = ", ".join(f'"{n}"' for n in activated_names)
+            self._log_event(
+                "info",
+                f'Activated {len(activated)} episode(s) into "{category["name"]}": {titles} '
+                f"- generated {strm_count} STRM file(s)",
+            )
+
+        if failed:
+            failed_titles = ", ".join(f'"{n}"' for n in failed_names)
+            self._log_event(
+                "warn",
+                f"Episode activation skipped {len(failed)} episode(s): {failed_titles}",
+            )
+
+        return {
+            "status": "ok" if activated else "error",
+            "activated": len(activated),
+            "strm_generated": strm_count,
+            "names": activated_names,
+            "failed": failed,
+            "failed_names": failed_names,
+        }
+
+    def _generate_strm_for_episodes(self, episode_ids, category):
+        """Batched in chunks of EPISODE_STRM_BATCH_SIZE with a short delay
+        between chunks, so a large series/season activate-all doesn't write
+        hundreds of STRM files (and implicitly demand a Plex scan) in one
+        instant -- the batching half of the safety valve alongside the
+        capacity gate above and the single-scan Plex lock."""
+        base_dir = self._series_category_path(category["strm_folder"])
+        port = int(self.settings.get("http_port", 8888))
+        host = self.settings.get("dashboard_host", "127.0.0.1")
+        os.makedirs(base_dir, exist_ok=True)
+
+        from apps.vod.models import Episode
+
+        count = 0
+        for batch_start in range(0, len(episode_ids), self.EPISODE_STRM_BATCH_SIZE):
+            batch = episode_ids[batch_start : batch_start + self.EPISODE_STRM_BATCH_SIZE]
+            for eid in batch:
+                try:
+                    episode = Episode.objects.select_related("series").get(id=int(eid))
+                except Episode.DoesNotExist:
+                    continue
+
+                try:
+                    series_name = self._clean_title(episode.series.name)
+                    year = getattr(episode.series, "year", None)
+                    series_folder_name = f"{series_name} ({year})" if year else series_name
+                    season_folder_name = f"Season {episode.season_number:02d}"
+                    folder = os.path.join(base_dir, series_folder_name, season_folder_name)
+                    os.makedirs(folder, exist_ok=True)
+
+                    ep_title = self._clean_title(episode.name) if episode.name else ""
+                    file_stem = f"{series_folder_name} - S{episode.season_number:02d}E{episode.episode_number:02d}"
+                    if ep_title:
+                        file_stem += f" - {ep_title}"
+
+                    strm_url = f"http://{host}:{port}/vod/episode/{eid}.mkv"
+                    strm_path = os.path.join(folder, f"{file_stem}.strm")
+                    with open(strm_path, "w") as f:
+                        f.write(strm_url)
+
+                    self._write_episode_nfo(episode, folder, file_stem)
+
+                    if eid in self._episodes_activated:
+                        self._episodes_activated[eid]["strm_folder"] = os.path.join(
+                            series_folder_name, season_folder_name
+                        )
+                        self._episodes_activated[eid]["strm_stem"] = file_stem
+                    count += 1
+                    logger.info(f"Episode STRM generated: {file_stem}")
+                except Exception as e:
+                    logger.error(f"Episode STRM generation failed for {eid}: {e}")
+                    self._log_event("error", f"Episode STRM generation failed for id={eid}: {e}")
+
+            remaining = episode_ids[batch_start + self.EPISODE_STRM_BATCH_SIZE :]
+            if remaining:
+                time.sleep(self.EPISODE_STRM_BATCH_DELAY_SECS)
+
+        return count
+
+    def _write_episode_nfo(self, episode, folder, file_stem):
+        nfo_path = os.path.join(folder, f"{file_stem}.nfo")
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            "<episodedetails>",
+            f"  <title>{self._xml_escape(episode.name or '')}</title>",
+            f"  <season>{episode.season_number}</season>",
+            f"  <episode>{episode.episode_number}</episode>",
+        ]
+        desc = getattr(episode, "description", "")
+        if desc:
+            lines.append(f"  <plot>{self._xml_escape(desc)}</plot>")
+        air_date = getattr(episode, "air_date", None)
+        if air_date:
+            lines.append(f"  <aired>{air_date}</aired>")
+        rating = getattr(episode, "rating", None)
+        if rating:
+            lines.append(f"  <rating>{rating}</rating>")
+        tmdb_id = getattr(episode, "tmdb_id", None)
+        if tmdb_id:
+            lines.append(f"  <uniqueid type=\"tmdb\" default=\"true\">{tmdb_id}</uniqueid>")
+        lines.append("</episodedetails>")
+
+        try:
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            logger.error(f"Episode NFO write failed for {file_stem}: {e}")
+
+    def deactivate_episodes(self, body):
+        episode_ids = body.get("episode_ids", [])
+        deactivated = []
+        # (category_id, folder_rel, file_stem) captured before delete since
+        # removal needs the category's base strm_folder to build the path.
+        removal_info = {}
+        for eid in episode_ids:
+            eid = str(eid)
+            if eid in self._episodes_activated:
+                entry = self._episodes_activated[eid]
+                removal_info[eid] = (
+                    entry.get("category_id"),
+                    entry.get("strm_folder"),
+                    entry.get("strm_stem"),
+                )
+                del self._episodes_activated[eid]
+                deactivated.append(eid)
+
+        self._save_state()
+
+        if deactivated:
+            self._remove_strm_for_episodes(removal_info)
+            self._log_event(
+                "info",
+                f"Deactivated {len(deactivated)} episode(s)",
+            )
+
+        return {"status": "ok", "deactivated": len(deactivated)}
+
+    def _remove_strm_for_episodes(self, removal_info):
+        import shutil as _shutil
+
+        for eid, (category_id, folder_rel, file_stem) in removal_info.items():
+            category = self._resolve_series_category(category_id)
+            if not category or not folder_rel:
+                logger.warning(f"Episode STRM removal skipped for {eid}: no known folder/category")
+                continue
+            try:
+                base_dir = self._series_category_path(category["strm_folder"])
+                folder = os.path.join(base_dir, folder_rel)
+                if file_stem:
+                    strm_path = os.path.join(folder, f"{file_stem}.strm")
+                    nfo_path = os.path.join(folder, f"{file_stem}.nfo")
+                    for p in (strm_path, nfo_path):
+                        if os.path.exists(p):
+                            os.remove(p)
+                    # Clean up the season/series folders if now empty, but
+                    # never delete the shared category base_dir itself.
+                    try:
+                        season_dir = folder
+                        os.rmdir(season_dir)
+                        series_dir = os.path.dirname(season_dir)
+                        if os.path.abspath(series_dir) != os.path.abspath(base_dir):
+                            os.rmdir(series_dir)
+                    except OSError:
+                        pass  # not empty -- other episodes still activated
+                logger.info(f"Episode STRM removed: {file_stem}")
+            except Exception as e:
+                logger.error(f"Episode STRM removal error for {eid}: {e}")
+
+    def get_episode_redirect_url(self, episode_id):
+        eid = str(episode_id)
+        if eid not in self._episodes_activated:
+            return None, "Episode not activated", None, None
+
+        dispatcharr_url = self.settings.get("dispatcharr_url", "").rstrip("/")
+        if not dispatcharr_url:
+            return None, "Dispatcharr URL not configured", None, None
+
+        try:
+            from apps.vod.models import Episode
+            episode = Episode.objects.get(id=int(eid))
+        except Exception:
+            return None, "Episode not found", None, None
+
+        relations = list(episode.m3u_relations.all())
+        if not relations:
+            return None, "No stream mapping for episode", None, None
+
+        entry = self._episodes_activated.get(eid, {})
+        cached_stream_id = entry.get("stream_pick")
+        relation = relations[0]
+        if cached_stream_id is not None:
+            for r in relations:
+                if str(r.stream_id) == str(cached_stream_id):
+                    relation = r
+                    break
+
+        relation = self._pick_relation_with_capacity(relations, relation)
+        entry["stream_pick"] = relation.stream_id
+        self._episodes_activated[eid] = entry
+        self._save_state()
+
+        stream_id = relation.stream_id
+        account_id = str(relation.m3u_account_id) if relation.m3u_account_id else "unknown"
+        redirect_url = self._build_episode_proxy_url(episode, relation)
+        return redirect_url, None, account_id, stream_id
+
     def list_categories(self, query):
         try:
             from apps.vod.models import VODCategory, M3UMovieRelation
@@ -1066,6 +1664,58 @@ class BridgeCore:
             account_counts = {}
             for row in (
                 M3UMovieRelation.objects
+                .values("m3u_account_id")
+                .annotate(cnt=Count("id"))
+            ):
+                account_counts[row["m3u_account_id"]] = row["cnt"]
+
+            providers = []
+            for acc in M3UAccount.objects.filter(
+                is_active=True, id__in=account_counts.keys()
+            ).order_by("name"):
+                providers.append(
+                    {"id": acc.id, "name": acc.name, "count": account_counts.get(acc.id, 0)}
+                )
+            return {"providers": providers}
+        except Exception as e:
+            return {"providers": [], "error": str(e)}
+
+    def list_series_catalog_categories(self, query):
+        try:
+            from apps.vod.models import VODCategory, M3USeriesRelation
+            from django.db.models import Count, Q
+
+            provider_ids = [v for v in query.get("provider_id", []) if v]
+
+            qs = VODCategory.objects.all()
+            if provider_ids:
+                qs = qs.annotate(
+                    series_count=Count(
+                        "m3useriesrelation",
+                        filter=Q(m3useriesrelation__m3u_account_id__in=[int(p) for p in provider_ids]),
+                    )
+                )
+            else:
+                qs = qs.annotate(series_count=Count("m3useriesrelation"))
+
+            cats = []
+            for cat in qs.filter(series_count__gt=0).order_by("name"):
+                cats.append(
+                    {"id": cat.id, "name": cat.name, "count": cat.series_count}
+                )
+            return {"categories": cats}
+        except Exception as e:
+            return {"categories": [], "error": str(e)}
+
+    def list_series_providers(self, query):
+        try:
+            from apps.m3u.models import M3UAccount
+            from apps.vod.models import M3USeriesRelation
+            from django.db.models import Count
+
+            account_counts = {}
+            for row in (
+                M3USeriesRelation.objects
                 .values("m3u_account_id")
                 .annotate(cnt=Count("id"))
             ):
@@ -1513,21 +2163,28 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"STRM removal error for {folder_name}: {e}")
 
-    def _trigger_plex_scan(self):
+    def _trigger_plex_scan(self, section=None):
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
-        section = self.settings.get("plex_library_section", 7)
+        if section is None:
+            section = self.settings.get("plex_library_section", 7)
         if not plex_url or not plex_token:
             return
-        try:
-            requests.get(
-                f"{plex_url}/library/sections/{section}/refresh",
-                headers={"X-Plex-Token": plex_token},
-                timeout=10,
-            )
-            logger.info("Plex library scan triggered")
-        except Exception as e:
-            logger.error(f"Plex scan failed: {e}")
+        # Large series/season activations can generate hundreds of STRM
+        # files across several batches; without this lock each batch (or a
+        # movie activation landing at the same moment) would fire its own
+        # concurrent /refresh call, and Plex's scanner does not coalesce
+        # overlapping scans of the same or different sections cleanly.
+        with self._plex_scan_lock:
+            try:
+                requests.get(
+                    f"{plex_url}/library/sections/{section}/refresh",
+                    headers={"X-Plex-Token": plex_token},
+                    timeout=10,
+                )
+                logger.info(f"Plex library scan triggered (section {section})")
+            except Exception as e:
+                logger.error(f"Plex scan failed: {e}")
 
     def _plex_delete_movies(self, movie_ids):
         plex_url = self.settings.get("plex_url", "")
@@ -1856,6 +2513,29 @@ class BridgeCore:
             self._log_event("info", f"Play request: \"{name}\" (id={mid}) from {client_ip} — redirect OK{via}")
         else:
             self._log_event("error", f"Play request: \"{name}\" (id={mid}) from {client_ip} — FAILED: {detail}")
+
+    def log_episode_play_request(self, episode_id, client_ip, ok, detail=None, account_id=None, stream_id=None):
+        eid = str(episode_id)
+        try:
+            from apps.vod.models import Episode
+            ep = Episode.objects.select_related("series").get(id=int(eid))
+            name = f"{ep.series.name} S{ep.season_number:02d}E{ep.episode_number:02d}"
+        except Exception:
+            name = f"episode #{eid}"
+
+        # Separate namespace from movie IDs in the dedup key -- Movie and
+        # Episode primary keys can collide since they're different tables.
+        key = ("episode", eid, str(stream_id))
+        if ok:
+            now = time.time()
+            last = self._last_play_log.get(key)
+            if last is not None and (now - last) < self.PLAY_LOG_DEDUP_SECS:
+                return
+            self._last_play_log[key] = now
+            via = f" (via {self._account_name(account_id)})" if account_id else ""
+            self._log_event("info", f"Play request: \"{name}\" (id={eid}) from {client_ip} — redirect OK{via}")
+        else:
+            self._log_event("error", f"Play request: \"{name}\" (id={eid}) from {client_ip} — FAILED: {detail}")
 
     def _account_name(self, account_id):
         try:

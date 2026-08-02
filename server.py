@@ -173,6 +173,14 @@ def _dispatch(environ, start_response, server, bridge, settings):
         query = _parse_query(environ)
         return _json_response(start_response, bridge.list_providers(query))
 
+    if path == "/api/series/catalog-categories" and method == "GET":
+        query = _parse_query(environ)
+        return _json_response(start_response, bridge.list_series_catalog_categories(query))
+
+    if path == "/api/series/providers" and method == "GET":
+        query = _parse_query(environ)
+        return _json_response(start_response, bridge.list_series_providers(query))
+
     if path == "/api/languages" and method == "GET":
         return _json_response(start_response, bridge.list_languages())
 
@@ -190,6 +198,44 @@ def _dispatch(environ, start_response, server, bridge, settings):
     if re.match(r"^/api/movies/\d+/detect-language$", path) and method == "POST":
         movie_id = path.split("/")[3]
         return _json_response(start_response, bridge.detect_single_language(movie_id))
+
+    if path == "/api/series/categories" and method == "GET":
+        return _json_response(start_response, bridge.list_series_categories())
+
+    if path == "/api/series/categories" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.create_series_category(body))
+
+    if re.match(r"^/api/series/categories/\d+$", path) and method == "PUT":
+        category_id = int(path.split("/")[-1])
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.update_series_category(category_id, body))
+
+    if re.match(r"^/api/series/categories/\d+$", path) and method == "DELETE":
+        category_id = int(path.split("/")[-1])
+        return _json_response(start_response, bridge.delete_series_category(category_id))
+
+    if path == "/api/series" and method == "GET":
+        query = _parse_query(environ)
+        return _json_response(start_response, bridge.list_series(query))
+
+    if re.match(r"^/api/series/\d+/seasons$", path) and method == "GET":
+        series_id = path.split("/")[3]
+        return _json_response(start_response, bridge.list_seasons(series_id))
+
+    if re.match(r"^/api/series/\d+/episodes$", path) and method == "GET":
+        series_id = path.split("/")[3]
+        query = _parse_query(environ)
+        season_number = query.get("season", [None])[0]
+        return _json_response(start_response, bridge.list_episodes(series_id, season_number))
+
+    if path == "/api/episodes/activate" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.activate_episodes(body))
+
+    if path == "/api/episodes/deactivate" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.deactivate_episodes(body))
 
     if path == "/api/health" and method == "GET":
         return _json_response(start_response, bridge.health_check(settings))
@@ -258,6 +304,36 @@ def _dispatch(environ, start_response, server, bridge, settings):
             ("Content-Length", str(len(body))),
         ])
         return [body]
+
+    if path.startswith("/vod/episode/"):
+        filename = path[len("/vod/episode/"):]
+        episode_id = _extract_movie_id(filename)
+        if not episode_id:
+            return _text_response(start_response, 404, "Not found")
+
+        if method == "HEAD":
+            start_response("200 OK", [
+                ("Accept-Ranges", "bytes"),
+                ("Content-Type", "video/x-matroska"),
+            ])
+            return [b""]
+
+        client_ip = environ.get("REMOTE_ADDR", "unknown")
+
+        redirect_url, error, account_id, stream_id = bridge.get_episode_redirect_url(episode_id)
+        if error:
+            status = 404 if "not found" in error.lower() or "not activated" in error.lower() else 503
+            bridge.log_episode_play_request(episode_id, client_ip, ok=False, detail=error)
+            if settings.get("debug_connections"):
+                bridge._log_event("debug", f"Redirect failed for episode {episode_id} (client {client_ip}): {error}")
+            return _text_response(start_response, status, error)
+
+        logger.info(f"302 redirect: episode {episode_id} -> {redirect_url}")
+        bridge.log_episode_play_request(episode_id, client_ip, ok=True, detail=None, account_id=account_id, stream_id=stream_id)
+        if settings.get("debug_connections"):
+            bridge._log_event("debug", f"Outbound redirect: episode {episode_id} -> {redirect_url} (client {client_ip})")
+        start_response("302 Found", [("Location", redirect_url)])
+        return [b""]
 
     if path.startswith("/vod/"):
         filename = path[5:]

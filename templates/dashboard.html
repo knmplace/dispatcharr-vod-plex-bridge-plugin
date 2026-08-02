@@ -36,6 +36,16 @@ a { color: var(--accent); text-decoration: none; }
 .header-stats { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text2); }
 .header-stats .stat-val { color: var(--text); font-weight: 600; }
 
+/* Movies/Series mode toggle */
+.mode-toggle { display: flex; background: var(--surface2); border: 1px solid var(--border); border-radius: 999px; padding: 2px; gap: 2px; }
+.mode-toggle .mode-btn { padding: 0.3rem 0.9rem; border-radius: 999px; font-size: 1.1rem; font-weight: 600; color: var(--text2); cursor: pointer; transition: all 0.15s; user-select: none; }
+.mode-toggle .mode-btn.active { background: var(--accent); color: #fff; }
+.mode-toggle .mode-btn:not(.active):hover { color: var(--text); }
+@media (max-width: 768px) {
+  .header { flex-wrap: wrap; gap: 0.5rem; }
+  .mode-toggle { order: 3; width: 100%; justify-content: center; }
+}
+
 /* Tabs */
 .tabs { display: flex; align-items: center; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); }
 .tab { padding: 0.6rem 1.2rem; cursor: pointer; color: var(--text2); font-size: 0.85rem; border-bottom: 2px solid transparent; transition: all 0.15s; position: relative; }
@@ -106,6 +116,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .movie-card { background: var(--surface2); border-radius: var(--radius); overflow: hidden; position: relative; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s; }
 .movie-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .movie-card.activated { box-shadow: 0 0 0 2px var(--green); }
+.movie-card.selected { box-shadow: 0 0 0 2px var(--accent); }
+.series-select-cb { position: absolute; top: 6px; left: 6px; z-index: 2; width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer; }
 .movie-poster { width: 100%; aspect-ratio: 2/3; background: var(--border); object-fit: cover; display: block; }
 .movie-poster.no-poster { display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--text2); }
 .movie-info { padding: 0.4rem 0.5rem; }
@@ -291,9 +303,14 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 
 <div class="header">
   <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v{{PLUGIN_VERSION}}</span></h1>
+  <div class="mode-toggle" id="modeToggle">
+    <div class="mode-btn active" data-mode="movies" onclick="switchMode('movies')">Movies</div>
+    <div class="mode-btn" data-mode="series" onclick="switchMode('series')">Series</div>
+  </div>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
-    <span>Activated: <span class="stat-val" id="hdrActivated">-</span></span>
+    <span>Movies Activated: <span class="stat-val" id="hdrActivated">-</span></span>
+    <span>Series Activated: <span class="stat-val" id="hdrSeriesActivated">-</span></span>
     <span>Categories: <span class="stat-val" id="hdrCategories">-</span></span>
   </div>
 </div>
@@ -303,6 +320,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
   <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
   <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
   <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
+  <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
 </div>
 
 <div class="content">
@@ -408,6 +426,77 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
         </div>
       </div>
     </div>
+
+    <!-- Series browse (drill-down: Series grid -> Season list -> Episode list). -->
+    <div id="seriesBrowse" style="display:none;">
+      <div class="browse-pinned">
+        <div class="panel">
+          <div class="panel-header" style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;">
+            <span id="seriesBreadcrumb">Series</span>
+            <button class="btn btn-outline" id="seriesBackBtn" onclick="seriesGoBack()" style="display:none;justify-self:center;font-size:0.95rem;padding:0.5rem 1.4rem;">&larr; Back</button>
+            <div style="display:flex;gap:0.3rem;align-items:center;justify-self:end;">
+              <button class="btn btn-primary btn-sm" onclick="selectAllSeriesItems()">Select All</button>
+              <button class="btn btn-outline btn-sm" onclick="clearAllSeriesSelections()">Clear All</button>
+              <button class="btn btn-green btn-sm" id="activateSeriesSelectedBtn" onclick="activateSeriesSelected(this)">Activate Selected</button>
+              <button class="btn btn-outline btn-sm" id="deactivateSeriesSelectedBtn" onclick="deactivateSeriesSelected(this)">Deactivate Selected</button>
+            </div>
+          </div>
+          <div class="panel-body" id="seriesSearchBar">
+            <div class="search-bar">
+              <div class="search-input-wrap" id="seriesSearchWrap" style="flex:0 0 220px;">
+                <input type="text" class="search-input" id="seriesSearchInput" placeholder="Search series..." onkeyup="if(event.key==='Enter')loadSeries(1)">
+                <button type="button" class="search-input-clear" onclick="document.getElementById('seriesSearchInput').value='';loadSeries(1)" title="Clear">&times;</button>
+              </div>
+              <div class="ms-dropdown" id="seriesProvDropdown">
+                <div class="ms-toggle" onclick="toggleMsPanel('seriesProv')">
+                  <span id="seriesProvLabel">All Providers</span>
+                  <span class="ms-arrow">&#9662;</span>
+                </div>
+                <div class="ms-panel" id="seriesProvPanel"></div>
+              </div>
+              <div class="ms-dropdown" id="seriesCatDropdown">
+                <div class="ms-toggle" onclick="toggleMsPanel('seriesCat')">
+                  <span id="seriesCatLabel">All Categories</span>
+                  <span class="ms-arrow">&#9662;</span>
+                </div>
+                <div class="ms-panel" id="seriesCatPanel2"></div>
+              </div>
+              <select class="search-input" id="seriesPerPageSel" onchange="loadSeries(1)" style="min-width:90px;">
+                <option value="60">60</option>
+                <option value="300">300</option>
+                <option value="800">800</option>
+                <option value="1300">1300</option>
+              </select>
+              <button class="btn btn-primary btn-sm" onclick="loadSeries(1)">Search</button>
+            </div>
+          </div>
+          <div class="selection-bar" id="seriesSelectionBar" style="display:none;">
+            <span>Selected: <span class="count" id="seriesSelCount">0</span></span>
+            <div style="display:flex;align-items:center;gap:0.4rem;">
+              <label style="font-size:0.75rem;color:var(--text2);">Destination:</label>
+              <select class="search-input" id="seriesDestCategorySel" style="min-width:160px;" onchange="onSeriesDestCategoryChange()"></select>
+            </div>
+            <div id="seriesAddCatInline" style="display:none;align-items:center;gap:0.4rem;">
+              <input type="text" class="search-input" id="seriesAddCatName" placeholder="Category name" style="width:130px;">
+              <input type="text" class="search-input" id="seriesAddCatFolder" placeholder="Folder name" style="width:120px;">
+              <input type="number" class="search-input" id="seriesAddCatPlexId" placeholder="Plex section ID" style="width:110px;">
+              <button class="btn btn-primary btn-sm" onclick="createSeriesCategoryInline()">Create</button>
+              <button class="btn btn-outline btn-sm" onclick="cancelSeriesAddCatInline()">Cancel</button>
+            </div>
+            <button class="btn btn-outline btn-sm" onclick="clearAllSeriesSelections()">Clear Selection</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <div id="seriesGrid" class="movie-grid">
+            <div class="loading"><span class="spinner"></span> Loading series...</div>
+          </div>
+          <div class="pagination" id="seriesPagination"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Streams Tab -->
@@ -491,6 +580,54 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     </div>
 
   </div>
+
+  <!-- Series Settings Tab -->
+  <div class="tab-pane" id="pane-seriesSettings">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Series Categories</span>
+      </div>
+      <div class="panel-body">
+        <p style="font-size:0.8rem;color:var(--text2);margin:0 0 0.75rem;">
+          Each category maps to its own STRM output folder (its own rclone endpoint)
+          and its own Plex library section ID. Separate from the Movies STRM
+          folder/Plex library set in the plugin's own Dispatcharr settings panel.
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:0.82rem;" id="seriesCatTable">
+          <thead>
+            <tr style="text-align:left;border-bottom:1px solid var(--border);">
+              <th style="padding:0.4rem;">Name</th>
+              <th style="padding:0.4rem;">Folder Name</th>
+              <th style="padding:0.4rem;">Plex Library Section ID</th>
+              <th style="padding:0.4rem;"></th>
+            </tr>
+          </thead>
+          <tbody id="seriesCatBody">
+            <tr><td colspan="4" class="loading" style="padding:0.6rem;"><span class="spinner"></span> Loading...</td></tr>
+          </tbody>
+        </table>
+
+        <div style="display:flex;gap:0.5rem;align-items:flex-end;margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border);flex-wrap:wrap;">
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <label style="font-size:0.72rem;color:var(--text);font-weight:600;">Name</label>
+            <input type="text" class="search-input" id="newCatName" placeholder="e.g. Comedy" style="width:160px;">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <label style="font-size:0.72rem;color:var(--text);font-weight:600;">Folder Name</label>
+            <input type="text" class="search-input" id="newCatFolder" placeholder="e.g. comedy" style="width:160px;" oninput="updateNewCatPathPreview()">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <label style="font-size:0.72rem;color:var(--text);font-weight:600;">Plex Library Section ID</label>
+            <input type="number" class="search-input" id="newCatPlexId" placeholder="optional, set after creating Plex library" style="width:220px;">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="createSeriesCategory()">Add Category</button>
+        </div>
+        <div style="font-size:0.72rem;color:var(--text2);margin-top:0.4rem;" id="newCatPathPreview"></div>
+        <div style="font-size:0.72rem;color:var(--text2);margin-top:0.2rem;">Leave Plex Library Section ID blank if the Plex library doesn't exist yet — the folder needs to exist first so Plex can point at it. You can edit the ID later once you know it.</div>
+        <span id="seriesCatMessage" style="display:none;font-size:0.75rem;color:var(--red);margin-top:0.5rem;"></span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -498,12 +635,15 @@ const BASE = '';
 let currentPage = 1;
 let selectedMovies = new Set();
 let streamRefreshTimer = null;
+let currentMode = 'movies';
 
 // Multi-select state
 const msState = {
   msProv: new Set(),
   msCat: new Set(),
-  msLang: new Set()
+  msLang: new Set(),
+  msSeriesProv: new Set(),
+  msSeriesCat: new Set()
 };
 
 function switchTab(tab) {
@@ -517,6 +657,491 @@ function switchTab(tab) {
   if (tab === 'health') loadHealth();
   if (tab === 'logs') { loadProxyLog(); startLogAutoRefresh(); }
   else stopLogAutoRefresh();
+  if (tab === 'seriesSettings') loadSeriesCategories();
+}
+
+function switchMode(mode) {
+  if (mode === currentMode) return;
+  currentMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+
+  const movieEls = [document.getElementById('browsePinned'), ...document.querySelectorAll('#pane-browse > .panel')];
+  const seriesEl = document.getElementById('seriesBrowse');
+  if (mode === 'series') {
+    movieEls.forEach(el => { if (el) el.style.display = 'none'; });
+    seriesEl.style.display = '';
+    seriesNav = { view: 'series', seriesId: null, seriesName: '', seasonNumber: null };
+    if (!seriesFiltersLoaded) {
+      seriesFiltersLoaded = true;
+      loadSeriesProviders();
+      loadSeriesCatalogCategories();
+      loadSeriesCategoriesIntoSelect();
+    }
+    loadSeries(1);
+  } else {
+    movieEls.forEach(el => { if (el) el.style.display = ''; });
+    seriesEl.style.display = 'none';
+  }
+}
+
+// --- Series/Season/Episode browse + selection/activation ---
+let seriesNav = { view: 'series', seriesId: null, seriesName: '', seriesPoster: '', seasonNumber: null };
+let seriesCurrentPage = 1;
+let seriesFiltersLoaded = false;
+
+// Selection is tracked per-card (series/season/episode) by a synthetic key,
+// each mapped to the episode IDs it represents. Series/season selections are
+// resolved to concrete episode IDs lazily (via /api/series/<id>/episodes)
+// only when the user hits Activate/Deactivate, since a big catalog browse
+// would otherwise mean fetching every series' full episode list up front.
+let seriesSelection = new Map(); // key -> {level, seriesId, seriesName, seasonNumber, episodeIds: [] | null}
+let seriesCategoriesCache = [];
+
+function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
+  if (level === 'series') return `series:${seriesId}`;
+  if (level === 'season') return `season:${seriesId}:${seasonNumber}`;
+  return `episode:${episodeId}`;
+}
+
+function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl) {
+  const key = seriesSelKey(level, seriesId, seasonNumber, episodeId);
+  const checked = cbEl ? cbEl.checked : !seriesSelection.has(key);
+  if (!checked) {
+    seriesSelection.delete(key);
+  } else {
+    seriesSelection.set(key, {
+      level, seriesId, seriesName, seasonNumber,
+      episodeIds: level === 'episode' ? [episodeId] : null,
+    });
+  }
+  updateSeriesSelectionUI();
+}
+
+function updateSeriesSelectionUI() {
+  document.querySelectorAll('#seriesGrid .movie-card').forEach(card => {
+    const cb = card.querySelector('.series-select-cb');
+    if (!cb) return;
+    const selected = seriesSelection.has(cb.dataset.selKey);
+    cb.checked = selected;
+    card.classList.toggle('selected', selected);
+  });
+  const bar = document.getElementById('seriesSelectionBar');
+  const count = document.getElementById('seriesSelCount');
+  if (seriesSelection.size > 0) {
+    bar.style.display = '';
+    count.textContent = seriesSelection.size;
+  } else {
+    bar.style.display = 'none';
+  }
+}
+
+function selectAllSeriesItems() {
+  document.querySelectorAll('#seriesGrid .series-select-cb').forEach(cb => {
+    if (!cb.checked) cb.dispatchEvent(new Event('change'));
+  });
+}
+
+function clearAllSeriesSelections() {
+  seriesSelection.clear();
+  updateSeriesSelectionUI();
+}
+
+async function loadSeriesCategoriesIntoSelect() {
+  const data = await api('/api/series/categories');
+  seriesCategoriesCache = data.categories || [];
+  const sel = document.getElementById('seriesDestCategorySel');
+  const prevValue = sel.value;
+  let html = '<option value="">Select category&hellip;</option>';
+  html += seriesCategoriesCache.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+  html += '<option value="__add__">+ Add Category&hellip;</option>';
+  sel.innerHTML = html;
+  if (prevValue && [...sel.options].some(o => o.value === prevValue)) sel.value = prevValue;
+}
+
+function onSeriesDestCategoryChange() {
+  const sel = document.getElementById('seriesDestCategorySel');
+  const inline = document.getElementById('seriesAddCatInline');
+  if (sel.value === '__add__') {
+    inline.style.display = 'flex';
+  } else {
+    inline.style.display = 'none';
+  }
+}
+
+function cancelSeriesAddCatInline() {
+  document.getElementById('seriesAddCatInline').style.display = 'none';
+  document.getElementById('seriesDestCategorySel').value = '';
+}
+
+async function createSeriesCategoryInline() {
+  const name = document.getElementById('seriesAddCatName').value.trim();
+  const folder = document.getElementById('seriesAddCatFolder').value.trim();
+  const plexId = document.getElementById('seriesAddCatPlexId').value.trim();
+  if (!name || !folder || !plexId) {
+    showToast('Add Category failed', 'Name, folder, and Plex library section ID are all required', 'error');
+    return;
+  }
+  try {
+    const data = await api('/api/series/categories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, strm_folder: folder, plex_library_section: parseInt(plexId) }),
+    });
+    if (data.status === 'error') {
+      showToast('Add Category failed', data.error || data.message || 'Unknown error', 'error');
+      return;
+    }
+    await loadSeriesCategoriesIntoSelect();
+    const sel = document.getElementById('seriesDestCategorySel');
+    sel.value = String(data.category.id);
+    document.getElementById('seriesAddCatInline').style.display = 'none';
+    document.getElementById('seriesAddCatName').value = '';
+    document.getElementById('seriesAddCatFolder').value = '';
+    document.getElementById('seriesAddCatPlexId').value = '';
+    showToast('Category created', `"${data.category.name}" ready to use`, 'success');
+  } catch (e) {
+    showToast('Add Category failed', String(e), 'error');
+  }
+}
+
+// Resolves the current selection (series/season/episode-level entries) down
+// to a flat list of concrete episode IDs, fetching each series/season's
+// episode list on demand.
+async function resolveSeriesSelectionToEpisodeIds() {
+  const ids = new Set();
+  for (const entry of seriesSelection.values()) {
+    if (entry.level === 'episode') {
+      entry.episodeIds.forEach(id => ids.add(id));
+    } else if (entry.level === 'season') {
+      const data = await api(`/api/series/${entry.seriesId}/episodes?season=${entry.seasonNumber}`);
+      (data.episodes || []).forEach(ep => ids.add(ep.id));
+    } else if (entry.level === 'series') {
+      const seasonsData = await api(`/api/series/${entry.seriesId}/seasons`);
+      for (const sn of (seasonsData.seasons || [])) {
+        const data = await api(`/api/series/${entry.seriesId}/episodes?season=${sn.season_number}`);
+        (data.episodes || []).forEach(ep => ids.add(ep.id));
+      }
+    }
+  }
+  return [...ids];
+}
+
+async function activateSeriesSelected(btnEl) {
+  if (seriesSelection.size === 0) return;
+  const categoryId = document.getElementById('seriesDestCategorySel').value;
+  if (!categoryId || categoryId === '__add__') {
+    showToast('Activate failed', 'Choose a destination category first', 'error');
+    return;
+  }
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const episodeIds = await resolveSeriesSelectionToEpisodeIds();
+    const data = await api('/api/episodes/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode_ids: episodeIds, category_id: parseInt(categoryId) }),
+    });
+    if (data.status === 'error') {
+      showToast('Activate failed', data.message || 'Unknown error', 'error');
+    } else {
+      showToast('Activate complete', namesPreview(data.names, data.activated), 'success');
+    }
+    clearAllSeriesSelections();
+    loadSummary();
+  } catch (e) {
+    showToast('Activate failed', String(e), 'error');
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
+async function deactivateSeriesSelected(btnEl) {
+  if (seriesSelection.size === 0) return;
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const episodeIds = await resolveSeriesSelectionToEpisodeIds();
+    const data = await api('/api/episodes/deactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode_ids: episodeIds }),
+    });
+    if (data.status === 'error') {
+      showToast('Deactivate failed', data.message || 'Unknown error', 'error');
+    } else {
+      showToast('Deactivate complete', `${data.deactivated} episode(s)`, 'success');
+    }
+    clearAllSeriesSelections();
+    loadSummary();
+  } catch (e) {
+    showToast('Deactivate failed', String(e), 'error');
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
+function seriesGoBack() {
+  if (seriesNav.view === 'episodes') {
+    seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null };
+    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster);
+  } else if (seriesNav.view === 'seasons') {
+    seriesNav = { view: 'series', seriesId: null, seriesName: '', seriesPoster: '', seasonNumber: null };
+    loadSeries(seriesCurrentPage);
+  }
+}
+
+async function loadSeries(page) {
+  seriesCurrentPage = page || 1;
+  seriesNav = { view: 'series', seriesId: null, seriesName: '', seasonNumber: null };
+  document.getElementById('seriesBreadcrumb').textContent = 'Series';
+  document.getElementById('seriesBackBtn').style.display = 'none';
+  document.getElementById('seriesSearchBar').style.display = '';
+
+  const search = document.getElementById('seriesSearchInput').value;
+  const perPage = parseInt(document.getElementById('seriesPerPageSel').value) || 60;
+  let url = `/api/series?page=${seriesCurrentPage}&per_page=${perPage}`;
+  if (search) url += `&search=${encodeURIComponent(search)}`;
+  const provP = msParams('seriesProv');
+  if (provP) url += '&' + provP;
+  const catP = msParams('seriesCat');
+  if (catP) url += '&' + catP;
+
+  const grid = document.getElementById('seriesGrid');
+  grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading series...</div>';
+  const data = await api(url);
+
+  if (!data.series || data.series.length === 0) {
+    grid.innerHTML = '<div class="empty">No series found</div>';
+    document.getElementById('seriesPagination').innerHTML = '';
+    return;
+  }
+
+  grid.innerHTML = data.series.map(s => {
+    const poster = s.poster
+      ? `<img class="movie-poster" src="${s.poster}" loading="lazy" onerror="posterRetry(this)">`
+      : '<div class="movie-poster no-poster">No Poster</div>';
+    const key = seriesSelKey('series', s.id, null, null);
+    const checked = seriesSelection.has(key) ? 'checked' : '';
+    const trailerBtn = s.trailer_key
+      ? `<button class="trailer-btn" onclick="event.stopPropagation();playTrailer('${s.trailer_key}')" title="Watch trailer">&#9654;</button>`
+      : '';
+    return `<div class="movie-card ${checked ? 'selected' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeHtml(s.id)}','${escapeHtml(s.name)}',null,null,this)">
+      ${trailerBtn}
+      ${poster}
+      <div class="movie-info">
+        <div class="movie-title">${escapeHtml(s.name)}</div>
+        <div class="movie-year">${s.year||''}${s.episode_count ? ' &middot; '+s.episode_count+' eps' : ''}</div>
+      </div>
+    </div>`;
+  }).join('');
+  grid.querySelectorAll('.movie-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.classList.contains('series-select-cb')) return;
+      loadSeasons(card.dataset.seriesId, card.dataset.seriesName, card.dataset.seriesPoster);
+    });
+  });
+  updateSeriesSelectionUI();
+
+  const pag = document.getElementById('seriesPagination');
+  if (data.pages > 1) {
+    let html = `<button ${seriesCurrentPage<=1?'disabled':''} onclick="loadSeries(${seriesCurrentPage-1})">Prev</button>`;
+    html += `<span class="page-info">${seriesCurrentPage} / ${data.pages} (${data.total} series)</span>`;
+    html += `<button ${seriesCurrentPage>=data.pages?'disabled':''} onclick="loadSeries(${seriesCurrentPage+1})">Next</button>`;
+    pag.innerHTML = html;
+  } else {
+    pag.innerHTML = data.total ? `<span class="page-info">${data.total} series</span>` : '';
+  }
+}
+
+function seriesPosterCardHtml(poster, label) {
+  return poster
+    ? `<img class="movie-poster" src="${poster}" loading="lazy" onerror="posterRetry(this)">`
+    : `<div class="movie-poster no-poster">${label}</div>`;
+}
+
+async function loadSeasons(seriesId, seriesName, seriesPoster) {
+  seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null };
+  document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName}`;
+  document.getElementById('seriesBackBtn').style.display = '';
+  document.getElementById('seriesSearchBar').style.display = 'none';
+  document.getElementById('seriesPagination').innerHTML = '';
+
+  const grid = document.getElementById('seriesGrid');
+  grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading seasons...</div>';
+  const data = await api(`/api/series/${seriesId}/seasons`);
+
+  if (!data.seasons || data.seasons.length === 0) {
+    grid.innerHTML = '<div class="empty">No seasons found</div>';
+    return;
+  }
+
+  grid.innerHTML = data.seasons.map(sn => {
+    const label = sn.season_number === 0 ? 'Specials' : `Season ${sn.season_number}`;
+    const key = seriesSelKey('season', seriesId, sn.season_number, null);
+    const checked = seriesSelection.has(key) ? 'checked' : '';
+    return `<div class="movie-card ${checked ? 'selected' : ''}" data-season-number="${sn.season_number}" title="${label}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${sn.season_number},null,this)">
+      ${seriesPosterCardHtml(seriesPoster, label)}
+      <div class="movie-info">
+        <div class="movie-title">${label}</div>
+        <div class="movie-year">${sn.episode_count} episodes</div>
+      </div>
+    </div>`;
+  }).join('');
+  grid.querySelectorAll('.movie-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.classList.contains('series-select-cb')) return;
+      loadEpisodes(seriesId, seriesName, parseInt(card.dataset.seasonNumber), seriesPoster);
+    });
+  });
+  updateSeriesSelectionUI();
+}
+
+async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
+  seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber };
+  const seasonLabel = seasonNumber === 0 ? 'Specials' : `Season ${seasonNumber}`;
+  document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName} / ${seasonLabel}`;
+  document.getElementById('seriesBackBtn').style.display = '';
+
+  const grid = document.getElementById('seriesGrid');
+  grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading episodes...</div>';
+  const data = await api(`/api/series/${seriesId}/episodes?season=${seasonNumber}`);
+
+  if (!data.episodes || data.episodes.length === 0) {
+    grid.innerHTML = '<div class="empty">No episodes found</div>';
+    return;
+  }
+
+  grid.innerHTML = data.episodes.map(ep => {
+    const epLabel = `S${String(ep.season_number).padStart(2,'0')}E${String(ep.episode_number).padStart(2,'0')}`;
+    const cleanName = stripEpisodeNamePrefix(ep.name, seriesName, epLabel);
+    const titleText = epLabel + (cleanName ? ' - ' + cleanName : '');
+    const key = seriesSelKey('episode', seriesId, seasonNumber, ep.id);
+    const checked = seriesSelection.has(key) ? 'checked' : '';
+    return `<div class="movie-card ${checked ? 'selected' : ''}" title="${escapeHtml(titleText)}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${seasonNumber},'${escapeHtml(ep.id)}',this)">
+      ${seriesPosterCardHtml(seriesPoster, epLabel)}
+      <div class="movie-info">
+        <div class="movie-title">${escapeHtml(titleText)}</div>
+        <div class="movie-year">${ep.air_date || ''}</div>
+      </div>
+    </div>`;
+  }).join('');
+  updateSeriesSelectionUI();
+}
+
+// Provider episode names often repeat "Series Name - SxxEyy - " before the actual
+// title; strip that so the card shows just the part unique to the episode.
+function stripEpisodeNamePrefix(name, seriesName, epLabel) {
+  if (!name) return '';
+  let cleaned = name;
+  const seriesEsc = seriesName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  cleaned = cleaned.replace(new RegExp('^\\s*' + seriesEsc + '\\s*[-:]\\s*', 'i'), '');
+  cleaned = cleaned.replace(new RegExp('^\\s*' + epLabel + '\\s*[-:]\\s*', 'i'), '');
+  return cleaned.trim();
+}
+
+// --- Series Settings tab: category -> STRM folder -> Plex library CRUD ---
+
+function seriesCatMessage(text) {
+  const el = document.getElementById('seriesCatMessage');
+  if (!text) { el.style.display = 'none'; return; }
+  el.textContent = text;
+  el.style.display = '';
+}
+
+let seriesCatBasePath = '';
+const SERIES_PLEX_SECTION_UNSET = 999;
+
+async function loadSeriesCategories() {
+  seriesCatMessage('');
+  const body = document.getElementById('seriesCatBody');
+  body.innerHTML = '<tr><td colspan="4" class="loading" style="padding:0.6rem;"><span class="spinner"></span> Loading...</td></tr>';
+  const data = await api('/api/series/categories');
+  const cats = data.categories || [];
+  seriesCatBasePath = (data.base_path || '').replace(/[\/\\]+$/, '');
+  updateNewCatPathPreview();
+
+  if (cats.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" style="padding:0.6rem;color:var(--text2);">No series categories yet — add one below.</td></tr>';
+    return;
+  }
+
+  body.innerHTML = cats.map(c => `
+    <tr style="border-bottom:1px solid var(--border);" data-cat-id="${c.id}">
+      <td style="padding:0.4rem;"><input type="text" class="search-input" value="${escapeHtml(c.name)}" id="catName_${c.id}" style="width:140px;"></td>
+      <td style="padding:0.4rem;">
+        <input type="text" class="search-input" value="${escapeHtml(c.strm_folder)}" id="catFolder_${c.id}" style="width:160px;">
+        <div style="font-size:0.68rem;color:var(--text2);margin-top:2px;">${escapeHtml(seriesCatBasePath)}/${escapeHtml(c.strm_folder)}</div>
+      </td>
+      <td style="padding:0.4rem;">
+        <input type="number" class="search-input" value="${c.plex_library_section}" id="catPlexId_${c.id}" style="width:100px;">
+        ${c.plex_library_section === SERIES_PLEX_SECTION_UNSET ? '<div style="font-size:0.68rem;color:var(--amber);margin-top:2px;">&#9888; Set real Plex Library ID</div>' : ''}
+      </td>
+      <td style="padding:0.4rem;white-space:nowrap;">
+        <button class="btn btn-outline btn-sm" onclick="saveSeriesCategory(${c.id})">Save</button>
+        <button class="btn btn-outline btn-sm" onclick="deleteSeriesCategory(${c.id})" style="color:var(--red);">Delete</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function updateNewCatPathPreview() {
+  const folder = document.getElementById('newCatFolder').value.trim();
+  const preview = document.getElementById('newCatPathPreview');
+  preview.textContent = folder ? `Will create: ${seriesCatBasePath}/${folder}` : '';
+}
+
+async function createSeriesCategory() {
+  seriesCatMessage('');
+  const name = document.getElementById('newCatName').value.trim();
+  const strm_folder = document.getElementById('newCatFolder').value.trim();
+  const plex_library_section = document.getElementById('newCatPlexId').value;
+
+  const data = await api('/api/series/categories', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, strm_folder, plex_library_section })
+  });
+
+  if (data.status !== 'ok') {
+    seriesCatMessage(data.error || 'Failed to create category');
+    return;
+  }
+  document.getElementById('newCatName').value = '';
+  document.getElementById('newCatFolder').value = '';
+  document.getElementById('newCatPlexId').value = '';
+  loadSeriesCategories();
+}
+
+async function saveSeriesCategory(id) {
+  seriesCatMessage('');
+  const name = document.getElementById(`catName_${id}`).value.trim();
+  const strm_folder = document.getElementById(`catFolder_${id}`).value.trim();
+  const plex_library_section = document.getElementById(`catPlexId_${id}`).value;
+
+  const data = await api(`/api/series/categories/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, strm_folder, plex_library_section })
+  });
+
+  if (data.status !== 'ok') {
+    seriesCatMessage(data.error || 'Failed to save category');
+    return;
+  }
+  showToast('Saved', `${name} updated`, 'success');
+  loadSeriesCategories();
+}
+
+async function deleteSeriesCategory(id) {
+  if (!confirm('Delete this series category? This does not delete any activated episodes.')) return;
+  const data = await api(`/api/series/categories/${id}`, { method: 'DELETE' });
+  if (data.status !== 'ok') {
+    seriesCatMessage(data.error || 'Failed to delete category');
+    return;
+  }
+  loadSeriesCategories();
 }
 
 async function api(path, opts) {
@@ -590,8 +1215,13 @@ function posterRetry(img) {
 }
 
 // Multi-select dropdown logic
+const MS_PANEL_IDS = {
+  prov: 'provPanel', cat: 'catPanel2', lang: 'langPanel',
+  seriesProv: 'seriesProvPanel', seriesCat: 'seriesCatPanel2'
+};
+
 function toggleMsPanel(type) {
-  const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
+  const panelId = MS_PANEL_IDS[type];
   const panel = document.getElementById(panelId);
   const toggle = panel.parentElement.querySelector('.ms-toggle');
   const wasOpen = panel.classList.contains('open');
@@ -613,8 +1243,21 @@ document.addEventListener('click', e => {
   }
 });
 
+const MS_SET_KEYS = {
+  prov: 'msProv', cat: 'msCat', lang: 'msLang',
+  seriesProv: 'msSeriesProv', seriesCat: 'msSeriesCat'
+};
+const MS_LABEL_IDS = {
+  prov: 'provLabel', cat: 'catLabel', lang: 'langLabel',
+  seriesProv: 'seriesProvLabel', seriesCat: 'seriesCatLabel'
+};
+const MS_ALL_LABELS = {
+  prov: 'All Providers', cat: 'All Categories', lang: 'All Languages',
+  seriesProv: 'All Providers', seriesCat: 'All Categories'
+};
+
 function onMsChange(type, id) {
-  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
+  const set = msState[MS_SET_KEYS[type]];
   if (set.has(id)) set.delete(id);
   else set.add(id);
   updateMsLabel(type);
@@ -622,20 +1265,29 @@ function onMsChange(type, id) {
   if (type === 'prov') {
     msState.msCat.clear();
     loadCategories();
+    searchMovies();
+  } else if (type === 'cat') {
+    searchMovies();
+  } else if (type === 'lang') {
+    searchMovies();
+  } else if (type === 'seriesProv') {
+    msState.msSeriesCat.clear();
+    loadSeriesCatalogCategories();
+    loadSeries(1);
+  } else if (type === 'seriesCat') {
+    loadSeries(1);
   }
-  searchMovies();
 }
 
 function updateMsLabel(type) {
-  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
-  const labelEl = document.getElementById(type === 'prov' ? 'provLabel' : type === 'cat' ? 'catLabel' : 'langLabel');
-  const allLabel = type === 'prov' ? 'All Providers' : type === 'cat' ? 'All Categories' : 'All Languages';
+  const set = msState[MS_SET_KEYS[type]];
+  const labelEl = document.getElementById(MS_LABEL_IDS[type]);
+  const allLabel = MS_ALL_LABELS[type];
 
   if (set.size === 0) {
     labelEl.innerHTML = allLabel;
   } else if (set.size === 1) {
-    const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
-    const panel = document.getElementById(panelId);
+    const panel = document.getElementById(MS_PANEL_IDS[type]);
     const item = panel.querySelector(`input[value="${[...set][0]}"]`);
     const name = item ? item.parentElement.querySelector('.ms-item-name').textContent : '1 selected';
     labelEl.innerHTML = name;
@@ -645,9 +1297,8 @@ function updateMsLabel(type) {
 }
 
 function buildMsPanel(type, items) {
-  const panelId = type === 'prov' ? 'provPanel' : type === 'cat' ? 'catPanel2' : 'langPanel';
-  const panel = document.getElementById(panelId);
-  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
+  const panel = document.getElementById(MS_PANEL_IDS[type]);
+  const set = msState[MS_SET_KEYS[type]];
 
   panel.innerHTML = items.map(item => {
     const checked = set.has(String(item.id)) ? 'checked' : '';
@@ -662,9 +1313,13 @@ function buildMsPanel(type, items) {
 }
 
 // Build query params from multi-select
+const MS_PARAM_KEYS = {
+  prov: 'provider_id', cat: 'category_id', lang: 'language',
+  seriesProv: 'provider_id', seriesCat: 'category_id'
+};
 function msParams(type) {
-  const set = type === 'prov' ? msState.msProv : type === 'cat' ? msState.msCat : msState.msLang;
-  const key = type === 'prov' ? 'provider_id' : type === 'cat' ? 'category_id' : 'language';
+  const set = msState[MS_SET_KEYS[type]];
+  const key = MS_PARAM_KEYS[type];
   return [...set].map(v => `${key}=${encodeURIComponent(v)}`).join('&');
 }
 
@@ -675,6 +1330,7 @@ async function loadSummary(btn) {
     const data = await api('/api/catalog/summary');
     document.getElementById('hdrTotal').textContent = data.total || 0;
     document.getElementById('hdrActivated').textContent = data.activated || 0;
+    document.getElementById('hdrSeriesActivated').textContent = data.series_activated || 0;
     document.getElementById('hdrCategories').textContent = (data.categories||[]).length;
 
     // Category chips
@@ -708,6 +1364,20 @@ async function loadCategories() {
   if (provParams) url += provParams + '&';
   const data = await api(url);
   buildMsPanel('cat', data.categories || []);
+}
+
+// Series providers/categories
+async function loadSeriesProviders() {
+  const data = await api('/api/series/providers');
+  buildMsPanel('seriesProv', data.providers || []);
+}
+
+async function loadSeriesCatalogCategories() {
+  let url = '/api/series/catalog-categories?';
+  const provParams = msParams('seriesProv');
+  if (provParams) url += provParams + '&';
+  const data = await api(url);
+  buildMsPanel('seriesCat', data.categories || []);
 }
 
 function filterByCategory(catId) {
