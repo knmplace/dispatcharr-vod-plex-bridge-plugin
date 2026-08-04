@@ -50,6 +50,18 @@ In Dispatcharr's plugin settings, configure:
 | **TMDB API Key** | Optional — enables language detection | *(your key)* |
 | **TMDB Read Token** | Optional — alternative to API key (Bearer token) | *(your token)* |
 
+After saving the settings and starting the server, open the plugin dashboard and go to
+**Health - rclone Endpoints**. It displays the exact URLs to use from the Plex/rclone host:
+
+```text
+Movies: http://<dashboard-host>:<dashboard-port>/vod/
+Series: http://<dashboard-host>:<dashboard-port>/vod-series/
+```
+
+Use the Movies URL for a Plex Movies library and the Series URL for a separate Plex TV Shows
+library. Series categories are subfolders below `/vod-series/`; they are not separate endpoints.
+The displayed host must be reachable from the Plex/rclone machine.
+
 ## 3. Expose the Port
 
 The plugin's HTTP port must be exposed through Docker. If Dispatcharr runs behind a VPN container (e.g., gluetun), add the port mapping there:

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -72,6 +73,24 @@ class BridgeCore:
     # Gives up after ~2 min and leaves it to the maintenance sweep.
     SIZE_RECONCILE_FAST_PATH_DELAYS_SECS = (20, 20, 20, 30, 30)
 
+    # Mirrors SIZE_RECONCILE_INTERVAL_SECS / SIZE_RECONCILE_FAST_PATH_DELAYS_SECS,
+    # but for backfilling a real tmdb_id onto series activated with a
+    # placeholder uniqueid (bead czo). Same two-tier shape: a fast retry
+    # burst right after activation, then a slower maintenance sweep to catch
+    # anything the fast path missed (e.g. Plex hadn't matched the show yet).
+    TMDB_RECONCILE_INTERVAL_SECS = 600
+    TMDB_RECONCILE_FAST_PATH_DELAYS_SECS = (20, 20, 20, 30, 30)
+
+    # Daily TMDB detection for unresolved (placeholder) series.
+    # Runs once per 24 hours, searches TMDB for series with is_placeholder=True
+    # and searched=False, stores top results for manual user review.
+    TMDB_DETECTION_INTERVAL_SECS = 86400  # 24 hours
+    TMDB_DETECTION_CONFIDENCE_THRESHOLD = 80  # Accept matches >= 80% confidence
+
+    # Delay between each series' TMDB search within one detection pass,
+    # to avoid hammering the API.
+    TMDB_SEARCH_DELAY_SECS = 0.5
+
     # Delay between each movie's refresh within one scheduled pass, so a
     # library-wide refresh doesn't burst requests against providers all at
     # once — spreads them out the same way a human clicking through movies
@@ -103,6 +122,7 @@ class BridgeCore:
         self._activated = {}
         self._episodes_activated = {}  # episode_id (str) -> {activated_at, stream_pick, category_id, strm_folder}
         self._series_categories = []  # [{id, name, strm_folder, plex_library_section}]
+        self._series_tmdb_state = {}  # series_id (str) -> {tmdb_id, is_placeholder, series_dir, series_name, category_id}
         self._plex_scan_lock = threading.Lock()  # serializes _trigger_plex_scan calls (movies + series)
         self._languages = {}
         self._data_dir = "/data/vod-plex-bridge"
@@ -124,6 +144,9 @@ class BridgeCore:
         self._last_removed_episode_check = 0.0
         self._last_stream_refresh_check = 0.0
         self._last_size_reconcile = 0.0
+        self._last_tmdb_reconcile = 0.0
+        self._last_tmdb_detection = 0.0
+        self._tmdb_detection_results = {}  # series_id (str) -> {results: [{tmdb_id, title, year, confidence, poster_path}], searched: bool, manual_pick: tmdb_id or None}
         self._last_tracking_sweep = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
         # Running counters surfaced on the Health tab so cleanup/refresh
@@ -152,6 +175,66 @@ class BridgeCore:
             f"BridgeCore initialized. {len(self._activated)} activated movies."
         )
         self._start_stall_watchdog()
+        threading.Thread(target=self._backfill_series_tmdb_state, daemon=True).start()
+
+    def _backfill_series_tmdb_state(self):
+        """One-time-per-restart repair for series activated before bead czo
+        shipped: those tvshow.nfo files already exist on disk with no
+        <uniqueid>, and _write_tvshow_nfo()'s skip-if-exists guard means a
+        newly-activated episode in the same series never touches them again.
+        Rebuilds the series_dir the same way _generate_strm_for_episodes()
+        does and force-rewrites tvshow.nfo through the normal resolve path
+        (sibling-row check, else placeholder) for every series in
+        _episodes_activated not yet tracked in _series_tmdb_state. Runs once
+        per plugin start, off the main thread since it touches disk/DB for
+        every distinct activated series."""
+        try:
+            from apps.vod.models import Episode
+        except Exception as e:
+            logger.error(f"Series tmdb backfill: model import failed: {e}")
+            return
+
+        pending = {}
+        for entry in self._episodes_activated.values():
+            sid = entry.get("series_id")
+            if not sid or sid in self._series_tmdb_state or sid in pending:
+                continue
+            pending[sid] = entry.get("category_id")
+
+        if not pending:
+            return
+
+        backfilled = 0
+        for sid, category_id in pending.items():
+            category = self._resolve_series_category(category_id)
+            if category is None:
+                continue
+            try:
+                episode = Episode.objects.select_related("series").filter(
+                    series_id=int(sid)
+                ).first()
+                if episode is None:
+                    continue
+                series = episode.series
+                series_name = self._clean_title(series.name)
+                year = getattr(series, "year", None)
+                series_folder_name = f"{series_name} ({year})" if year else series_name
+                series_dir = os.path.join(
+                    self._series_category_path(category["strm_folder"]), series_folder_name
+                )
+                if not os.path.isdir(series_dir):
+                    continue
+                self._write_tvshow_nfo(
+                    series, series_dir, clean_title=series_name,
+                    force=True, category_id=category_id,
+                )
+                backfilled += 1
+            except Exception as e:
+                logger.error(f"Series tmdb backfill failed for series {sid}: {e}")
+
+        if backfilled:
+            self._save_state()
+            logger.info(f"Series tmdb backfill: repaired tvshow.nfo for {backfilled}/{len(pending)} pre-existing series")
 
     def cleanup(self):
         self._watchdog_stop.set()
@@ -325,6 +408,20 @@ class BridgeCore:
                     self._reconcile_all_confirmed_episode_sizes()
                 except Exception as e:
                     logger.error(f"Episode size reconcile sweep error: {e}")
+
+            if now - self._last_tmdb_reconcile >= self.TMDB_RECONCILE_INTERVAL_SECS:
+                self._last_tmdb_reconcile = now
+                try:
+                    self._reconcile_all_series_tmdb_ids()
+                except Exception as e:
+                    logger.error(f"Series tmdb reconcile sweep error: {e}")
+
+            if now - self._last_tmdb_detection >= self.TMDB_DETECTION_INTERVAL_SECS:
+                self._last_tmdb_detection = now
+                try:
+                    self._run_tmdb_detection_sweep()
+                except Exception as e:
+                    logger.error(f"TMDB detection sweep error: {e}")
 
             if now - self._last_tracking_sweep >= self.STALE_TRACKING_SWEEP_INTERVAL_SECS:
                 self._last_tracking_sweep = now
@@ -827,6 +924,8 @@ class BridgeCore:
                 self._episodes_activated = state.get("episodes_activated", {})
                 self._maint_stats.update(state.get("maint_stats", {}))
                 self._series_categories = state.get("series_categories", [])
+                self._series_tmdb_state = state.get("series_tmdb_state", {})
+                self._tmdb_detection_results = state.get("tmdb_detection_results", {})
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
@@ -847,6 +946,8 @@ class BridgeCore:
                 "episodes_activated": self._episodes_activated,
                 "maint_stats": self._maint_stats,
                 "series_categories": self._series_categories,
+                "series_tmdb_state": self._series_tmdb_state,
+                "tmdb_detection_results": self._tmdb_detection_results,
             }, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
@@ -1333,6 +1434,17 @@ class BridgeCore:
                 except Exception:
                     cp = {}
 
+                activated_category = None
+                if sid in activated_counts:
+                    for entry in self._episodes_activated.values():
+                        if str(entry.get("series_id")) == sid:
+                            category_id = entry.get("category_id")
+                            if category_id:
+                                cat = self._resolve_series_category(category_id)
+                                if cat:
+                                    activated_category = cat.get("name")
+                            break
+
                 series_list.append(
                     {
                         "id": sid,
@@ -1347,6 +1459,7 @@ class BridgeCore:
                         "episode_count": getattr(s, "episode_count", None),
                         "trailer_key": trailer_key,
                         "activated_episode_count": activated_counts.get(sid, 0),
+                        "activated_category": activated_category,
                     }
                 )
 
@@ -1564,6 +1677,16 @@ class BridgeCore:
                     args=(eid,),
                     daemon=True,
                 ).start()
+            placeholder_series_ids = {
+                self._episodes_activated[eid]["series_id"] for eid in activated
+                if self._series_tmdb_state.get(self._episodes_activated[eid]["series_id"], {}).get("is_placeholder")
+            }
+            for sid in placeholder_series_ids:
+                threading.Thread(
+                    target=self._tmdb_reconcile_fast_path_series,
+                    args=(sid,),
+                    daemon=True,
+                ).start()
             titles = ", ".join(f'"{n}"' for n in activated_names)
             self._log_event(
                 "info",
@@ -1707,7 +1830,10 @@ class BridgeCore:
                     os.makedirs(folder, exist_ok=True)
 
                     if series_folder_name not in nfo_written_for:
-                        self._write_tvshow_nfo(episode.series, series_dir, clean_title=series_name)
+                        self._write_tvshow_nfo(
+                            episode.series, series_dir, clean_title=series_name,
+                            category_id=category["id"],
+                        )
                         nfo_written_for.add(series_folder_name)
 
                     ep_label = f"S{episode.season_number:02d}E{episode.episode_number:02d}"
@@ -1766,7 +1892,48 @@ class BridgeCore:
         except Exception as e:
             logger.error(f"Episode NFO write failed for {file_stem}: {e}")
 
-    def _write_tvshow_nfo(self, series, series_dir, clean_title=None):
+    def _find_sibling_series_tmdb_id(self, series):
+        """Dispatcharr's VOD catalog can hold duplicate Series rows for the
+        same real-world show (observed live: '13 Reasons Why' had 3 rows,
+        only one with tmdb_id populated, and the row that got activated was
+        an unrelated no-metadata duplicate). Cheap fix before falling back to
+        a placeholder: look for another row with the exact same name that
+        already has a tmdb_id and borrow it."""
+        name = getattr(series, "name", None)
+        if not name:
+            return None
+        try:
+            from apps.vod.models import Series as SeriesModel
+        except Exception:
+            return None
+        try:
+            sibling = (
+                SeriesModel.objects
+                .filter(name=name)
+                .exclude(id=series.id)
+                .exclude(tmdb_id__isnull=True)
+                .exclude(tmdb_id="")
+                .first()
+            )
+        except Exception as e:
+            logger.error(f"Sibling series tmdb lookup failed for '{name}': {e}")
+            return None
+        return getattr(sibling, "tmdb_id", None) if sibling else None
+
+    def _placeholder_series_tmdb_id(self, series):
+        """Deterministic stand-in uniqueid for a series with no real tmdb_id
+        anywhere in Dispatcharr's catalog (own row or a sibling row). Not a
+        real TMDB id -- just enough of a distinct identity, keyed off
+        name+year, to stop Plex's TV agent from merging two anchor-less shows
+        that land in the same library section. Replaced with a real id once
+        the background reconcile sweep finds one (see
+        _reconcile_series_tmdb_id / _reconcile_all_series_tmdb_ids)."""
+        name = getattr(series, "name", "") or ""
+        year = getattr(series, "year", "") or ""
+        digest = hashlib.sha1(f"{name}|{year}".encode("utf-8")).hexdigest()[:12]
+        return digest
+
+    def _write_tvshow_nfo(self, series, series_dir, clean_title=None, force=False, category_id=None):
         """Series-level identity anchor for Plex's TV agent. Without a
         tvshow.nfo at the show's root folder, Plex has only the folder name
         and thin per-episode metadata to identify each show in a shared
@@ -1775,9 +1942,15 @@ class BridgeCore:
         its episodes to the first show already in that library instead of
         creating its own show entry, because nothing pinned each folder to
         a distinct show identity. Written once per series folder (skipped
-        if already present) alongside the per-episode NFOs."""
+        if already present, unless force=True for the tmdb-id repair path
+        in _reconcile_series_tmdb_id) alongside the per-episode NFOs.
+
+        When series.tmdb_id is missing, tries a sibling Series row with the
+        same name first (_find_sibling_series_tmdb_id), then falls back to a
+        placeholder id (_placeholder_series_tmdb_id) rather than omitting
+        <uniqueid> entirely -- see bead czo."""
         nfo_path = os.path.join(series_dir, "tvshow.nfo")
-        if os.path.exists(nfo_path):
+        if os.path.exists(nfo_path) and not force:
             return
         title = clean_title if clean_title is not None else (getattr(series, "name", "") or "")
         lines = [
@@ -1801,16 +1974,36 @@ class BridgeCore:
         if rating:
             lines.append(f"  <rating>{rating}</rating>")
         tmdb_id = getattr(series, "tmdb_id", None)
-        if tmdb_id:
-            lines.append(f"  <uniqueid type=\"tmdb\" default=\"true\">{tmdb_id}</uniqueid>")
+        is_placeholder = False
+        if not tmdb_id:
+            tmdb_id = self._find_sibling_series_tmdb_id(series)
+        if not tmdb_id:
+            tmdb_id = self._placeholder_series_tmdb_id(series)
+            is_placeholder = True
+        uniqueid_type = "vodbridge" if is_placeholder else "tmdb"
+        lines.append(f"  <uniqueid type=\"{uniqueid_type}\" default=\"true\">{tmdb_id}</uniqueid>")
+        if not is_placeholder:
+            lines.append(f"  <tmdbid>{tmdb_id}</tmdbid>")
         lines.append("</tvshow>")
 
         try:
             with open(nfo_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-            logger.info(f"tvshow.nfo written for {title}")
+            logger.info(f"tvshow.nfo written for {title} (tmdb_id={tmdb_id}, placeholder={is_placeholder})")
         except Exception as e:
             logger.error(f"tvshow.nfo write failed for {title}: {e}")
+            return
+
+        sid = str(series.id)
+        prior = self._series_tmdb_state.get(sid, {})
+        self._series_tmdb_state[sid] = {
+            "tmdb_id": tmdb_id,
+            "is_placeholder": is_placeholder,
+            "series_dir": series_dir,
+            "series_name": getattr(series, "name", "") or "",
+            "series_clean_title": title,
+            "category_id": category_id if category_id is not None else prior.get("category_id"),
+        }
 
     def deactivate_episodes(self, body):
         episode_ids = body.get("episode_ids", [])
@@ -1870,7 +2063,7 @@ class BridgeCore:
             try:
                 resp = requests.get(
                     f"{plex_url}/library/sections/{section}/all",
-                    params={"X-Plex-Token": plex_token, "type": "4"},
+                    params={"X-Plex-Token": plex_token, "type": "2"},
                     headers={"Accept": "application/json"},
                     timeout=15,
                 )
@@ -1938,6 +2131,9 @@ class BridgeCore:
                         os.rmdir(season_dir)
                         series_dir = os.path.dirname(season_dir)
                         if os.path.abspath(series_dir) != os.path.abspath(category_base):
+                            tvshow_nfo = os.path.join(series_dir, "tvshow.nfo")
+                            if os.path.exists(tvshow_nfo):
+                                os.remove(tvshow_nfo)
                             os.rmdir(series_dir)
                     except OSError:
                         pass  # not empty -- other episodes still activated
@@ -2102,6 +2298,291 @@ class BridgeCore:
         if confirmed:
             self._save_state()
             logger.info(f"Episode size reconcile sweep: confirmed {confirmed}/{len(missing)} episodes")
+
+    def _fetch_plex_series_tmdb_ids(self, series_ids=None):
+        """Mirrors _fetch_plex_episode_sizes(): once Plex has scanned a
+        series folder (even one anchored only by our placeholder uniqueid),
+        its own metadata agent independently matches the show and resolves
+        a real tmdb guid -- read that back rather than calling the TMDB API
+        ourselves. Matches by show title (grandparentTitle-equivalent: the
+        section's top-level show title) against _series_tmdb_state's
+        series_clean_title, grouped by plex_library_section since each
+        Series Settings category can point at a different Plex library.
+
+        series_ids=None checks every tracked series across all known
+        categories (maintenance sweep); pass a list to limit the match set
+        (post-activation fast path)."""
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token:
+            return {}
+
+        wanted_ids = {str(sid) for sid in series_ids} if series_ids is not None else None
+        by_section = {}
+        for sid, entry in self._series_tmdb_state.items():
+            if wanted_ids is not None and sid not in wanted_ids:
+                continue
+            category = self._resolve_series_category(entry.get("category_id"))
+            section = category["plex_library_section"] if category else None
+            if section in (None, "", self.PLEX_SECTION_UNSET):
+                continue
+            by_section.setdefault(section, []).append((sid, entry))
+
+        resolved = {}
+        for section, pairs in by_section.items():
+            try:
+                resp = requests.get(
+                    f"{plex_url}/library/sections/{section}/all",
+                    params={"X-Plex-Token": plex_token, "type": "2"},
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
+                    continue
+
+                items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+                by_title = {it.get("title", ""): it for it in items}
+
+                for sid, entry in pairs:
+                    item = by_title.get(entry.get("series_clean_title", ""))
+                    if not item:
+                        continue
+                    for g in item.get("Guid", []):
+                        guid_id = g.get("id", "")
+                        if guid_id.startswith("tmdb://"):
+                            resolved[sid] = guid_id[len("tmdb://"):]
+                            break
+            except Exception as e:
+                logger.error(f"Plex series tmdb query failed for section {section}: {e}")
+
+        return resolved
+
+    def _reconcile_series_tmdb_id(self, series_id):
+        """Look up one placeholder-anchored series against Plex's own
+        resolved match and, if found, rewrite tvshow.nfo with the real
+        tmdb_id. Returns True if a real id was found and written."""
+        sid = str(series_id)
+        entry = self._series_tmdb_state.get(sid)
+        if entry is None or not entry.get("is_placeholder"):
+            return False
+
+        resolved = self._fetch_plex_series_tmdb_ids([sid])
+        real_tmdb_id = resolved.get(sid)
+        if not real_tmdb_id:
+            return False
+
+        try:
+            from apps.vod.models import Series as SeriesModel
+            series = SeriesModel.objects.get(id=int(sid))
+        except Exception:
+            return False
+
+        entry["tmdb_id"] = real_tmdb_id
+        entry["is_placeholder"] = False
+        self._write_tvshow_nfo(
+            series, entry["series_dir"], clean_title=entry.get("series_clean_title"),
+            force=True, category_id=entry.get("category_id"),
+        )
+        self._save_state()
+        logger.info(f"Series tmdb_id resolved via Plex for '{entry.get('series_name')}': {real_tmdb_id}")
+        return True
+
+    def _tmdb_reconcile_fast_path_series(self, series_id):
+        """Background retry loop started right after series activation,
+        mirroring _size_reconcile_fast_path_episode(). Only started for
+        series that got a placeholder uniqueid at write time."""
+        for delay in self.TMDB_RECONCILE_FAST_PATH_DELAYS_SECS:
+            time.sleep(delay)
+            try:
+                if self._reconcile_series_tmdb_id(series_id):
+                    return
+            except Exception as e:
+                logger.error(f"Fast-path tmdb reconcile error for series {series_id}: {e}")
+
+    def _calculate_tmdb_confidence(self, title, year, tmdb_result):
+        """Hybrid confidence scoring for TMDB search results.
+        Combines popularity, vote weighting, and name/year match bonuses.
+        Returns percentage 0-100."""
+        if not isinstance(tmdb_result, dict):
+            return 0
+
+        base_score = 50.0
+
+        # Popularity score (max +20): normalize popularity to 0-20 range (typical TMDB popularity is 0-100+)
+        popularity = tmdb_result.get("popularity", 0)
+        popularity_bonus = min(20, (popularity / 100) * 20)
+        base_score += popularity_bonus
+
+        # Vote weighting (max +15): higher vote count + higher vote average = more reliable
+        vote_count = tmdb_result.get("vote_count", 0)
+        vote_avg = tmdb_result.get("vote_average", 0)
+        vote_bonus = 0
+        if vote_count > 50:
+            vote_bonus += 10
+        if vote_avg >= 7.0:
+            vote_bonus += 5
+        base_score += vote_bonus
+
+        # Name match bonus (max +15): exact or very close title match
+        tmdb_title = tmdb_result.get("name", "").lower()
+        clean_title = title.lower().strip()
+        if tmdb_title == clean_title:
+            base_score += 15
+        elif tmdb_title.startswith(clean_title) or clean_title.startswith(tmdb_title):
+            base_score += 10
+
+        # Year match bonus (max +10): exact or within ±1 year
+        tmdb_year_str = tmdb_result.get("first_air_date", "")
+        if tmdb_year_str:
+            try:
+                tmdb_year = int(tmdb_year_str.split("-")[0])
+                year_int = int(year)
+                if tmdb_year == year_int:
+                    base_score += 10
+                elif abs(tmdb_year - year_int) == 1:
+                    base_score += 5
+            except (ValueError, IndexError):
+                pass
+
+        return min(100, base_score)
+
+    def _search_tmdb_series(self, series_name, year):
+        """Query TMDB /search/tv endpoint for series matches.
+        Returns list of results sorted by confidence score (descending).
+        Reads API key from Dispatcharr settings."""
+        try:
+            import requests
+        except ImportError:
+            logger.warning("requests library not available for TMDB search")
+            return []
+
+        tmdb_api_key = self.settings.get("tmdb_api_key", "")
+        if not tmdb_api_key:
+            logger.warning("No TMDB API key configured")
+            return []
+
+        try:
+            url = "https://api.themoviedb.org/3/search/tv"
+            params = {
+                "api_key": tmdb_api_key,
+                "query": series_name,
+                "first_air_date_year": str(year) if year else None,
+            }
+            params = {k: v for k, v in params.items() if v}
+
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+
+            results = data.get("results", [])
+            scored = []
+            for result in results:
+                confidence = self._calculate_tmdb_confidence(series_name, year, result)
+                scored.append({
+                    "tmdb_id": result.get("id"),
+                    "name": result.get("name"),
+                    "year": result.get("first_air_date", "")[:4],
+                    "poster_path": result.get("poster_path"),
+                    "overview": result.get("overview"),
+                    "confidence": confidence,
+                    "raw": result,
+                })
+
+            scored.sort(key=lambda x: x["confidence"], reverse=True)
+            return scored
+        except Exception as e:
+            logger.error(f"TMDB search error for '{series_name}' ({year}): {e}")
+            return []
+
+    def _run_tmdb_detection_sweep(self):
+        """Maintenance-cycle sweep: search TMDB for series with placeholder IDs
+        that haven't been searched yet. Auto-accept >= 80% confidence matches,
+        queue < 80% results for manual review."""
+        from apps.vod.models import Series as SeriesModel
+        candidates = [
+            (sid, entry) for sid, entry in self._series_tmdb_state.items()
+            if entry.get("is_placeholder") and not entry.get("searched")
+        ]
+        if not candidates:
+            return
+
+        auto_resolved = 0
+        queued_for_review = 0
+
+        for sid, entry in candidates:
+            try:
+                series_name = entry.get("name")
+                year = entry.get("year")
+                if not series_name:
+                    continue
+
+                time.sleep(self.TMDB_SEARCH_DELAY_SECS)
+                results = self._search_tmdb_series(series_name, year)
+                if not results:
+                    entry["searched"] = True
+                    continue
+
+                best = results[0]
+                if best["confidence"] >= self.TMDB_DETECTION_CONFIDENCE_THRESHOLD:
+                    # Auto-accept
+                    try:
+                        series = SeriesModel.objects.get(id=sid)
+                        series.tmdb_id = best["tmdb_id"]
+                        series.save(update_fields=["tmdb_id"])
+                        entry["is_placeholder"] = False
+                        entry["tmdb_id"] = best["tmdb_id"]
+                        entry["searched"] = True
+
+                        # Rewrite NFO with real tmdb_id
+                        series_dir = os.path.join(self._data_dir, "series", str(sid))
+                        if os.path.isdir(series_dir):
+                            self._write_tvshow_nfo(series, series_dir, force=True)
+
+                        auto_resolved += 1
+                        logger.info(f"TMDB detection auto-resolved series {sid}: {best['name']} (id={best['tmdb_id']}, confidence={best['confidence']:.0f}%)")
+                    except Exception as e:
+                        logger.error(f"TMDB detection auto-resolve error for series {sid}: {e}")
+                        entry["searched"] = True
+                else:
+                    # Queue for manual review
+                    self._tmdb_detection_results[sid] = {
+                        "name": series_name,
+                        "year": year,
+                        "results": results[:5],  # Top 5
+                        "ts": time.time(),
+                    }
+                    entry["searched"] = True
+                    queued_for_review += 1
+                    logger.debug(f"TMDB detection queued series {sid} for manual review (best={best['confidence']:.0f}%)")
+            except Exception as e:
+                logger.error(f"TMDB detection sweep error for series {sid}: {e}")
+                try:
+                    self._series_tmdb_state[sid]["searched"] = True
+                except:
+                    pass
+
+        if auto_resolved or queued_for_review:
+            logger.info(f"TMDB detection sweep: {auto_resolved} auto-resolved, {queued_for_review} queued for review")
+
+    def _reconcile_all_series_tmdb_ids(self):
+        """Maintenance-cycle sweep: backfill a real tmdb_id for every
+        activated series still sitting on a placeholder uniqueid."""
+        missing = [
+            sid for sid, entry in self._series_tmdb_state.items()
+            if entry.get("is_placeholder")
+        ]
+        if not missing:
+            return
+        resolved = 0
+        for sid in missing:
+            try:
+                if self._reconcile_series_tmdb_id(sid):
+                    resolved += 1
+            except Exception as e:
+                logger.error(f"Series tmdb reconcile sweep error for series {sid}: {e}")
+        if resolved:
+            logger.info(f"Series tmdb reconcile sweep: resolved {resolved}/{len(missing)} series")
 
     def _get_episode_redirect_lock(self, episode_id):
         with self._episode_redirect_locks_guard:

@@ -120,10 +120,11 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .series-select-cb { position: absolute; top: 6px; left: 6px; z-index: 2; width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer; }
 .movie-poster { width: 100%; aspect-ratio: 2/3; background: var(--border); object-fit: cover; display: block; }
 .movie-poster.no-poster { display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--text2); }
-.movie-info { padding: 0.4rem 0.5rem; }
-.movie-title { font-size: 0.75rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.movie-info { padding: 0.4rem 0.5rem; display: flex; flex-direction: column; align-items: center; text-align: center; }
+.movie-title { font-size: 0.75rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; }
+.movie-category { font-size: 0.6rem; color: var(--accent); font-weight: 500; margin-bottom: 2px; }
 .movie-year { font-size: 0.65rem; color: var(--text2); }
-.movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #000; font-size: 0.55rem; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.movie-badge { position: absolute; top: 4px; right: 4px; background: var(--green); color: #000; font-size: 0.65rem; padding: 2px 8px; border-radius: 4px; font-weight: 700; letter-spacing: 0.5px; box-shadow: 0 2px 4px rgba(0,0,0,0.4); }
 .activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
 .movie-card:hover .activate-btn { opacity: 1; }
 .reactivate-btn { position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--amber); font-size: 0.9rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; z-index: 2; }
@@ -320,6 +321,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
   <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
   <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
   <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
+  <div class="tab" data-tab="tmdbResults" onclick="switchTab('tmdbResults')">TMDB Results <span class="badge" id="tmdbBadge" style="display:none">0</span></div>
   <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
 </div>
 
@@ -632,6 +634,22 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       </div>
     </div>
   </div>
+
+  <!-- TMDB Results Tab -->
+  <div class="tab-pane" id="pane-tmdbResults">
+    <div class="panel">
+      <div class="panel-header">
+        <span>TMDB Detection Results</span>
+        <button class="btn btn-primary btn-sm" onclick="loadTmdbResults()">Refresh</button>
+      </div>
+      <div class="panel-body">
+        <div id="tmdbResultsContainer">
+          <div style="color:var(--text2);font-size:0.85rem;">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -659,6 +677,7 @@ function switchTab(tab) {
   if (tab === 'streams') startStreamRefresh();
   else stopStreamRefresh();
   if (tab === 'health') loadHealth();
+  if (tab === 'tmdbResults') loadTmdbResults();
   if (tab === 'logs') { loadProxyLog(); startLogAutoRefresh(); }
   else stopLogAutoRefresh();
   if (tab === 'seriesSettings') loadSeriesCategories();
@@ -982,6 +1001,7 @@ async function loadSeries(page) {
       ${actBadge}
       ${poster}
       <div class="movie-info">
+        ${s.activated_category ? `<div class="movie-category">${escapeHtml(s.activated_category)}</div>` : ''}
         <div class="movie-title">${escapeHtml(s.name)}</div>
         <div class="movie-year">${s.year||''}${s.episode_count ? ' &middot; '+s.episode_count+' eps' : ''}</div>
       </div>
@@ -1725,6 +1745,85 @@ function downloadBugReport() {
 }
 
 // Health
+async function loadTmdbResults() {
+  const container = document.getElementById('tmdbResultsContainer');
+  container.innerHTML = '<div style="color:var(--text2);font-size:0.85rem;">Loading...</div>';
+
+  const data = await api('/api/series/tmdb-results');
+  const results = data.results || [];
+
+  // Update badge
+  const badge = document.getElementById('tmdbBadge');
+  if (results.length > 0) {
+    badge.textContent = results.length;
+    badge.style.display = 'inline';
+  } else {
+    badge.style.display = 'none';
+  }
+
+  if (results.length === 0) {
+    container.innerHTML = '<div style="color:var(--green);font-size:0.9rem;">✓ No pending TMDB matches. All series resolved!</div>';
+    return;
+  }
+
+  container.innerHTML = results.map(series => `
+    <div class="panel" style="margin-bottom:1rem;">
+      <div class="panel-header">
+        <span>${escapeHtml(series.name)} (${series.year || '?'})</span>
+        <span style="font-size:0.7rem;color:var(--text2);">Series ID: ${series.series_id}</span>
+      </div>
+      <div class="panel-body">
+        <div style="display:flex;flex-direction:column;gap:0.8rem;">
+          ${series.results.map((result, idx) => `
+            <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:0.6rem;display:flex;gap:0.8rem;">
+              <div style="flex:0 0 50px;">
+                ${result.poster_path ? `<img src="https://image.tmdb.org/t/p/w92${result.poster_path}" style="width:50px;height:75px;border-radius:4px;object-fit:cover;" alt="${escapeHtml(result.name)}">` : '<div style="width:50px;height:75px;background:var(--border);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:0.7rem;color:var(--text2);">No Poster</div>'}
+              </div>
+              <div style="flex:1;">
+                <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">${escapeHtml(result.name)}</div>
+                <div style="font-size:0.75rem;color:var(--text2);margin-bottom:6px;">Year: ${result.year || '?'} • TMDB ID: ${result.tmdb_id}</div>
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem;">
+                  <div style="background:var(--green);color:#000;padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:600;">Confidence: ${Math.round(result.confidence)}%</div>
+                </div>
+                ${result.overview ? `<div style="font-size:0.75rem;color:var(--text2);line-height:1.4;max-height:3em;overflow:hidden;">${escapeHtml(result.overview)}</div>` : ''}
+              </div>
+              <div style="flex:0 0 120px;display:flex;align-items:center;">
+                <button class="btn btn-green" onclick="acceptTmdbResult(${series.series_id}, ${idx})" style="width:100%;font-size:0.8rem;">Accept</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function acceptTmdbResult(seriesId, resultIndex) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Accepting...';
+
+  try {
+    const response = await api('/api/series/tmdb-accept', 'POST', {
+      series_id: seriesId,
+      result_index: resultIndex
+    });
+
+    if (response.status === 'ok') {
+      showMessage('✓ TMDB ID accepted and NFO updated', 'green');
+      await loadTmdbResults();
+    } else {
+      showMessage('✗ Failed to accept TMDB match: ' + (response.error || 'unknown error'), 'red');
+      btn.disabled = false;
+      btn.textContent = 'Accept';
+    }
+  } catch (err) {
+    showMessage('✗ Error: ' + err.message, 'red');
+    btn.disabled = false;
+    btn.textContent = 'Accept';
+  }
+}
+
 async function loadHealth() {
   const data = await api('/api/health');
   const body = document.getElementById('healthBody');

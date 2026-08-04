@@ -293,6 +293,57 @@ def _dispatch(environ, start_response, server, bridge, settings):
         hours = max(1.0, min(hours, 24 * 7))
         return _bug_report_response(start_response, bridge, hours)
 
+    if path == "/api/series/tmdb-results" and method == "GET":
+        results = bridge._tmdb_detection_results
+        response_data = []
+        for series_id, entry in results.items():
+            response_data.append({
+                "series_id": series_id,
+                "name": entry.get("name"),
+                "year": entry.get("year"),
+                "results": entry.get("results", []),
+            })
+        return _json_response(start_response, {"results": response_data})
+
+    if path == "/api/series/tmdb-accept" and method == "POST":
+        body = _read_json_body(environ)
+        series_id = body.get("series_id")
+        result_index = body.get("result_index")
+        if not series_id or result_index is None:
+            return _json_response(start_response, {"error": "Missing series_id or result_index"}, status=400)
+
+        entry = bridge._tmdb_detection_results.get(series_id)
+        if not entry:
+            return _json_response(start_response, {"error": "Series not found in results"}, status=404)
+
+        results = entry.get("results", [])
+        if not (0 <= result_index < len(results)):
+            return _json_response(start_response, {"error": "Invalid result_index"}, status=400)
+
+        selected = results[result_index]
+        try:
+            from apps.vod.models import Series
+            series = Series.objects.get(id=series_id)
+            series.tmdb_id = selected["tmdb_id"]
+            series.save(update_fields=["tmdb_id"])
+
+            # Update state and rewrite NFO
+            bridge._series_tmdb_state[series_id]["is_placeholder"] = False
+            bridge._series_tmdb_state[series_id]["tmdb_id"] = selected["tmdb_id"]
+
+            series_dir = os.path.join(bridge._data_dir, "series", str(series_id))
+            if os.path.isdir(series_dir):
+                bridge._write_tvshow_nfo(series, series_dir, force=True)
+
+            # Remove from results
+            del bridge._tmdb_detection_results[series_id]
+
+            logger.info(f"TMDB manual accept for series {series_id}: {selected['name']} (id={selected['tmdb_id']})")
+            return _json_response(start_response, {"status": "ok", "series_id": series_id, "tmdb_id": selected["tmdb_id"]})
+        except Exception as e:
+            logger.error(f"TMDB accept error for series {series_id}: {e}")
+            return _json_response(start_response, {"error": str(e)}, status=500)
+
     # --- VOD filesystem ---
     if path == "/vod":
         start_response("301 Moved Permanently", [("Location", "/vod/")])
