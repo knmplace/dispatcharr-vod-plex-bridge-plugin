@@ -415,18 +415,29 @@ def _dispatch(environ, start_response, server, bridge, settings):
                 return _text_response(start_response, 404, "Not found")
 
             if method == "HEAD":
-                info = bridge.get_episode_info(episode_id)
-                if not info:
-                    return _text_response(start_response, 404, "Not found")
-                headers = [
-                    ("Accept-Ranges", "bytes"),
-                    ("Content-Type", info.get("content_type", "video/x-matroska")),
-                ]
-                file_size = info.get("file_size")
-                if file_size:
-                    headers.append(("Content-Length", str(file_size)))
-                start_response("200 OK", headers)
-                return [b""]
+                with bridge._head_request_semaphore:
+                    info = bridge.get_episode_info(episode_id)
+                    if not info:
+                        return _text_response(start_response, 404, "Not found")
+                    headers = [
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Type", info.get("content_type", "video/x-matroska")),
+                    ]
+                    file_size = info.get("file_size")
+                    if file_size:
+                        headers.append(("Content-Length", str(file_size)))
+                    start_response("200 OK", headers)
+                    return [b""]
+
+            # GET/Range/other requests: only redirect if not a Plex library scan.
+            # Plex's scanner (MediaServer-Agent/Plex) uses GET to verify file
+            # accessibility during library analysis, which would otherwise cause
+            # unnecessary provider connections via get_episode_redirect_url().
+            # Return 403 to signal "not for scanning", letting Plex skip analysis
+            # and trust the HEAD metadata instead.
+            user_agent = environ.get("HTTP_USER_AGENT", "").lower()
+            if "mediaserver-agent" in user_agent or "plex" in user_agent:
+                return _text_response(start_response, 403, "Forbidden (scan-time GET not allowed)")
 
             client_ip = environ.get("REMOTE_ADDR", "unknown")
             redirect_url, error, account_id, stream_id = bridge.get_episode_redirect_url(episode_id)
@@ -453,18 +464,24 @@ def _dispatch(environ, start_response, server, bridge, settings):
             return _text_response(start_response, 404, "Not found")
 
         if method == "HEAD":
-            info = bridge.get_episode_info(episode_id)
-            if not info:
-                return _text_response(start_response, 404, "Not found")
-            headers = [
-                ("Accept-Ranges", "bytes"),
-                ("Content-Type", info.get("content_type", "video/x-matroska")),
-            ]
-            file_size = info.get("file_size")
-            if file_size:
-                headers.append(("Content-Length", str(file_size)))
-            start_response("200 OK", headers)
-            return [b""]
+            with bridge._head_request_semaphore:
+                info = bridge.get_episode_info(episode_id)
+                if not info:
+                    return _text_response(start_response, 404, "Not found")
+                headers = [
+                    ("Accept-Ranges", "bytes"),
+                    ("Content-Type", info.get("content_type", "video/x-matroska")),
+                ]
+                file_size = info.get("file_size")
+                if file_size:
+                    headers.append(("Content-Length", str(file_size)))
+                start_response("200 OK", headers)
+                return [b""]
+
+        # GET/Range/other requests: only redirect if not a Plex library scan.
+        user_agent = environ.get("HTTP_USER_AGENT", "").lower()
+        if "mediaserver-agent" in user_agent or "plex" in user_agent:
+            return _text_response(start_response, 403, "Forbidden (scan-time GET not allowed)")
 
         client_ip = environ.get("REMOTE_ADDR", "unknown")
 
@@ -490,18 +507,26 @@ def _dispatch(environ, start_response, server, bridge, settings):
             return _text_response(start_response, 404, "Not found")
 
         if method == "HEAD":
-            info = bridge.get_movie_info(movie_id)
-            if not info:
-                return _text_response(start_response, 404, "Not found")
-            headers = [
-                ("Accept-Ranges", "bytes"),
-                ("Content-Type", info.get("content_type", "video/x-matroska")),
-            ]
-            file_size = info.get("file_size")
-            if file_size:
-                headers.append(("Content-Length", str(file_size)))
-            start_response("200 OK", headers)
-            return [b""]
+            with bridge._head_request_semaphore:
+                info = bridge.get_movie_info(movie_id)
+                if not info:
+                    return _text_response(start_response, 404, "Not found")
+                headers = [
+                    ("Accept-Ranges", "bytes"),
+                    ("Content-Type", info.get("content_type", "video/x-matroska")),
+                ]
+                file_size = info.get("file_size")
+                if file_size:
+                    headers.append(("Content-Length", str(file_size)))
+                start_response("200 OK", headers)
+                return [b""]
+
+        # GET/Range/other requests: only redirect if not a Plex library scan.
+        # Plex's scanner uses GET to verify file accessibility during analysis,
+        # which would otherwise cause unnecessary provider connections.
+        user_agent = environ.get("HTTP_USER_AGENT", "").lower()
+        if "mediaserver-agent" in user_agent or "plex" in user_agent:
+            return _text_response(start_response, 403, "Forbidden (scan-time GET not allowed)")
 
         client_ip = environ.get("REMOTE_ADDR", "unknown")
 
