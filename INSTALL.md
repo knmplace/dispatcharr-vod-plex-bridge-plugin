@@ -34,6 +34,18 @@ docker exec <dispatcharr-container> chown -R 1000:1000 /data/plugins/vod_plex_br
 
 Restart the Dispatcharr container, then enable the plugin in the Dispatcharr UI.
 
+## 1a. Upgrading from v2.0.x or Earlier
+
+If you're upgrading from an old version and see **duplicate "VOD To Plex" cards** in Dispatcharr's plugin list, you must uninstall the old plugin card first:
+
+1. In Dispatcharr's **Plugins** panel, find the old "VOD To Plex" card (it may show as "UNMANAGED" or an older version)
+2. Click **Uninstall** to remove it
+3. Go to **Find Plugins**, search for "VOD To Plex", and click **Import Plugin**
+4. Select the latest `.zip` file from the GitHub release
+5. Dispatcharr will now upgrade in-place instead of creating a duplicate
+
+This is required because Dispatcharr's plugin importer derives the plugin's unique key from the zip's folder structure. Starting with v2.2.0, all release zips have the correct `vod_plex_bridge/` prefix, so upgrades will work correctly going forward.
+
 ## 2. Configure the Plugin
 
 In Dispatcharr's plugin settings, configure:
