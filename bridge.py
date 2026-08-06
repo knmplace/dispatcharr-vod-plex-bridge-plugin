@@ -149,6 +149,9 @@ class BridgeCore:
         self._tmdb_detection_results = {}  # series_id (str) -> {results: [{tmdb_id, title, year, confidence, poster_path}], searched: bool, manual_pick: tmdb_id or None}
         self._last_tracking_sweep = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
+        self._diagnostic_log = deque(maxlen=5000)
+        max_concurrent_heads = int(settings.get("head_request_max_concurrent", 5))
+        self._head_request_semaphore = threading.Semaphore(max_concurrent_heads)
         # Running counters surfaced on the Health tab so cleanup/refresh
         # activity is visible without digging through the activity log.
         # Persisted in bridge_state.json alongside _activated.
@@ -275,6 +278,10 @@ class BridgeCore:
         self._activity_log.append({"ts": time.time(), "level": level, "message": message})
         self._save_activity_log()
 
+    def _log_diagnostic(self, level, message):
+        """Log technical diagnostic info (hidden from dashboard, in bug reports)."""
+        self._diagnostic_log.append({"ts": time.time(), "level": level, "message": message})
+
     def get_activity_log(self):
         return list(self._activity_log)
 
@@ -319,7 +326,20 @@ class BridgeCore:
         cutoff = time.time() - (hours * 3600)
 
         lines = []
+        lines.append("=== ACTIVITY LOG ===")
+        lines.append("")
         for entry in self._activity_log:
+            if entry.get("ts", 0) < cutoff:
+                continue
+            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("ts", 0)))
+            level = str(entry.get("level", "info")).upper()
+            message = self._sanitize_log_text(str(entry.get("message", "")), provider_map)
+            lines.append(f"[{ts_str}] {level}: {message}")
+
+        lines.append("")
+        lines.append("=== DIAGNOSTIC LOG (Technical Details) ===")
+        lines.append("")
+        for entry in self._diagnostic_log:
             if entry.get("ts", 0) < cutoff:
                 continue
             ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("ts", 0)))
@@ -627,7 +647,53 @@ class BridgeCore:
         existing_ids = set(
             str(i) for i in Episode.objects.filter(id__in=activated_ids).values_list("id", flat=True)
         )
-        removed = [eid for eid in self._episodes_activated.keys() if eid not in existing_ids]
+        missing = [eid for eid in self._episodes_activated.keys() if eid not in existing_ids]
+
+        # Before treating a missing id as a real removal, check whether an
+        # M3U/VOD catalog refresh simply reassigned it a new primary key --
+        # observed live: 1899's 8 episodes kept their series name/season/
+        # episode numbers but got entirely new Episode row ids (2157-2164 ->
+        # 2165-2172) after a refresh, and this check used to nuke the STRM
+        # files + Plex library entries for content that was never actually
+        # removed by the provider. Match by (series name, season, episode
+        # number) -- same approach _fetch_plex_episode_sizes() already uses
+        # for matching against Plex's own metadata -- and migrate the
+        # activation entry to the new id instead of deleting it.
+        migrated = []
+        removed = []
+        if missing:
+            candidates = Episode.objects.filter(
+                season_number__in={self._episodes_activated[eid].get("season_number") for eid in missing},
+            ).select_related("series").only(
+                "id", "season_number", "episode_number", "series__name"
+            )
+            by_key = {}
+            for ep in candidates:
+                key = (self._clean_title(ep.series.name), ep.season_number, ep.episode_number)
+                by_key.setdefault(key, ep.id)
+
+            for eid in missing:
+                entry = self._episodes_activated[eid]
+                key = (
+                    entry.get("series_name"),
+                    entry.get("season_number"),
+                    entry.get("episode_number"),
+                )
+                new_id = by_key.get(key)
+                if new_id is not None and str(new_id) not in self._episodes_activated:
+                    new_eid = str(new_id)
+                    self._episodes_activated[new_eid] = entry
+                    self._episodes_activated.pop(eid, None)
+                    migrated.append((eid, new_eid))
+                else:
+                    removed.append(eid)
+
+            if migrated:
+                self._save_state()
+                logger.info(
+                    f"Reconciliation: {len(migrated)} activated episode(s) re-matched to "
+                    f"new Dispatcharr ids after catalog refresh: {migrated}"
+                )
 
         if not removed:
             self._maint_stats["last_removed_episode_check"] = {
@@ -922,10 +988,20 @@ class BridgeCore:
                     state = json.load(f)
                 self._activated = state.get("activated", {})
                 self._episodes_activated = state.get("episodes_activated", {})
+                # Backfill mtime for episodes activated before this field
+                # existed -- without it, list_series_vod_directory() falls
+                # back to a fresh time.time() on every listing request,
+                # which looks like a constantly-changing directory to Plex
+                # and defeats the confirmed_size cache-stability fix.
+                for _entry in self._episodes_activated.values():
+                    if not _entry.get("mtime"):
+                        _entry["mtime"] = _entry.get("activated_at") or time.time()
                 self._maint_stats.update(state.get("maint_stats", {}))
                 self._series_categories = state.get("series_categories", [])
                 self._series_tmdb_state = state.get("series_tmdb_state", {})
                 self._tmdb_detection_results = state.get("tmdb_detection_results", {})
+                if "diagnostic_log" in state:
+                    self._diagnostic_log.extend(state["diagnostic_log"])
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
@@ -948,6 +1024,7 @@ class BridgeCore:
                 "series_categories": self._series_categories,
                 "series_tmdb_state": self._series_tmdb_state,
                 "tmdb_detection_results": self._tmdb_detection_results,
+                "diagnostic_log": list(self._diagnostic_log)[-1000:],
             }, f)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
@@ -1598,6 +1675,16 @@ class BridgeCore:
         return f"{dispatcharr_url}/proxy/vod/episode/{episode.uuid}?stream_id={relation.stream_id}"
 
     def activate_episodes(self, body):
+        """Activate episodes with transient error requeue (max 3 retries).
+
+        For each episode:
+        1. Try to fetch from DB (retry on transient errors)
+        2. Get stream relations (fail if none)
+        3. Pick least-loaded provider (no capacity check, defer to playback)
+        4. Record activation entry
+
+        Returns: {"status": "ok"|"error", "activated": int, "failed": int, ...}
+        """
         episode_ids = body.get("episode_ids", [])
         category_id = body.get("category_id")
         if not episode_ids:
@@ -1619,50 +1706,111 @@ class BridgeCore:
         failed = []
         failed_names = []
 
-        for eid in episode_ids:
+        queue = deque(episode_ids)
+        retry_counts = {}
+        max_retries = 3
+
+        while queue:
+            eid = queue.popleft()
             eid = str(eid)
+
+            # Skip already activated episodes
             if eid in self._episodes_activated:
                 continue
 
+            # Step 1: Fetch episode from DB
             try:
                 episode = Episode.objects.select_related("series").get(id=int(eid))
-            except Exception:
+            except Episode.DoesNotExist:
+                self._log_diagnostic("error", f"Episode {eid}: not found in database")
                 failed.append({"id": eid, "name": f"#{eid}", "message": "Episode not found"})
                 failed_names.append(f"#{eid}")
                 continue
+            except Exception as e:
+                retry_count = retry_counts.get(eid, 0)
+                if retry_count < max_retries:
+                    queue.append(eid)
+                    retry_counts[eid] = retry_count + 1
+                    self._log_diagnostic("warn",
+                        f"Episode {eid}: DB lookup transient error (attempt {retry_count + 1}/{max_retries}): {type(e).__name__}: {str(e)[:100]}")
+                    continue
+                else:
+                    self._log_diagnostic("error",
+                        f"Episode {eid}: DB lookup failed after {max_retries} retries: {type(e).__name__}")
+                    failed.append({"id": eid, "name": f"#{eid}", "message": "Episode lookup failed after retries"})
+                    failed_names.append(f"#{eid}")
+                    continue
 
-            relations = list(episode.m3u_relations.all())
-            if not relations:
-                failed.append({"id": eid, "name": episode.name, "message": "No stream mapping for episode"})
+            # Step 2: Get stream relations
+            try:
+                relations = list(episode.m3u_relations.all())
+                if not relations:
+                    self._log_diagnostic("warn",
+                        f"Episode {eid} ({episode.series.name} S{episode.season_number}E{episode.episode_number}): no stream relations")
+                    failed.append({"id": eid, "name": episode.name, "message": "No stream mapping for episode"})
+                    failed_names.append(episode.name)
+                    continue
+            except Exception as e:
+                retry_count = retry_counts.get(eid, 0)
+                if retry_count < max_retries:
+                    queue.append(eid)
+                    retry_counts[eid] = retry_count + 1
+                    self._log_diagnostic("warn",
+                        f"Episode {eid}: stream relations lookup error (attempt {retry_count + 1}/{max_retries}): {type(e).__name__}")
+                    continue
+                else:
+                    self._log_diagnostic("error",
+                        f"Episode {eid}: stream relations lookup failed after {max_retries} retries")
+                    failed.append({"id": eid, "name": episode.name, "message": "Stream relations lookup failed"})
+                    failed_names.append(episode.name)
+                    continue
+
+            # Step 3: Pick least-loaded provider (no capacity check)
+            try:
+                best_relation = min(relations,
+                    key=lambda r: self._get_provider_current_stream_count(r.m3u_account_id))
+                provider_name = self._account_name(best_relation.m3u_account_id)
+                current_streams = self._get_provider_current_stream_count(best_relation.m3u_account_id)
+            except Exception as e:
+                self._log_diagnostic("error",
+                    f"Episode {eid}: failed to pick best provider: {type(e).__name__}")
+                failed.append({"id": eid, "name": episode.name, "message": "Provider selection failed"})
                 failed_names.append(episode.name)
                 continue
 
-            chosen_relation = None
-            for relation in relations:
-                if self._account_has_capacity(relation.m3u_account_id):
-                    chosen_relation = relation
-                    break
-
-            if chosen_relation is None:
-                failed.append({
-                    "id": eid,
-                    "name": episode.name,
-                    "message": "No provider with a free connection slot right now",
-                })
-                failed_names.append(episode.name)
-                continue
-
-            self._episodes_activated[eid] = {
-                "activated_at": time.time(),
-                "stream_pick": chosen_relation.stream_id,
-                "category_id": category["id"],
-                "series_id": str(episode.series_id),
-                "series_name": self._clean_title(episode.series.name),
-                "season_number": episode.season_number,
-                "episode_number": episode.episode_number,
-            }
-            activated.append(eid)
-            activated_names.append(f"{episode.series.name} S{episode.season_number:02d}E{episode.episode_number:02d}")
+            # Step 4: Record activation entry
+            try:
+                now = time.time()
+                estimated_size = self._resolve_estimated_episode_size(episode, relations)
+                self._episodes_activated[eid] = {
+                    "activated_at": now,
+                    "mtime": now,
+                    "stream_pick": best_relation.stream_id,
+                    "category_id": category["id"],
+                    "series_id": str(episode.series_id),
+                    "series_name": self._clean_title(episode.series.name),
+                    "season_number": episode.season_number,
+                    "episode_number": episode.episode_number,
+                    "estimated_size": estimated_size,
+                }
+                activated.append(eid)
+                activated_names.append(f"{episode.series.name} S{episode.season_number:02d}E{episode.episode_number:02d}")
+                self._log_diagnostic("info",
+                    f"Episode {eid}: activated (provider={provider_name}, current_streams={current_streams})")
+            except Exception as e:
+                retry_count = retry_counts.get(eid, 0)
+                if retry_count < max_retries:
+                    queue.append(eid)
+                    retry_counts[eid] = retry_count + 1
+                    self._log_diagnostic("warn",
+                        f"Episode {eid}: activation transient error (attempt {retry_count + 1}/{max_retries}): {type(e).__name__}: {str(e)[:100]}")
+                    continue
+                else:
+                    self._log_diagnostic("error",
+                        f"Episode {eid}: activation failed after {max_retries} retries: {type(e).__name__}")
+                    failed.append({"id": eid, "name": episode.name, "message": "Activation failed after retries"})
+                    failed_names.append(episode.name)
+                    continue
 
         self._save_state()
 
@@ -1670,13 +1818,33 @@ class BridgeCore:
         if activated:
             strm_count = self._generate_strm_for_episodes(activated, category)
             self._save_state()
-            self._trigger_plex_scan(section=category["plex_library_section"])
+            # Option A: Fetch confirmed sizes immediately before triggering scan,
+            # so that when Plex probes during scan, sizes are already cached.
+            self._log_diagnostic("info", f"Episode activation: fetching {len(activated)} confirmed sizes from Plex before scan trigger...")
+            sizes = self._fetch_plex_episode_sizes(activated)
             for eid in activated:
-                threading.Thread(
-                    target=self._size_reconcile_fast_path_episode,
-                    args=(eid,),
-                    daemon=True,
-                ).start()
+                result = sizes.get(eid)
+                if result:
+                    size, updated_at = result
+                    entry = self._episodes_activated.get(eid)
+                    if entry and entry.get("confirmed_size") != size:
+                        entry["confirmed_size"] = size
+                        entry["plex_updated_at"] = updated_at
+                        entry["mtime"] = time.time()
+                        self._log_diagnostic("debug", f"Episode {eid}: pre-scan size confirmed {size} bytes")
+            if sizes:
+                self._save_state()
+                self._log_diagnostic("info", f"Episode activation: {len(sizes)}/{len(activated)} sizes confirmed before scan trigger")
+            self._trigger_plex_scan(section=category["plex_library_section"])
+            # Background retry threads as fallback (in case initial query found no sizes yet)
+            for eid in activated:
+                entry = self._episodes_activated.get(eid)
+                if not entry or not entry.get("confirmed_size"):
+                    threading.Thread(
+                        target=self._size_reconcile_fast_path_episode,
+                        args=(eid,),
+                        daemon=True,
+                    ).start()
             placeholder_series_ids = {
                 self._episodes_activated[eid]["series_id"] for eid in activated
                 if self._series_tmdb_state.get(self._episodes_activated[eid]["series_id"], {}).get("is_placeholder")
@@ -1700,6 +1868,8 @@ class BridgeCore:
                 "warn",
                 f"Episode activation skipped {len(failed)} episode(s): {failed_titles}",
             )
+
+        self._log_diagnostic("info", f"Episode activation batch complete: {len(activated)} activated, {len(failed)} failed")
 
         return {
             "status": "ok" if activated else "error",
@@ -1752,6 +1922,8 @@ class BridgeCore:
                         break
             relation = self._pick_relation_with_capacity(relations, preferred)
             entry["stream_pick"] = relation.stream_id
+            if not entry.get("estimated_size"):
+                entry["estimated_size"] = self._resolve_estimated_episode_size(episode, relations)
 
         self._save_state()
 
@@ -2149,20 +2321,26 @@ class BridgeCore:
         why series episodes showed up in Plex but wouldn't play)."""
         eid = str(episode_id)
         if eid not in self._episodes_activated:
+            self._log_diagnostic("debug", f"Episode {eid}: HEAD probe, not activated")
             return None
 
         try:
             from apps.vod.models import Episode
             episode = Episode.objects.get(id=int(eid))
         except Exception as e:
+            self._log_diagnostic("warn", f"Episode {eid}: HEAD probe lookup failed: {e}")
             logger.warning(f"get_episode_info: episode {eid} lookup failed: {e}")
             return None
+
+        entry = self._episodes_activated.get(eid, {})
+        has_confirmed = entry.get("confirmed_size") is not None
+        file_size = self._estimate_episode_size(episode)
 
         info = {
             "name": episode.name,
             "uuid": str(episode.uuid),
             "content_type": "video/x-matroska",
-            "file_size": self._estimate_episode_size(episode),
+            "file_size": file_size,
         }
 
         relation = episode.m3u_relations.first()
@@ -2172,16 +2350,24 @@ class BridgeCore:
             if ext.lstrip(".") == "mp4":
                 info["content_type"] = "video/mp4"
 
+        self._log_diagnostic("debug", f"Episode {eid}: HEAD probe response size={file_size} bytes, confirmed={has_confirmed}, series={entry.get('series_name')}")
+        self._log_diagnostic("debug", f"Episode {eid}: HEAD probe OK (size={info.get('file_size')} bytes, confirmed={has_confirmed})")
         return info
 
     def _estimate_episode_size(self, episode):
-        # Same ground-truth-first pattern as movies' _estimate_size(): once
-        # Plex has analyzed the episode and reported back its own size, serve
+        # Same three-tier, ground-truth-first pattern as movies' _estimate_size():
+        # once Plex has analyzed the episode and reported back its own size, serve
         # that back so Content-Length never mismatches what Plex already
-        # recorded, which is what triggers an unwanted re-analysis pass.
+        # recorded, which is what triggers an unwanted re-analysis pass. Until
+        # then, serve the bitrate-based estimate cached at activation time
+        # (see _resolve_estimated_episode_size) rather than falling straight to
+        # the crude duration guess.
         entry = self._episodes_activated.get(str(episode.id))
-        if entry and entry.get("confirmed_size"):
-            return int(entry["confirmed_size"])
+        if entry:
+            if entry.get("confirmed_size"):
+                return int(entry["confirmed_size"])
+            if entry.get("estimated_size"):
+                return int(entry["estimated_size"])
 
         duration = getattr(episode, "duration_secs", None)
         if duration and duration > 0:
@@ -2197,10 +2383,19 @@ class BridgeCore:
 
         episode_ids=None fetches sizes for every matched episode across all
         known categories (maintenance sweep); pass a list to limit the match
-        set (post-activation fast path)."""
+        set (post-activation fast path).
+
+        Returns {eid: (size, updated_at)} — updated_at is Plex's own
+        top-level "updatedAt" timestamp for that item, stamped whenever Plex
+        re-analyzes the file. Episode-only: used to detect when Plex's
+        recorded size has drifted from what we last confirmed, so a stale
+        confirmed_size doesn't sit unnoticed forever (see
+        _reconcile_confirmed_episode_size). Movies deliberately untouched —
+        that mechanism is working and out of scope for this change."""
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
         if not plex_url or not plex_token:
+            self._log_diagnostic("warn", f"_fetch_plex_episode_sizes: Plex URL or token not configured")
             return {}
 
         wanted_ids = {str(eid) for eid in episode_ids} if episode_ids is not None else None
@@ -2214,9 +2409,16 @@ class BridgeCore:
                 continue
             by_section.setdefault(section, []).append((eid, entry))
 
+        if not by_section:
+            self._log_diagnostic("debug", f"_fetch_plex_episode_sizes: No episodes to query (wanted_ids={len(wanted_ids or [])})")
+            return {}
+
+        self._log_diagnostic("info", f"_fetch_plex_episode_sizes: Querying Plex for {len(by_section)} sections ({sum(len(p) for p in by_section.values())} episodes)")
+
         sizes = {}
         for section, pairs in by_section.items():
             try:
+                self._log_diagnostic("debug", f"_fetch_plex_episode_sizes: Plex API query section={section}, episode_count={len(pairs)}")
                 resp = requests.get(
                     f"{plex_url}/library/sections/{section}/all",
                     params={"X-Plex-Token": plex_token, "type": "4"},
@@ -2224,7 +2426,7 @@ class BridgeCore:
                     timeout=15,
                 )
                 if resp.status_code != 200:
-                    logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
+                    self._log_diagnostic("warn", f"_fetch_plex_episode_sizes: Plex query failed section={section} status={resp.status_code}")
                     continue
 
                 items = resp.json().get("MediaContainer", {}).get("Metadata", [])
@@ -2233,6 +2435,7 @@ class BridgeCore:
                     key = (it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index"))
                     by_key[key] = it
 
+                found_count = 0
                 for eid, entry in pairs:
                     key = (entry.get("series_name", ""), entry.get("season_number"), entry.get("episode_number"))
                     item = by_key.get(key)
@@ -2240,64 +2443,171 @@ class BridgeCore:
                         continue
                     parts = item.get("Media", [{}])[0].get("Part", [])
                     if parts and parts[0].get("size"):
-                        sizes[eid] = int(parts[0]["size"])
-            except Exception as e:
-                logger.error(f"Plex episode size query failed for section {section}: {e}")
+                        size = int(parts[0]["size"])
+                        updated_at = item.get("updatedAt")
+                        sizes[eid] = (size, updated_at)
+                        found_count += 1
+                        self._log_diagnostic("debug", f"_fetch_plex_episode_sizes: Episode {eid} size confirmed {size} bytes (updatedAt={updated_at})")
 
+                self._log_diagnostic("info", f"_fetch_plex_episode_sizes: Section {section} complete: {found_count}/{len(pairs)} episodes size confirmed")
+            except Exception as e:
+                self._log_diagnostic("error", f"_fetch_plex_episode_sizes: Section {section} failed: {type(e).__name__}: {str(e)[:100]}")
+
+        self._log_diagnostic("info", f"_fetch_plex_episode_sizes: Complete, {len(sizes)} sizes confirmed total")
         return sizes
 
     def _reconcile_confirmed_episode_size(self, episode_id):
         """Fetch Plex's recorded size for one episode and store it as
-        confirmed_size if found. Returns True if a size was stored."""
+        confirmed_size if found or if Plex has since re-analyzed the file
+        (detected via Plex's own updatedAt timestamp advancing past what we
+        last recorded — see plex_updated_at). Returns True if a size was
+        stored/updated."""
         eid = str(episode_id)
+        self._log_diagnostic("debug", f"_reconcile_confirmed_episode_size: Starting size reconciliation for episode {eid}")
         sizes = self._fetch_plex_episode_sizes([eid])
-        size = sizes.get(eid)
-        if not size:
+        result = sizes.get(eid)
+        if not result:
+            self._log_diagnostic("debug", f"_reconcile_confirmed_episode_size: Episode {eid} not found in Plex")
             return False
+        size, updated_at = result
         entry = self._episodes_activated.get(eid)
         if entry is None:
+            self._log_diagnostic("debug", f"_reconcile_confirmed_episode_size: Episode {eid} not in activated list")
             return False
-        if entry.get("confirmed_size") == size:
+        if entry.get("confirmed_size") == size and entry.get("plex_updated_at") == updated_at:
+            self._log_diagnostic("debug", f"_reconcile_confirmed_episode_size: Episode {eid} already confirmed and in sync (size={size})")
             return False
+        old_size = entry.get("confirmed_size")
         entry["confirmed_size"] = size
+        entry["plex_updated_at"] = updated_at
+        entry["mtime"] = time.time()
         self._save_state()
+        self._log_diagnostic("info", f"_reconcile_confirmed_episode_size: Episode {eid} size confirmed {size} bytes (was {old_size}), mtime updated")
         logger.info(f"Confirmed Plex size for episode {eid}: {size} bytes")
         return True
 
     def _size_reconcile_fast_path_episode(self, episode_id):
         """Background retry loop started right after episode activation,
         mirroring _size_reconcile_fast_path() for movies."""
-        for delay in self.SIZE_RECONCILE_FAST_PATH_DELAYS_SECS:
+        self._log_diagnostic("info", f"_size_reconcile_fast_path_episode: Background reconciliation thread starting for episode {episode_id}")
+        for attempt, delay in enumerate(self.SIZE_RECONCILE_FAST_PATH_DELAYS_SECS, 1):
             time.sleep(delay)
             try:
+                self._log_diagnostic("debug", f"_size_reconcile_fast_path_episode: Episode {episode_id} attempt {attempt}/{len(self.SIZE_RECONCILE_FAST_PATH_DELAYS_SECS)}, querying Plex...")
                 if self._reconcile_confirmed_episode_size(episode_id):
+                    self._log_diagnostic("info", f"_size_reconcile_fast_path_episode: Episode {episode_id} size confirmed successfully in background thread")
                     return
             except Exception as e:
-                logger.error(f"Fast-path size reconcile error for episode {episode_id}: {e}")
+                self._log_diagnostic("error", f"_size_reconcile_fast_path_episode: Episode {episode_id} attempt {attempt} failed: {type(e).__name__}: {str(e)[:100]}")
+        self._log_diagnostic("warn", f"_size_reconcile_fast_path_episode: Episode {episode_id} size reconciliation exhausted all retries")
 
     def _reconcile_all_confirmed_episode_sizes(self):
         """Maintenance-cycle sweep: backfill confirmed_size for every
-        activated episode that doesn't have one yet."""
-        missing = [
-            eid for eid, entry in self._episodes_activated.items()
-            if not entry.get("confirmed_size")
-        ]
-        if not missing:
+        activated episode that doesn't have one yet, AND re-check every
+        already-confirmed episode against Plex's updatedAt to catch drift
+        from a later real re-analysis (e.g. Plex silently re-deriving a
+        different size on its own schedule) — unlike movies' equivalent,
+        which stays one-shot-only intentionally, per explicit instruction
+        to scope this fix to episodes only for now."""
+        candidates = list(self._episodes_activated.keys())
+        if not candidates:
+            self._log_diagnostic("debug", f"_reconcile_all_confirmed_episode_sizes: No episodes activated")
             return
-        sizes = self._fetch_plex_episode_sizes(missing)
+        self._log_diagnostic("info", f"_reconcile_all_confirmed_episode_sizes: Starting maintenance sweep for {len(candidates)} episodes")
+        sizes = self._fetch_plex_episode_sizes(candidates)
         confirmed = 0
-        for eid in missing:
-            size = sizes.get(eid)
-            if not size:
+        for eid in candidates:
+            result = sizes.get(eid)
+            if not result:
                 continue
+            size, updated_at = result
             entry = self._episodes_activated.get(eid)
-            if entry is None or entry.get("confirmed_size") == size:
+            if entry is None:
+                continue
+            if entry.get("confirmed_size") == size and entry.get("plex_updated_at") == updated_at:
                 continue
             entry["confirmed_size"] = size
+            entry["plex_updated_at"] = updated_at
+            entry["mtime"] = time.time()
             confirmed += 1
         if confirmed:
             self._save_state()
-            logger.info(f"Episode size reconcile sweep: confirmed {confirmed}/{len(missing)} episodes")
+            self._log_diagnostic("info", f"_reconcile_all_confirmed_episode_sizes: Maintenance sweep complete, {confirmed}/{len(candidates)} sizes confirmed/updated")
+            logger.info(f"Episode size reconcile sweep: confirmed/updated {confirmed}/{len(candidates)} episodes")
+
+    def _resolve_estimated_episode_size(self, episode, relations):
+        """Mirrors _resolve_estimated_size() for movies: try every M3U
+        relation for this episode until one returns a usable bitrate, and
+        cache a bitrate-based byte estimate for the gap between activation
+        and confirmed_size landing. Dispatcharr has no episode equivalent of
+        refresh_movie_advanced_data (episode metadata comes from
+        get_series_info, which never carries bitrate) — so this calls
+        Xtream's get_vod_info directly per relation, same API movies use,
+        keyed by the episode's own stream_id. Returns None if no relation
+        ever supplies bitrate (cheap fallback to the duration guess on every
+        call — no need to cache a miss)."""
+        episode.refresh_from_db()
+        duration_secs = getattr(episode, "duration_secs", None)
+
+        for relation in relations:
+            bitrate = self._fetch_episode_relation_bitrate(relation)
+            if bitrate is None:
+                continue
+            if not duration_secs:
+                episode.refresh_from_db()
+                duration_secs = getattr(episode, "duration_secs", None)
+            size = self._estimate_size_from_bitrate(bitrate, duration_secs)
+            if size:
+                logger.info(
+                    f"Episode {episode.id}: estimated size {size} bytes from "
+                    f"bitrate {bitrate}kbps via relation {relation.id} "
+                    f"(account {relation.m3u_account_id})"
+                )
+                return size
+
+        logger.info(
+            f"Episode {episode.id}: no relation returned bitrate info — "
+            f"falling back to placeholder size estimate"
+        )
+        return None
+
+    def _fetch_episode_relation_bitrate(self, relation):
+        """Metadata-only Xtream get_vod_info() call for one episode's stream
+        — no stream connection, no provider slot consumed. Returns bitrate
+        in kbps, or None if the provider doesn't supply it for this
+        relation. Unlike movies' _fetch_relation_bitrate(), this doesn't go
+        through a Dispatcharr task (none exists for episodes) and doesn't
+        write back to episode/series fields — bitrate is used in-memory only
+        and never persisted to custom_properties, to avoid duplicating what
+        Dispatcharr's own refresh_series_episodes already owns."""
+        try:
+            from core.xtream_codes import Client as XtreamCodesClient
+            account = relation.m3u_account
+            with XtreamCodesClient(
+                server_url=account.server_url,
+                username=account.username,
+                password=account.password,
+                user_agent=account.get_user_agent().user_agent,
+            ) as client:
+                vod_info = client.get_vod_info(relation.stream_id)
+        except Exception as e:
+            logger.debug(f"_fetch_episode_relation_bitrate: fetch failed for relation {relation.id}: {e}")
+            return None
+
+        if not vod_info:
+            return None
+        info = vod_info.get("info", {})
+        if isinstance(info, list):
+            info = info[0] if info and isinstance(info[0], dict) else {}
+        elif not isinstance(info, dict):
+            info = {}
+
+        bitrate = info.get("bitrate")
+        try:
+            bitrate = float(bitrate) if bitrate else None
+        except (TypeError, ValueError):
+            bitrate = None
+        return bitrate if bitrate and bitrate > 0 else None
 
     def _fetch_plex_series_tmdb_ids(self, series_ids=None):
         """Mirrors _fetch_plex_episode_sizes(): once Plex has scanned a
@@ -3598,15 +3908,16 @@ class BridgeCore:
             elif entry.endswith(".nfo"):
                 links.append(f'<a href="{quote(entry)}">{entry}</a> {mtime}')
 
-        now_str = datetime.now().strftime("%d-%b-%Y %H:%M")
         for eid, entry in self._episodes_activated.items():
             if entry.get("strm_folder") != rel:
                 continue
             stem = entry.get("strm_stem")
             if not stem:
                 continue
+            mtime_ts = entry.get("mtime") or entry.get("activated_at") or time.time()
+            ep_mtime_str = datetime.fromtimestamp(mtime_ts).strftime("%d-%b-%Y %H:%M")
             fname = f"{stem} [{eid}].mkv"
-            links.append(f'<a href="{quote(fname)}">{fname}</a> {now_str}')
+            links.append(f'<a href="{quote(fname)}">{fname}</a> {ep_mtime_str}')
 
         return "<html><body>\n" + "\n".join(links) + "\n</body></html>"
 
@@ -3694,6 +4005,29 @@ class BridgeCore:
             return M3UAccount.objects.get(id=int(account_id)).name
         except Exception:
             return f"account #{account_id}"
+
+    def _get_provider_current_stream_count(self, account_id):
+        """Get current number of active streams for a provider account.
+
+        Used during activation to pick the least-loaded provider.
+        Falls back to 0 (assume available) if the check can't be performed.
+        """
+        try:
+            from apps.m3u.models import M3UAccountProfile
+            from apps.m3u.connection_pool import get_profile_active_connection_count
+            from core.utils import RedisClient
+
+            profile = M3UAccountProfile.objects.filter(
+                m3u_account_id=account_id, is_active=True
+            ).order_by("-is_default").first()
+            if profile is None:
+                return 0
+
+            redis_client = RedisClient.get_client()
+            return get_profile_active_connection_count(profile, redis_client)
+        except Exception as e:
+            logger.debug(f"Stream count check skipped for account {account_id}: {e}")
+            return 0
 
     def _resolve_relation(self, movie_id, persist_pick=False):
         mid = str(movie_id)
@@ -4006,13 +4340,30 @@ class BridgeCore:
         if activated:
             strm_count = self._generate_strm_for_movies(activated)
             self._save_state()
-            self._trigger_plex_scan()
+            # Option A: Fetch confirmed sizes immediately before triggering scan,
+            # so that when Plex probes during scan, sizes are already cached.
+            self._log_diagnostic("info", f"Movie activation: fetching {len(activated)} confirmed sizes from Plex before scan trigger...")
+            sizes = self._fetch_plex_movie_sizes(activated)
             for mid in activated:
-                threading.Thread(
-                    target=self._size_reconcile_fast_path,
-                    args=(mid,),
-                    daemon=True,
-                ).start()
+                size = sizes.get(mid)
+                if size:
+                    entry = self._activated.get(mid)
+                    if entry and entry.get("confirmed_size") != size:
+                        entry["confirmed_size"] = size
+                        self._log_diagnostic("debug", f"Movie {mid}: pre-scan size confirmed {size} bytes")
+            if sizes:
+                self._save_state()
+                self._log_diagnostic("info", f"Movie activation: {len(sizes)}/{len(activated)} sizes confirmed before scan trigger")
+            self._trigger_plex_scan()
+            # Background retry threads as fallback (in case initial query found no sizes yet)
+            for mid in activated:
+                entry = self._activated.get(mid)
+                if not entry or not entry.get("confirmed_size"):
+                    threading.Thread(
+                        target=self._size_reconcile_fast_path,
+                        args=(mid,),
+                        daemon=True,
+                    ).start()
             names = activated_names or self._movie_names(activated)
             titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
@@ -4283,20 +4634,24 @@ class BridgeCore:
 
         return preferred
 
-    # How long a resolved redirect for a movie is reused for duplicate/rapid
-    # follow-up requests, instead of re-resolving and issuing a fresh 302.
-    # rclone's VFS read-ahead fires several near-simultaneous requests for
-    # different byte ranges of the same file within milliseconds of each
-    # other; without this each one independently races Dispatcharr's proxy
-    # for a provider connection slot, and any that lose get a 429/503 and
-    # retry immediately — a self-inflicted request storm on the same
+    # How long a resolved redirect for a movie/episode is reused for
+    # duplicate/rapid follow-up requests, instead of re-resolving and issuing
+    # a fresh 302. rclone's VFS read-ahead/startup behavior fires repeated
+    # open/abort/reopen requests for the same file for several seconds at
+    # the start of a stream (confirmed live 2026-08-05: a single episode saw
+    # ~15 seconds of retries, 250ms-1.3s apart, each one -- without this --
+    # opening its own brand new real provider connection); without
+    # coalescing, each one independently races Dispatcharr's proxy for a
+    # provider connection slot, and any that lose get a 429/503 and retry
+    # immediately — a self-inflicted request storm on the same
     # already-at-capacity provider. Coalescing them behind one lock means
-    # only one request per movie resolves/redirects at a time; the rest wait
-    # briefly and reuse that result instead of piling on. Kept short (well
-    # above the read-ahead burst window, well below a deliberate pause/stop
-    # then resume) so a genuine resume click after playback stalled/died
-    # doesn't get chained to a redirect resolved for the dead connection.
-    REDIRECT_COALESCE_SECS = 1
+    # only one request per movie/episode resolves/redirects at a time; the
+    # rest wait briefly and reuse that result instead of piling on. Kept
+    # above the observed startup-burst window, well below a deliberate
+    # pause/stop then resume, so a genuine resume click after playback
+    # stalled/died doesn't get chained to a redirect resolved for the dead
+    # connection.
+    REDIRECT_COALESCE_SECS = 20
 
     def _get_redirect_lock(self, movie_id):
         with self._redirect_locks_guard:
@@ -4392,20 +4747,26 @@ class BridgeCore:
     def get_movie_info(self, movie_id):
         mid = str(movie_id)
         if mid not in self._activated:
+            self._log_diagnostic("debug", f"Movie {mid}: HEAD probe, not activated")
             return None
 
         try:
             from apps.vod.models import Movie
             movie = Movie.objects.get(id=int(mid))
         except Exception as e:
+            self._log_diagnostic("warn", f"Movie {mid}: HEAD probe lookup failed: {e}")
             logger.warning(f"get_movie_info: movie {mid} lookup failed: {e}")
             return None
+
+        entry = self._activated.get(mid, {})
+        has_confirmed = entry.get("confirmed_size") is not None
+        file_size = self._estimate_size(movie)
 
         info = {
             "name": movie.name,
             "uuid": str(movie.uuid),
             "content_type": "video/x-matroska",
-            "file_size": self._estimate_size(movie),
+            "file_size": file_size,
         }
 
         relation = movie.m3u_relations.first()
@@ -4415,6 +4776,7 @@ class BridgeCore:
             if ext.lstrip(".") == "mp4":
                 info["content_type"] = "video/mp4"
 
+        self._log_diagnostic("debug", f"Movie {mid}: HEAD probe response size={file_size} bytes, confirmed={has_confirmed}, title={movie.name}")
         return info
 
     def _estimate_size(self, movie):

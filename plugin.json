@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -96,6 +96,15 @@
       "type": "boolean",
       "default": false,
       "help_text": "Logs server start/stop errors and every connection to/from Dispatcharr and Plex (inbound VOD requests, outbound Plex API calls, redirect resolution) to the dashboard's Logs tab. Useful for diagnosing setup issues remotely. Generates a lot of log entries — leave off unless troubleshooting."
+    },
+    {
+      "id": "head_request_max_concurrent",
+      "label": "Max Concurrent HEAD Probes (Plex Scan Throttle)",
+      "type": "number",
+      "default": 5,
+      "help_text": "During a Plex library scan, Plex fires many parallel HEAD/metadata probe requests at once (especially for series with lots of episodes). This caps how many the plugin processes at the same time — extra probes queue instead of all hitting your IPTV provider simultaneously, so a big scan or bulk activation doesn't blow past your provider's max concurrent connection limit. Lower it if your provider allows very few simultaneous connections; raise it if your provider tolerates more and you want scans to finish faster. Takes effect on next server start.",
+      "min": 1,
+      "max": 50
     },
     {
       "id": "max_concurrent_per_title",

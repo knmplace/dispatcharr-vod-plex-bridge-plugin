@@ -719,6 +719,7 @@ let seriesFiltersLoaded = false;
 // would otherwise mean fetching every series' full episode list up front.
 let seriesSelection = new Map(); // key -> {level, seriesId, seriesName, seasonNumber, episodeIds: [] | null}
 let seriesCategoriesCache = [];
+let lastCheckedSeriesCheckbox = null; // for shift-click range selection
 
 function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
   if (level === 'series') return `series:${seriesId}`;
@@ -726,7 +727,27 @@ function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
   return `episode:${episodeId}`;
 }
 
-function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl) {
+function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl, evt) {
+  // Shift+click range selection
+  if (evt && evt.shiftKey && lastCheckedSeriesCheckbox && lastCheckedSeriesCheckbox !== cbEl) {
+    const allCheckboxes = Array.from(document.querySelectorAll('#seriesGrid .series-select-cb'));
+    const startIdx = allCheckboxes.indexOf(lastCheckedSeriesCheckbox);
+    const endIdx = allCheckboxes.indexOf(cbEl);
+    if (startIdx !== -1 && endIdx !== -1) {
+      const [minIdx, maxIdx] = startIdx < endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+      for (let i = minIdx; i <= maxIdx; i++) {
+        const checkbox = allCheckboxes[i];
+        if (!checkbox.checked) {
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+      lastCheckedSeriesCheckbox = cbEl;
+      return;
+    }
+  }
+
+  lastCheckedSeriesCheckbox = cbEl;
   const key = seriesSelKey(level, seriesId, seasonNumber, episodeId);
   const checked = cbEl ? cbEl.checked : !seriesSelection.has(key);
   if (!checked) {
@@ -760,7 +781,10 @@ function updateSeriesSelectionUI() {
 
 function selectAllSeriesItems() {
   document.querySelectorAll('#seriesGrid .series-select-cb').forEach(cb => {
-    if (!cb.checked) cb.dispatchEvent(new Event('change'));
+    if (!cb.checked) {
+      cb.checked = true;
+      cb.dispatchEvent(new Event('change'));
+    }
   });
 }
 
@@ -996,7 +1020,7 @@ async function loadSeries(page) {
       ? `<span class="movie-badge">Active (${s.activated_episode_count})</span>`
       : '';
     return `<div class="movie-card ${checked ? 'selected' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeHtml(s.id)}','${escapeHtml(s.name)}',null,null,this)">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeHtml(s.id)}','${escapeHtml(s.name)}',null,null,this,event)">
       ${trailerBtn}
       ${actBadge}
       ${poster}
@@ -1053,7 +1077,7 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
     const key = seriesSelKey('season', seriesId, sn.season_number, null);
     const checked = seriesSelection.has(key) ? 'checked' : '';
     return `<div class="movie-card ${checked ? 'selected' : ''}" data-season-number="${sn.season_number}" title="${label}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${sn.season_number},null,this)">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${sn.season_number},null,this,event)">
       ${seriesPosterCardHtml(seriesPoster, label)}
       <div class="movie-info">
         <div class="movie-title">${label}</div>
@@ -1095,7 +1119,7 @@ async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
       ? `<button class="reactivate-btn" onclick="event.stopPropagation();quickReactivateEpisode('${ep.id}', this)" title="Reactivate (refresh NFO/stream pick without touching Plex)">&#8635;</button>`
       : '';
     return `<div class="movie-card ${checked ? 'selected' : ''}" title="${escapeHtml(titleText)}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${seasonNumber},'${escapeHtml(ep.id)}',this)">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${seasonNumber},'${escapeHtml(ep.id)}',this,event)">
       ${reactivateBtn}
       ${seriesPosterCardHtml(seriesPoster, epLabel)}
       <div class="movie-info">

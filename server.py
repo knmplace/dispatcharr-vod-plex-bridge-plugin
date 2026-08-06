@@ -426,6 +426,9 @@ def _dispatch(environ, start_response, server, bridge, settings):
                     file_size = info.get("file_size")
                     if file_size:
                         headers.append(("Content-Length", str(file_size)))
+                    mtime = info.get("mtime")
+                    if mtime:
+                        headers.append(("Last-Modified", formatdate(mtime, usegmt=True)))
                     start_response("200 OK", headers)
                     return [b""]
 
@@ -475,6 +478,9 @@ def _dispatch(environ, start_response, server, bridge, settings):
                 file_size = info.get("file_size")
                 if file_size:
                     headers.append(("Content-Length", str(file_size)))
+                mtime = info.get("mtime")
+                if mtime:
+                    headers.append(("Last-Modified", formatdate(mtime, usegmt=True)))
                 start_response("200 OK", headers)
                 return [b""]
 
@@ -518,6 +524,9 @@ def _dispatch(environ, start_response, server, bridge, settings):
                 file_size = info.get("file_size")
                 if file_size:
                     headers.append(("Content-Length", str(file_size)))
+                mtime = info.get("mtime")
+                if mtime:
+                    headers.append(("Last-Modified", formatdate(mtime, usegmt=True)))
                 start_response("200 OK", headers)
                 return [b""]
 
