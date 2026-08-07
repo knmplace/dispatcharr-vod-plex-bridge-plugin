@@ -1488,6 +1488,22 @@ class BridgeCore:
                 counts[sid] = counts.get(sid, 0) + 1
         return counts
 
+    def _activated_series_categories(self):
+        """series_id (str) -> activated_category name, same aggregation
+        approach as _activated_series_episode_counts -- used both to render
+        the category chip on each card and to sort by it."""
+        names = {}
+        for entry in self._episodes_activated.values():
+            sid = entry.get("series_id")
+            if not sid or sid in names:
+                continue
+            category_id = entry.get("category_id")
+            if category_id:
+                cat = self._resolve_series_category(category_id)
+                if cat:
+                    names[sid] = cat.get("name")
+        return names
+
     def list_series(self, query):
         try:
             from apps.vod.models import Series
@@ -1499,8 +1515,10 @@ class BridgeCore:
             provider_ids = [v for v in query.get("provider_id", []) if v]
             category_ids = [v for v in query.get("category_id", []) if v]
             activated_only = query.get("activated_only", [""])[0]
+            sort_by = query.get("sort", [""])[0]
 
             activated_counts = self._activated_series_episode_counts()
+            activated_categories = self._activated_series_categories() if sort_by == "activated_category" else None
 
             # Series rows whose ONLY backing M3U relation(s) are to an inactive
             # account, or to a category the account has explicitly disabled,
@@ -1543,12 +1561,29 @@ class BridgeCore:
                 self._log_event(
                     "debug",
                     f"list_series: total={total} page={page} per_page={per_page} "
-                    f"filters(search={bool(search)}, providers={provider_ids}, categories={category_ids})",
+                    f"filters(search={bool(search)}, providers={provider_ids}, categories={category_ids}, sort={sort_by})",
                 )
 
             offset = (page - 1) * per_page
+            if sort_by == "activated_category":
+                # Category name isn't a DB column on Series (it's derived from
+                # our own activation-state dict), so this sort has to happen
+                # in Python across the full filtered set before paginating,
+                # unlike the default name sort which the DB handles directly.
+                all_series = list(qs.select_related("logo"))
+                all_series.sort(
+                    key=lambda s: (
+                        activated_categories.get(str(s.id)) is None,
+                        activated_categories.get(str(s.id)) or "",
+                        s.name or "",
+                    )
+                )
+                page_series = all_series[offset : offset + per_page]
+            else:
+                page_series = qs.select_related("logo")[offset : offset + per_page]
+
             series_list = []
-            for s in qs.select_related("logo")[offset : offset + per_page]:
+            for s in page_series:
                 sid = str(s.id)
                 poster = ""
                 try:
@@ -1566,16 +1601,19 @@ class BridgeCore:
                 except Exception:
                     cp = {}
 
-                activated_category = None
-                if sid in activated_counts:
-                    for entry in self._episodes_activated.values():
-                        if str(entry.get("series_id")) == sid:
-                            category_id = entry.get("category_id")
-                            if category_id:
-                                cat = self._resolve_series_category(category_id)
-                                if cat:
-                                    activated_category = cat.get("name")
-                            break
+                if activated_categories is not None:
+                    activated_category = activated_categories.get(sid)
+                else:
+                    activated_category = None
+                    if sid in activated_counts:
+                        for entry in self._episodes_activated.values():
+                            if str(entry.get("series_id")) == sid:
+                                category_id = entry.get("category_id")
+                                if category_id:
+                                    cat = self._resolve_series_category(category_id)
+                                    if cat:
+                                        activated_category = cat.get("name")
+                                break
 
                 # The model's own episode_count is Dispatcharr's catalog-reported
                 # figure and is frequently None/stale. Episodes are only actually

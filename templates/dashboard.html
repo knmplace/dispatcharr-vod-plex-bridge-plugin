@@ -541,6 +541,10 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
                 <input type="checkbox" id="seriesActivatedFilter" onchange="loadSeries(1)"> Activated Only
               </label>
               <button class="btn btn-primary btn-sm" onclick="loadSeries(1)">Search</button>
+              <select class="search-input" id="seriesSortSel" onchange="loadSeries(1)" style="min-width:170px;">
+                <option value="name">Sort: Name</option>
+                <option value="activated_category">Sort: Activated Category</option>
+              </select>
             </div>
           </div>
           <div class="selection-bar" id="seriesSelectionBar" style="display:none;">
@@ -777,6 +781,7 @@ function switchMode(mode) {
 
 // --- Series/Season/Episode browse + selection/activation ---
 let seriesNav = { view: 'series', seriesId: null, seriesName: '', seriesPoster: '', seasonNumber: null };
+let seriesNavToken = 0;
 let seriesCurrentPage = 1;
 let seriesFiltersLoaded = false;
 
@@ -1076,6 +1081,7 @@ function toggleSeriesDrillActivatedOnly(checked) {
 }
 
 async function loadSeries(page) {
+  const myToken = ++seriesNavToken;
   seriesCurrentPage = page || 1;
   seriesNav = { view: 'series', seriesId: null, seriesName: '', seasonNumber: null };
   document.getElementById('seriesDrillActivatedToggle').style.display = 'none';
@@ -1094,10 +1100,13 @@ async function loadSeries(page) {
   const activatedOnly = document.getElementById('seriesActivatedFilter').checked;
   if (activatedOnly) url += '&activated_only=1';
   seriesNav.activatedOnly = activatedOnly;
+  const sortBy = document.getElementById('seriesSortSel').value;
+  if (sortBy && sortBy !== 'name') url += `&sort=${encodeURIComponent(sortBy)}`;
 
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading series...</div>';
   const data = await api(url);
+  if (myToken !== seriesNavToken) return;
 
   if (!data.series || data.series.length === 0) {
     grid.innerHTML = '<div class="empty">No series found</div>';
@@ -1161,6 +1170,7 @@ function seriesPosterCardHtml(poster, label) {
 }
 
 async function loadSeasons(seriesId, seriesName, seriesPoster) {
+  const myToken = ++seriesNavToken;
   const activatedOnly = !!seriesNav.activatedOnly;
   seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null, activatedOnly };
   document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName}`;
@@ -1173,6 +1183,7 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading seasons...</div>';
   const data = await api(`/api/series/${seriesId}/seasons`);
+  if (myToken !== seriesNavToken) return;
 
   if (!data.seasons || data.seasons.length === 0) {
     grid.innerHTML = '<div class="empty">No seasons found</div>';
@@ -1210,6 +1221,7 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
 }
 
 async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
+  const myToken = ++seriesNavToken;
   const activatedOnly = !!seriesNav.activatedOnly;
   seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber, activatedOnly };
   const seasonLabel = seasonNumber === 0 ? 'Specials' : `Season ${seasonNumber}`;
@@ -1221,6 +1233,7 @@ async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading episodes...</div>';
   const data = await api(`/api/series/${seriesId}/episodes?season=${seasonNumber}`);
+  if (myToken !== seriesNavToken) return;
 
   if (!data.episodes || data.episodes.length === 0) {
     grid.innerHTML = '<div class="empty">No episodes found</div>';
