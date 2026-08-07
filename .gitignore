@@ -6,3 +6,5 @@ SERIES_IMPLEMENTATION_PLAN.md
 __pycache__/
 *.pyc
 logs/
+.share.notes/
+*.code-workspace
