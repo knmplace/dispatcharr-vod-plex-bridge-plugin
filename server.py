@@ -234,6 +234,13 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.activate_episodes(body))
 
+    if path == "/api/episodes/activation-jobs" and method == "GET":
+        return _json_response(start_response, bridge.list_episode_jobs())
+
+    if re.match(r"^/api/episodes/activation-jobs/[^/]+$", path) and method == "GET":
+        job_id = path.split("/")[-1]
+        return _json_response(start_response, bridge.get_episode_job_status(job_id))
+
     if path == "/api/episodes/deactivate" and method == "POST":
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.deactivate_episodes(body))

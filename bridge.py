@@ -140,6 +140,19 @@ class BridgeCore:
         self._watchdog_thread = None
         self._watchdog_stop = threading.Event()
         self._watchdog_ticks = 0
+        # Episode activation queue: activate_episodes() only enqueues a job
+        # and returns immediately; a single worker thread drains jobs
+        # (and batches within a job) one at a time, so a 300-episode
+        # activation can never stack concurrent Plex scans/DB load on top
+        # of whatever else is already running, no matter how many more
+        # activation clicks land while it's in progress (see bead vpv).
+        self._episode_jobs = {}  # job_id -> {status, total, done, batches_total, batches_done, created_at, category_name}
+        self._episode_job_queue = deque()  # job_ids waiting/running, FIFO
+        self._episode_job_lock = threading.Lock()  # guards _episode_jobs + _episode_job_queue
+        self._episode_job_wake = threading.Event()  # signals worker that a new job was queued
+        self._episode_job_stop = threading.Event()
+        self._episode_job_counter = 0
+        self._episode_job_worker_thread = None
         self._last_removed_check = 0.0
         self._last_removed_episode_check = 0.0
         self._last_stream_refresh_check = 0.0
@@ -178,7 +191,16 @@ class BridgeCore:
             f"BridgeCore initialized. {len(self._activated)} activated movies."
         )
         self._start_stall_watchdog()
+        self._start_episode_job_worker()
         threading.Thread(target=self._backfill_series_tmdb_state, daemon=True).start()
+
+    def _start_episode_job_worker(self):
+        self._episode_job_worker_thread = threading.Thread(
+            target=self._episode_job_worker_loop,
+            daemon=True,
+            name="vod-bridge-episode-activation-worker",
+        )
+        self._episode_job_worker_thread.start()
 
     def _backfill_series_tmdb_state(self):
         """One-time-per-restart repair for series activated before bead czo
@@ -241,6 +263,8 @@ class BridgeCore:
 
     def cleanup(self):
         self._watchdog_stop.set()
+        self._episode_job_stop.set()
+        self._episode_job_wake.set()  # unblock the worker if it's waiting on a new job
         if self._watchdog_thread is not None:
             # Bound the wait: the loop only checks the stop event every 10s
             # and may be mid-way through a Plex/DB call, so give it a window
@@ -251,6 +275,17 @@ class BridgeCore:
                     "VOD To Plex: stall watchdog thread did not stop within "
                     "15s of shutdown — it will keep running until it next "
                     "wakes and observes the stop signal."
+                )
+        if self._episode_job_worker_thread is not None:
+            # The worker only checks the stop event between batches, so it
+            # may be mid-batch; give it a window to finish that batch and
+            # exit cleanly rather than blocking Stop Server indefinitely.
+            self._episode_job_worker_thread.join(timeout=15)
+            if self._episode_job_worker_thread.is_alive():
+                logger.warning(
+                    "VOD To Plex: episode activation worker did not stop "
+                    "within 15s of shutdown — it will keep running until it "
+                    "finishes its current batch and observes the stop signal."
                 )
         self._save_state()
 
@@ -1174,10 +1209,16 @@ class BridgeCore:
             if self.settings.get("debug_connections"):
                 self._log_event("debug", f"Category summary query failed: {e}")
 
+        shows_activated = len({
+            entry.get("series_id") for entry in self._episodes_activated.values()
+            if entry.get("series_id")
+        })
+
         return {
             "total": total,
             "activated": activated,
             "series_activated": len(self._episodes_activated),
+            "shows_activated": shows_activated,
             "categories": categories,
         }
 
@@ -1450,6 +1491,7 @@ class BridgeCore:
     def list_series(self, query):
         try:
             from apps.vod.models import Series
+            from django.db.models import F
 
             page = int(query.get("page", [1])[0])
             per_page = int(query.get("per_page", [50])[0])
@@ -1460,7 +1502,20 @@ class BridgeCore:
 
             activated_counts = self._activated_series_episode_counts()
 
-            qs = Series.objects.all()
+            # Series rows whose ONLY backing M3U relation(s) are to an inactive
+            # account, or to a category the account has explicitly disabled,
+            # are stale leftovers Dispatcharr keeps around after a
+            # deactivate/disable -- they're invisible in the provider/category
+            # filter dropdowns (both already filter on is_active/enabled) but
+            # without this same filter here they still render as extra
+            # duplicate cards on the unfiltered browse grid (e.g. a disabled
+            # "NEWTON LINEUP" account contributing a 3rd copy of a title that
+            # only has 2 real active-provider relations).
+            qs = Series.objects.filter(
+                m3u_relations__m3u_account__is_active=True,
+                m3u_relations__category__m3u_relations__m3u_account=F("m3u_relations__m3u_account"),
+                m3u_relations__category__m3u_relations__enabled=True,
+            ).distinct()
 
             if search:
                 qs = qs.filter(name__icontains=search)
@@ -1522,6 +1577,19 @@ class BridgeCore:
                                     activated_category = cat.get("name")
                             break
 
+                # The model's own episode_count is Dispatcharr's catalog-reported
+                # figure and is frequently None/stale. Episodes are only actually
+                # fetched into the DB lazily (see _ensure_episodes_fetched), so if
+                # they're already present locally, use that real count instead --
+                # without triggering a fetch here, since this runs per-page over
+                # up to per_page series on every browse load.
+                fetched_episode_count = s.episodes.count()
+                episode_count = fetched_episode_count or getattr(s, "episode_count", None)
+                sid_activated = activated_counts.get(sid, 0)
+                fully_activated = bool(
+                    fetched_episode_count and sid_activated >= fetched_episode_count
+                )
+
                 series_list.append(
                     {
                         "id": sid,
@@ -1533,9 +1601,10 @@ class BridgeCore:
                         "poster": poster,
                         "description": getattr(s, "description", ""),
                         "uuid": str(getattr(s, "uuid", "")),
-                        "episode_count": getattr(s, "episode_count", None),
+                        "episode_count": episode_count,
                         "trailer_key": trailer_key,
-                        "activated_episode_count": activated_counts.get(sid, 0),
+                        "activated_episode_count": sid_activated,
+                        "fully_activated": fully_activated,
                         "activated_category": activated_category,
                     }
                 )
@@ -1591,11 +1660,23 @@ class BridgeCore:
                 seasons.setdefault(ep.season_number, 0)
                 seasons[ep.season_number] += 1
 
+            activated_counts = {}
+            sid = str(series_id)
+            for entry in self._episodes_activated.values():
+                if entry.get("series_id") == sid:
+                    sn = entry.get("season_number")
+                    activated_counts[sn] = activated_counts.get(sn, 0) + 1
+
             return {
                 "series_id": str(series_id),
                 "series_name": series.name,
                 "seasons": [
-                    {"season_number": num, "episode_count": count}
+                    {
+                        "season_number": num,
+                        "episode_count": count,
+                        "activated_episode_count": activated_counts.get(num, 0),
+                        "fully_activated": activated_counts.get(num, 0) >= count,
+                    }
                     for num, count in sorted(seasons.items())
                 ],
             }
@@ -1675,15 +1756,24 @@ class BridgeCore:
         return f"{dispatcharr_url}/proxy/vod/episode/{episode.uuid}?stream_id={relation.stream_id}"
 
     def activate_episodes(self, body):
-        """Activate episodes with transient error requeue (max 3 retries).
+        """Enqueue episode activation as a background job and return
+        immediately. episode_ids are split into EPISODE_STRM_BATCH_SIZE
+        chunks; a single dedicated worker thread (_episode_job_worker_loop)
+        drains one batch at a time, across all queued jobs, so a 300-episode
+        activation can never pile concurrent Plex scans/DB load on top of
+        anything else -- including another activation click landing while
+        this one is still running, which just appends to the same queue
+        instead of starting a second worker (see bead vpv: 30+ series
+        activations failing silently under Plex scan / provider-connection
+        saturation).
 
-        For each episode:
-        1. Try to fetch from DB (retry on transient errors)
-        2. Get stream relations (fail if none)
-        3. Pick least-loaded provider (no capacity check, defer to playback)
-        4. Record activation entry
-
-        Returns: {"status": "ok"|"error", "activated": int, "failed": int, ...}
+        Returns immediately with {"status": "queued", "job_id", "total"} --
+        poll get_episode_job_status(job_id) or list_episode_jobs() for
+        progress. The actual per-episode activation logic (DB lookup, stream
+        relation lookup, provider pick, activation record) lives in
+        _activate_episode_batch(), unchanged from the old synchronous
+        implementation aside from running one batch at a time instead of
+        the whole list in one HTTP request.
         """
         episode_ids = body.get("episode_ids", [])
         category_id = body.get("category_id")
@@ -1696,10 +1786,220 @@ class BridgeCore:
         if category is None:
             return {"status": "error", "message": "Destination category not found"}
 
+        # Skip anything already activated up front so job totals/progress
+        # reflect actual work, matching the old skip-if-activated behavior.
+        pending_ids = [str(eid) for eid in episode_ids if str(eid) not in self._episodes_activated]
+        if not pending_ids:
+            return {"status": "ok", "activated": 0, "strm_generated": 0, "names": [], "failed": [], "failed_names": []}
+
+        batches = [
+            pending_ids[i:i + self.EPISODE_STRM_BATCH_SIZE]
+            for i in range(0, len(pending_ids), self.EPISODE_STRM_BATCH_SIZE)
+        ]
+
+        with self._episode_job_lock:
+            self._episode_job_counter += 1
+            job_id = str(self._episode_job_counter)
+            self._episode_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "category_id": category["id"],
+                "category_name": category["name"],
+                "total": len(pending_ids),
+                "done": 0,
+                "batches_total": len(batches),
+                "batches_done": 0,
+                "batches": batches,
+                "created_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                "activated": [],
+                "activated_names": [],
+                "failed": [],
+                "failed_names": [],
+                "strm_generated": 0,
+            }
+            queue_position = len(self._episode_job_queue)
+            self._episode_job_queue.append(job_id)
+
+        self._log_diagnostic("info",
+            f"Episode activation job {job_id} queued: {len(pending_ids)} episodes in {len(batches)} batch(es), "
+            f"position {queue_position} in queue")
+        self._episode_job_wake.set()
+
+        return {
+            "status": "queued",
+            "job_id": job_id,
+            "total": len(pending_ids),
+            "batches": len(batches),
+            "queue_position": queue_position,
+        }
+
+    def get_episode_job_status(self, job_id):
+        with self._episode_job_lock:
+            job = self._episode_jobs.get(str(job_id))
+            if job is None:
+                return {"status": "error", "message": "Job not found"}
+            return dict(job, batches=None)  # omit raw batch id lists from the response payload
+
+    def list_episode_jobs(self):
+        """Returns active (queued/running) jobs, most-recent-first, for the
+        dashboard's queue-depth indicator. Finished jobs are pruned by the
+        worker loop after a short grace period (see _episode_job_worker_loop)
+        rather than kept forever."""
+        with self._episode_job_lock:
+            jobs = [dict(j, batches=None) for j in self._episode_jobs.values()]
+        jobs.sort(key=lambda j: j["created_at"], reverse=True)
+        return {"jobs": jobs}
+
+    def _episode_job_worker_loop(self):
+        """Single consumer for _episode_job_queue: pulls one batch at a time
+        (from the oldest still-incomplete job) and processes it via
+        _activate_episode_batch(), so exactly one batch's worth of DB/Plex/
+        provider load is ever in flight regardless of how many activation
+        jobs are queued behind it."""
+        while not self._episode_job_stop.is_set():
+            job_id = None
+            with self._episode_job_lock:
+                if self._episode_job_queue:
+                    job_id = self._episode_job_queue[0]
+
+            if job_id is None:
+                self._episode_job_wake.wait(timeout=10)
+                self._episode_job_wake.clear()
+                continue
+
+            with self._episode_job_lock:
+                job = self._episode_jobs.get(job_id)
+                if job is None or not job["batches"]:
+                    self._episode_job_queue.popleft()
+                    continue
+                if job["status"] == "queued":
+                    job["status"] = "running"
+                    job["started_at"] = time.time()
+                batch = job["batches"].pop(0)
+                category = self._resolve_series_category(job["category_id"])
+
+            if category is None:
+                self._log_diagnostic("error", f"Episode activation job {job_id}: destination category no longer exists, aborting job")
+                with self._episode_job_lock:
+                    job["status"] = "error"
+                    job["finished_at"] = time.time()
+                    self._episode_job_queue.popleft()
+                continue
+
+            try:
+                self._activate_episode_batch(batch, category, job)
+            except Exception as e:
+                logger.error(f"Episode activation job {job_id} batch failed: {e}")
+                self._log_diagnostic("error", f"Episode activation job {job_id}: batch failed: {type(e).__name__}: {str(e)[:200]}")
+
+            with self._episode_job_lock:
+                job["batches_done"] += 1
+                job["done"] = len(job["activated"]) + len(job["failed"])
+                if not job["batches"]:
+                    job["status"] = "plex_scanning"
+                    job["plex_confirmed"] = 0
+                    self._episode_job_queue.popleft()
+                    titles = ", ".join(f'"{n}"' for n in job["activated_names"])
+                    self._log_event(
+                        "info",
+                        f'Activated {len(job["activated"])} episode(s) into "{job["category_name"]}": {titles} '
+                        f'- generated {job["strm_generated"]} STRM file(s)',
+                    )
+                    if job["failed"]:
+                        failed_titles = ", ".join(f'"{n}"' for n in job["failed_names"])
+                        self._log_event("warn", f'Episode activation skipped {len(job["failed"])} episode(s): {failed_titles}')
+                    self._log_diagnostic("info",
+                        f'Episode activation job {job_id} complete: {len(job["activated"])} activated, {len(job["failed"])} failed - awaiting Plex confirmation')
+                    run_plex_wait = True
+                else:
+                    run_plex_wait = False
+                    # More batches remain for this job -- pace the next one
+                    # so Plex isn't hit with another scan/HEAD wave back to
+                    # back with the one this batch just triggered.
+                    time.sleep(self.EPISODE_STRM_BATCH_DELAY_SECS)
+
+            if run_plex_wait:
+                self._wait_for_plex_episode_confirmation(job_id, job)
+
+            # Old, finished jobs are pruned lazily here so the dashboard can
+            # still show "just completed" status for a little while without
+            # _episode_jobs growing unbounded over a long-running server.
+            self._prune_finished_episode_jobs()
+
+    PLEX_CONFIRM_POLL_SECS = 3
+    PLEX_CONFIRM_TIMEOUT_SECS = 900
+
+    def _wait_for_plex_episode_confirmation(self, job_id, job):
+        """After our own batches finish, Plex is still analyzing the files
+        in the background (HEAD/probe + library scan). Poll Plex's own
+        library JSON via _fetch_plex_episode_sizes() every few seconds so
+        the dashboard can show a live completed/pending count for this
+        phase too, instead of the pill disappearing while Plex is still
+        working -- this was the exact confusion the user hit live-testing
+        a 47-episode activation (pill gone, but Plex still climbing
+        11->14->17 episodes for several more minutes)."""
+        eids = list(job["activated"])
+        if not eids:
+            with self._episode_job_lock:
+                job["status"] = "done"
+                job["finished_at"] = time.time()
+            return
+
+        deadline = time.time() + self.PLEX_CONFIRM_TIMEOUT_SECS
+        pending = set(eids)
+        while pending and time.time() < deadline and not self._episode_job_stop.is_set():
+            try:
+                sizes = self._fetch_plex_episode_sizes(list(pending))
+            except Exception as e:
+                logger.error(f"Episode activation job {job_id}: Plex confirmation poll failed: {e}")
+                sizes = {}
+            pending -= set(sizes.keys())
+            with self._episode_job_lock:
+                job["plex_confirmed"] = len(eids) - len(pending)
+            if not pending:
+                break
+            time.sleep(self.PLEX_CONFIRM_POLL_SECS)
+
+        with self._episode_job_lock:
+            job["plex_confirmed"] = len(eids) - len(pending)
+            job["status"] = "done"
+            job["finished_at"] = time.time()
+        if pending:
+            self._log_diagnostic("warn",
+                f'Episode activation job {job_id}: Plex confirmation timed out after {self.PLEX_CONFIRM_TIMEOUT_SECS}s '
+                f'with {len(pending)}/{len(eids)} episode(s) still unconfirmed by Plex')
+        else:
+            self._log_diagnostic("info", f'Episode activation job {job_id}: Plex confirmed all {len(eids)} episode(s)')
+
+    EPISODE_JOB_RETENTION_SECS = 600
+
+    def _prune_finished_episode_jobs(self):
+        cutoff = time.time() - self.EPISODE_JOB_RETENTION_SECS
+        with self._episode_job_lock:
+            stale = [
+                jid for jid, j in self._episode_jobs.items()
+                if j["status"] in ("done", "error") and j.get("finished_at") and j["finished_at"] < cutoff
+            ]
+            for jid in stale:
+                del self._episode_jobs[jid]
+
+    def _activate_episode_batch(self, episode_ids, category, job):
+        """Activates one batch of episodes and, if any succeeded, generates
+        their STRM/NFO, fetches confirmed sizes, and triggers a Plex scan
+        for just this batch -- same per-episode logic as the old
+        activate_episodes() (DB lookup w/ transient retry, stream relation
+        lookup, least-loaded provider pick, activation record), but scoped
+        to one batch so the Plex scan/size-fetch happens per-batch instead
+        of once for the whole activation. Mutates job's activated/failed
+        lists and strm_generated count in place."""
         try:
             from apps.vod.models import Episode
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            job["failed"].extend({"id": eid, "name": f"#{eid}", "message": str(e)} for eid in episode_ids)
+            job["failed_names"].extend(f"#{eid}" for eid in episode_ids)
+            return
 
         activated = []
         activated_names = []
@@ -1714,7 +2014,6 @@ class BridgeCore:
             eid = queue.popleft()
             eid = str(eid)
 
-            # Skip already activated episodes
             if eid in self._episodes_activated:
                 continue
 
@@ -1818,8 +2117,10 @@ class BridgeCore:
         if activated:
             strm_count = self._generate_strm_for_episodes(activated, category)
             self._save_state()
-            # Option A: Fetch confirmed sizes immediately before triggering scan,
-            # so that when Plex probes during scan, sizes are already cached.
+            # Fetch confirmed sizes immediately before triggering the scan
+            # for this batch, so Plex's probes during that scan already see
+            # cached sizes (Option A, same rationale as the old single-shot
+            # version, just scoped to this batch instead of the whole job).
             self._log_diagnostic("info", f"Episode activation: fetching {len(activated)} confirmed sizes from Plex before scan trigger...")
             sizes = self._fetch_plex_episode_sizes(activated)
             for eid in activated:
@@ -1836,7 +2137,6 @@ class BridgeCore:
                 self._save_state()
                 self._log_diagnostic("info", f"Episode activation: {len(sizes)}/{len(activated)} sizes confirmed before scan trigger")
             self._trigger_plex_scan(section=category["plex_library_section"])
-            # Background retry threads as fallback (in case initial query found no sizes yet)
             for eid in activated:
                 entry = self._episodes_activated.get(eid)
                 if not entry or not entry.get("confirmed_size"):
@@ -1855,30 +2155,12 @@ class BridgeCore:
                     args=(sid,),
                     daemon=True,
                 ).start()
-            titles = ", ".join(f'"{n}"' for n in activated_names)
-            self._log_event(
-                "info",
-                f'Activated {len(activated)} episode(s) into "{category["name"]}": {titles} '
-                f"- generated {strm_count} STRM file(s)",
-            )
 
-        if failed:
-            failed_titles = ", ".join(f'"{n}"' for n in failed_names)
-            self._log_event(
-                "warn",
-                f"Episode activation skipped {len(failed)} episode(s): {failed_titles}",
-            )
-
-        self._log_diagnostic("info", f"Episode activation batch complete: {len(activated)} activated, {len(failed)} failed")
-
-        return {
-            "status": "ok" if activated else "error",
-            "activated": len(activated),
-            "strm_generated": strm_count,
-            "names": activated_names,
-            "failed": failed,
-            "failed_names": failed_names,
-        }
+        job["activated"].extend(activated)
+        job["activated_names"].extend(activated_names)
+        job["failed"].extend(failed)
+        job["failed_names"].extend(failed_names)
+        job["strm_generated"] += strm_count
 
     def reactivate_episodes(self, body):
         """Manual 'Reactivate' for already-activated episodes, mirroring

@@ -46,8 +46,56 @@ a { color: var(--accent); text-decoration: none; }
   .mode-toggle { order: 3; width: 100%; justify-content: center; }
 }
 
+/* Live activation status pill — shown only while an activation job is
+   queued/running, so the dashboard makes clear something is still working
+   in the background instead of looking idle/stuck (see bead vpv). */
+.activation-status {
+  display: flex; align-items: center; gap: 0.6rem;
+  background: var(--surface2); border: 1.5px solid var(--accent); border-radius: 999px;
+  padding: 0.45rem 1.05rem; font-size: 0.85rem; color: var(--text2);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent), 0 1px 6px rgba(0,0,0,0.15);
+  animation: activation-fade-in 0.25s ease;
+}
+.activation-status.has-error { border-color: #e5484d; color: #e5484d; box-shadow: 0 0 0 3px rgba(229,72,77,0.15), 0 1px 6px rgba(0,0,0,0.15); }
+.activation-status.plex-phase { border-color: #a855f7; box-shadow: 0 0 0 3px rgba(168,85,247,0.15), 0 1px 6px rgba(0,0,0,0.15); }
+.activation-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
+  animation: activation-pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+.activation-status.has-error .activation-dot { background: #e5484d; animation: none; }
+.activation-status.plex-phase .activation-dot { background: #a855f7; }
+.activation-label { font-weight: 700; color: var(--text); white-space: nowrap; }
+.activation-status.has-error .activation-label { color: #e5484d; }
+.activation-status.plex-phase .activation-label { color: #a855f7; }
+.activation-progress {
+  width: 84px; height: 5px; border-radius: 3px; background: var(--border);
+  overflow: hidden; flex-shrink: 0;
+}
+.activation-progress-bar {
+  display: block; height: 100%; background: var(--accent); border-radius: 3px;
+  width: 0%; transition: width 0.4s ease;
+}
+.activation-status.has-error .activation-progress-bar { background: #e5484d; }
+.activation-status.plex-phase .activation-progress-bar { background: #a855f7; }
+.activation-count { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+.activation-elapsed { font-variant-numeric: tabular-nums; color: var(--text2); white-space: nowrap; }
+@keyframes activation-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.7); }
+}
+@keyframes activation-fade-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (max-width: 768px) {
+  .activation-status { order: 4; width: 100%; justify-content: center; }
+}
+
 /* Tabs */
-.tabs { display: flex; align-items: center; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); }
+.tabs { display: flex; align-items: center; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; z-index: 90; top: var(--header-h, 0px); justify-content: space-between; padding-right: 1.2rem; }
+.tabs-stats { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text2); white-space: nowrap; }
+.tabs-stats .stat-val { color: var(--text); font-weight: 600; }
 .tab { padding: 0.6rem 1.2rem; cursor: pointer; color: var(--text2); font-size: 0.85rem; border-bottom: 2px solid transparent; transition: all 0.15s; position: relative; }
 .tab:hover { color: var(--text); background: var(--surface2); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -117,7 +165,9 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .movie-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .movie-card.activated { box-shadow: 0 0 0 2px var(--green); }
 .movie-card.selected { box-shadow: 0 0 0 2px var(--accent); }
+.movie-card.fully-activated { opacity: 0.45; filter: grayscale(0.6); }
 .series-select-cb { position: absolute; top: 6px; left: 6px; z-index: 2; width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer; }
+.series-select-cb:disabled { cursor: not-allowed; opacity: 0.5; }
 .movie-poster { width: 100%; aspect-ratio: 2/3; background: var(--border); object-fit: cover; display: block; }
 .movie-poster.no-poster { display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--text2); }
 .movie-info { padding: 0.4rem 0.5rem; display: flex; flex-direction: column; align-items: center; text-align: center; }
@@ -308,21 +358,33 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="mode-btn active" data-mode="movies" onclick="switchMode('movies')">Movies</div>
     <div class="mode-btn" data-mode="series" onclick="switchMode('series')">Series</div>
   </div>
+  <div class="activation-status" id="activationStatus" style="display:none;">
+    <span class="activation-dot"></span>
+    <span class="activation-label" id="activationLabel">Activating…</span>
+    <span class="activation-progress"><span class="activation-progress-bar" id="activationProgressBar"></span></span>
+    <span class="activation-count" id="activationCount">0/0</span>
+    <span class="activation-elapsed" id="activationElapsed">0:00</span>
+  </div>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Movies Activated: <span class="stat-val" id="hdrActivated">-</span></span>
-    <span>Series Activated: <span class="stat-val" id="hdrSeriesActivated">-</span></span>
     <span>Categories: <span class="stat-val" id="hdrCategories">-</span></span>
   </div>
 </div>
 
 <div class="tabs">
-  <div class="tab active" data-tab="browse" onclick="switchTab('browse')">Browse</div>
-  <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
-  <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
-  <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
-  <div class="tab" data-tab="tmdbResults" onclick="switchTab('tmdbResults')">TMDB Results <span class="badge" id="tmdbBadge" style="display:none">0</span></div>
-  <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
+  <div style="display:flex;align-items:center;">
+    <div class="tab active" data-tab="browse" onclick="switchTab('browse')">Browse</div>
+    <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
+    <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
+    <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
+    <div class="tab" data-tab="tmdbResults" onclick="switchTab('tmdbResults')">TMDB Results <span class="badge" id="tmdbBadge" style="display:none">0</span></div>
+    <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
+  </div>
+  <div class="tabs-stats">
+    <span>Shows Activated: <span class="stat-val" id="hdrShowsActivated">-</span></span>
+    <span>Episodes Activated: <span class="stat-val" id="hdrSeriesActivated">-</span></span>
+  </div>
 </div>
 
 <div class="content">
@@ -435,7 +497,12 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
         <div class="panel">
           <div class="panel-header" style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;">
             <span id="seriesBreadcrumb">Series</span>
-            <button class="btn btn-outline" id="seriesBackBtn" onclick="seriesGoBack()" style="display:none;justify-self:center;font-size:0.95rem;padding:0.5rem 1.4rem;">&larr; Back</button>
+            <div style="display:flex;gap:0.6rem;align-items:center;justify-self:center;">
+              <button class="btn btn-outline" id="seriesBackBtn" onclick="seriesGoBack()" style="display:none;font-size:0.95rem;padding:0.5rem 1.4rem;">&larr; Back</button>
+              <label id="seriesDrillActivatedToggle" style="display:none;font-size:0.75rem;color:var(--text2);align-items:center;gap:4px;white-space:nowrap;cursor:pointer;">
+                <input type="checkbox" id="seriesDrillActivatedFilter" onchange="toggleSeriesDrillActivatedOnly(this.checked)"> Activated Only
+              </label>
+            </div>
             <div style="display:flex;gap:0.3rem;align-items:center;justify-self:end;">
               <button class="btn btn-primary btn-sm" onclick="selectAllSeriesItems()">Select All</button>
               <button class="btn btn-outline btn-sm" onclick="clearAllSeriesSelections()">Clear All</button>
@@ -477,7 +544,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
             </div>
           </div>
           <div class="selection-bar" id="seriesSelectionBar" style="display:none;">
-            <span>Selected: <span class="count" id="seriesSelCount">0</span></span>
+            <span>Shows Selected: <span class="count" id="seriesSelShowsCount">0</span></span>
+            <span>Episodes Selected: <span class="count" id="seriesSelEpisodesCount">0</span></span>
             <div style="display:flex;align-items:center;gap:0.4rem;">
               <label style="font-size:0.75rem;color:var(--text2);">Destination:</label>
               <select class="search-input" id="seriesDestCategorySel" style="min-width:160px;" onchange="onSeriesDestCategoryChange()"></select>
@@ -727,7 +795,7 @@ function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
   return `episode:${episodeId}`;
 }
 
-function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl, evt) {
+function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl, evt, remainingEpisodeCount) {
   // Shift+click range selection
   if (evt && evt.shiftKey && lastCheckedSeriesCheckbox && lastCheckedSeriesCheckbox !== cbEl) {
     const allCheckboxes = Array.from(document.querySelectorAll('#seriesGrid .series-select-cb'));
@@ -737,6 +805,7 @@ function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId
       const [minIdx, maxIdx] = startIdx < endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
       for (let i = minIdx; i <= maxIdx; i++) {
         const checkbox = allCheckboxes[i];
+        if (checkbox.disabled) continue;
         if (!checkbox.checked) {
           checkbox.checked = true;
           checkbox.dispatchEvent(new Event('change', { bubbles: true }));
@@ -756,6 +825,7 @@ function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId
     seriesSelection.set(key, {
       level, seriesId, seriesName, seasonNumber,
       episodeIds: level === 'episode' ? [episodeId] : null,
+      remainingEpisodeCount: level === 'episode' ? 1 : (remainingEpisodeCount || 0),
     });
   }
   updateSeriesSelectionUI();
@@ -770,10 +840,18 @@ function updateSeriesSelectionUI() {
     card.classList.toggle('selected', selected);
   });
   const bar = document.getElementById('seriesSelectionBar');
-  const count = document.getElementById('seriesSelCount');
+  const showsCount = document.getElementById('seriesSelShowsCount');
+  const episodesCount = document.getElementById('seriesSelEpisodesCount');
   if (seriesSelection.size > 0) {
     bar.style.display = '';
-    count.textContent = seriesSelection.size;
+    const distinctShows = new Set();
+    let episodeTotal = 0;
+    for (const entry of seriesSelection.values()) {
+      distinctShows.add(entry.seriesId);
+      episodeTotal += entry.remainingEpisodeCount || 0;
+    }
+    showsCount.textContent = distinctShows.size;
+    episodesCount.textContent = episodeTotal;
   } else {
     bar.style.display = 'none';
   }
@@ -781,6 +859,7 @@ function updateSeriesSelectionUI() {
 
 function selectAllSeriesItems() {
   document.querySelectorAll('#seriesGrid .series-select-cb').forEach(cb => {
+    if (cb.disabled) return;
     if (!cb.checked) {
       cb.checked = true;
       cb.dispatchEvent(new Event('change'));
@@ -853,20 +932,22 @@ async function createSeriesCategoryInline() {
 
 // Resolves the current selection (series/season/episode-level entries) down
 // to a flat list of concrete episode IDs, fetching each series/season's
-// episode list on demand.
-async function resolveSeriesSelectionToEpisodeIds() {
+// episode list on demand. skipActivated drops already-activated episodes
+// from season/series-level picks -- used for Activate only, since
+// Deactivate/Reactivate need to operate on already-activated episodes.
+async function resolveSeriesSelectionToEpisodeIds(skipActivated) {
   const ids = new Set();
   for (const entry of seriesSelection.values()) {
     if (entry.level === 'episode') {
       entry.episodeIds.forEach(id => ids.add(id));
     } else if (entry.level === 'season') {
       const data = await api(`/api/series/${entry.seriesId}/episodes?season=${entry.seasonNumber}`);
-      (data.episodes || []).forEach(ep => ids.add(ep.id));
+      (data.episodes || []).forEach(ep => { if (!skipActivated || !ep.activated) ids.add(ep.id); });
     } else if (entry.level === 'series') {
       const seasonsData = await api(`/api/series/${entry.seriesId}/seasons`);
       for (const sn of (seasonsData.seasons || [])) {
         const data = await api(`/api/series/${entry.seriesId}/episodes?season=${sn.season_number}`);
-        (data.episodes || []).forEach(ep => ids.add(ep.id));
+        (data.episodes || []).forEach(ep => { if (!skipActivated || !ep.activated) ids.add(ep.id); });
       }
     }
   }
@@ -882,7 +963,7 @@ async function activateSeriesSelected(btnEl) {
   }
   if (btnEl) btnEl.classList.add('is-busy');
   try {
-    const episodeIds = await resolveSeriesSelectionToEpisodeIds();
+    const episodeIds = await resolveSeriesSelectionToEpisodeIds(true);
     const data = await api('/api/episodes/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -890,6 +971,10 @@ async function activateSeriesSelected(btnEl) {
     });
     if (data.status === 'error') {
       showToast('Activate failed', data.message || 'Unknown error', 'error');
+    } else if (data.status === 'queued') {
+      const queueMsg = data.queue_position > 0 ? ` (queued behind ${data.queue_position} job(s))` : '';
+      showToast('Activation started', `${data.total} episode(s) queued in ${data.batches} batch(es)${queueMsg}`, 'success');
+      pollActivationStatus();
     } else {
       showToast('Activate complete', namesPreview(data.names, data.activated), 'success');
     }
@@ -972,7 +1057,8 @@ async function quickReactivateEpisode(id, btnEl) {
 
 function seriesGoBack() {
   if (seriesNav.view === 'episodes') {
-    seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null };
+    const activatedOnly = seriesNav.activatedOnly;
+    seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null, activatedOnly };
     loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster);
   } else if (seriesNav.view === 'seasons') {
     seriesNav = { view: 'series', seriesId: null, seriesName: '', seriesPoster: '', seasonNumber: null };
@@ -980,9 +1066,19 @@ function seriesGoBack() {
   }
 }
 
+function toggleSeriesDrillActivatedOnly(checked) {
+  seriesNav.activatedOnly = checked;
+  if (seriesNav.view === 'episodes') {
+    loadEpisodes(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seasonNumber, seriesNav.seriesPoster);
+  } else if (seriesNav.view === 'seasons') {
+    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster);
+  }
+}
+
 async function loadSeries(page) {
   seriesCurrentPage = page || 1;
   seriesNav = { view: 'series', seriesId: null, seriesName: '', seasonNumber: null };
+  document.getElementById('seriesDrillActivatedToggle').style.display = 'none';
   document.getElementById('seriesBreadcrumb').textContent = 'Series';
   document.getElementById('seriesBackBtn').style.display = 'none';
   document.getElementById('seriesSearchBar').style.display = '';
@@ -995,7 +1091,9 @@ async function loadSeries(page) {
   if (provP) url += '&' + provP;
   const catP = msParams('seriesCat');
   if (catP) url += '&' + catP;
-  if (document.getElementById('seriesActivatedFilter').checked) url += '&activated_only=1';
+  const activatedOnly = document.getElementById('seriesActivatedFilter').checked;
+  if (activatedOnly) url += '&activated_only=1';
+  seriesNav.activatedOnly = activatedOnly;
 
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading series...</div>';
@@ -1013,14 +1111,20 @@ async function loadSeries(page) {
       : '<div class="movie-poster no-poster">No Poster</div>';
     const key = seriesSelKey('series', s.id, null, null);
     const checked = seriesSelection.has(key) ? 'checked' : '';
+    const fullyActivated = !!s.fully_activated;
+    const remainingCount = Math.max(0, (s.episode_count || 0) - (s.activated_episode_count || 0));
+    // Normal view: disable fully-activated shows (nothing left to activate).
+    // Activated Only view: disable shows with zero activation (nothing to deactivate/reactivate).
+    const disabled = activatedOnly ? !(s.activated_episode_count > 0) : fullyActivated;
+    const disabledReason = activatedOnly ? ' (no activated episodes)' : ' (all episodes already activated)';
     const trailerBtn = s.trailer_key
       ? `<button class="trailer-btn" onclick="event.stopPropagation();playTrailer('${s.trailer_key}')" title="Watch trailer">&#9654;</button>`
       : '';
     const actBadge = s.activated_episode_count > 0
       ? `<span class="movie-badge">Active (${s.activated_episode_count})</span>`
       : '';
-    return `<div class="movie-card ${checked ? 'selected' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeHtml(s.id)}','${escapeHtml(s.name)}',null,null,this,event)">
+    return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}${disabled ? disabledReason : ''}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeJsAttr(s.id)}','${escapeJsAttr(s.name)}',null,null,this,event,${remainingCount})">
       ${trailerBtn}
       ${actBadge}
       ${poster}
@@ -1057,11 +1161,14 @@ function seriesPosterCardHtml(poster, label) {
 }
 
 async function loadSeasons(seriesId, seriesName, seriesPoster) {
-  seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null };
+  const activatedOnly = !!seriesNav.activatedOnly;
+  seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null, activatedOnly };
   document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName}`;
   document.getElementById('seriesBackBtn').style.display = '';
   document.getElementById('seriesSearchBar').style.display = 'none';
   document.getElementById('seriesPagination').innerHTML = '';
+  document.getElementById('seriesDrillActivatedToggle').style.display = 'flex';
+  document.getElementById('seriesDrillActivatedFilter').checked = activatedOnly;
 
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading seasons...</div>';
@@ -1076,8 +1183,16 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
     const label = sn.season_number === 0 ? 'Specials' : `Season ${sn.season_number}`;
     const key = seriesSelKey('season', seriesId, sn.season_number, null);
     const checked = seriesSelection.has(key) ? 'checked' : '';
-    return `<div class="movie-card ${checked ? 'selected' : ''}" data-season-number="${sn.season_number}" title="${label}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${sn.season_number},null,this,event)">
+    const fullyActivated = !!sn.fully_activated;
+    const remainingCount = Math.max(0, (sn.episode_count || 0) - (sn.activated_episode_count || 0));
+    const disabled = activatedOnly ? !(sn.activated_episode_count > 0) : fullyActivated;
+    const disabledReason = activatedOnly ? ' (no activated episodes)' : ' (all episodes already activated)';
+    const actBadge = sn.activated_episode_count > 0
+      ? `<span class="movie-badge">Active (${sn.activated_episode_count})</span>`
+      : '';
+    return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" data-season-number="${sn.season_number}" title="${label}${disabled ? disabledReason : ''}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${sn.season_number},null,this,event,${remainingCount})">
+      ${actBadge}
       ${seriesPosterCardHtml(seriesPoster, label)}
       <div class="movie-info">
         <div class="movie-title">${label}</div>
@@ -1095,10 +1210,13 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
 }
 
 async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
-  seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber };
+  const activatedOnly = !!seriesNav.activatedOnly;
+  seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber, activatedOnly };
   const seasonLabel = seasonNumber === 0 ? 'Specials' : `Season ${seasonNumber}`;
   document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName} / ${seasonLabel}`;
   document.getElementById('seriesBackBtn').style.display = '';
+  document.getElementById('seriesDrillActivatedToggle').style.display = 'flex';
+  document.getElementById('seriesDrillActivatedFilter').checked = activatedOnly;
 
   const grid = document.getElementById('seriesGrid');
   grid.innerHTML = '<div class="loading"><span class="spinner"></span> Loading episodes...</div>';
@@ -1118,8 +1236,12 @@ async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
     const reactivateBtn = ep.activated
       ? `<button class="reactivate-btn" onclick="event.stopPropagation();quickReactivateEpisode('${ep.id}', this)" title="Reactivate (refresh NFO/stream pick without touching Plex)">&#8635;</button>`
       : '';
-    return `<div class="movie-card ${checked ? 'selected' : ''}" title="${escapeHtml(titleText)}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeHtml(seriesId)}','${escapeHtml(seriesName)}',${seasonNumber},'${escapeHtml(ep.id)}',this,event)">
+    const disabled = activatedOnly ? !ep.activated : ep.activated;
+    const disabledReason = activatedOnly ? ' (not activated)' : ' (already activated)';
+    const actBadge = ep.activated ? '<span class="movie-badge">Active</span>' : '';
+    return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" title="${escapeHtml(titleText)}${disabled ? disabledReason : ''}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${seasonNumber},'${escapeJsAttr(ep.id)}',this,event,1)">
+      ${actBadge}
       ${reactivateBtn}
       ${seriesPosterCardHtml(seriesPoster, epLabel)}
       <div class="movie-info">
@@ -1435,6 +1557,7 @@ async function loadSummary(btn) {
     document.getElementById('hdrTotal').textContent = data.total || 0;
     document.getElementById('hdrActivated').textContent = data.activated || 0;
     document.getElementById('hdrSeriesActivated').textContent = data.series_activated || 0;
+    document.getElementById('hdrShowsActivated').textContent = data.shows_activated || 0;
     document.getElementById('hdrCategories').textContent = (data.categories||[]).length;
 
     // Category chips
@@ -2040,6 +2163,10 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function escapeJsAttr(s) {
+  return escapeHtml(String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"));
+}
+
 async function loadProxyLog() {
   try {
     const data = await api('/api/activity-log');
@@ -2095,12 +2222,102 @@ function toggleLogAutoRefresh() {
   }
 }
 
+// Live activation status pill — polls queued/running episode activation
+// jobs and shows a pulsing indicator + progress + elapsed time between
+// Movies/Series and the catalog stats, so a long series activation doesn't
+// look "stuck" while it drip-feeds in the background (see bead vpv). Hidden
+// entirely when nothing is queued/running.
+let activationPollTimer = null;
+let activationKnownJobIds = new Set();
+
+function formatElapsed(startedAt) {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+async function pollActivationStatus() {
+  const el = document.getElementById('activationStatus');
+  try {
+    const data = await api('/api/episodes/activation-jobs');
+    const jobs = data.jobs || [];
+    const active = jobs.filter(j => j.status === 'queued' || j.status === 'running');
+    const plexPhase = jobs.filter(j => j.status === 'plex_scanning');
+    const errored = jobs.filter(j => j.status === 'error' && !activationKnownJobIds.has('seen:' + j.job_id));
+
+    // Surface a toast the first time we see a job land in "error" status,
+    // then remember it so we don't re-toast on every subsequent poll.
+    errored.forEach(j => {
+      showToast('Activation job failed', `"${j.category_name || 'destination'}" — job stopped, see Logs tab`, 'error');
+      activationKnownJobIds.add('seen:' + j.job_id);
+    });
+
+    if (active.length === 0 && plexPhase.length === 0) {
+      el.style.display = 'none';
+      el.classList.remove('plex-phase');
+      // A job just finished since the last poll — refresh header counts.
+      if (activationKnownJobIds.has('running')) {
+        activationKnownJobIds.delete('running');
+        loadSummary();
+      }
+      return;
+    }
+    activationKnownJobIds.add('running');
+    el.style.display = 'flex';
+    el.classList.remove('has-error');
+
+    if (active.length > 0) {
+      // Our own batch-processing phase: STRM/NFO generation + per-batch scan trigger.
+      el.classList.remove('plex-phase');
+      const running = active.find(j => j.status === 'running') || active[0];
+      const totalDone = active.reduce((sum, j) => sum + (j.done || 0), 0);
+      const totalCount = active.reduce((sum, j) => sum + (j.total || 0), 0);
+      const pct = totalCount > 0 ? Math.min(100, (totalDone / totalCount) * 100) : 0;
+      const queuedBehind = active.length - 1;
+
+      document.getElementById('activationLabel').textContent = queuedBehind > 0
+        ? `Activating (+${queuedBehind} queued)…`
+        : 'Activating…';
+      document.getElementById('activationProgressBar').style.width = pct + '%';
+      document.getElementById('activationCount').textContent = `${totalDone}/${totalCount}`;
+      document.getElementById('activationElapsed').textContent = running.started_at
+        ? formatElapsed(running.started_at)
+        : '0:00';
+    } else {
+      // All of our own batches are done; Plex is still analyzing the files
+      // in the background (library scan / HEAD probes). Keep the pill up
+      // with a live confirmed/pending count so it doesn't look "stuck".
+      el.classList.add('plex-phase');
+      const totalConfirmed = plexPhase.reduce((sum, j) => sum + (j.plex_confirmed || 0), 0);
+      const totalCount = plexPhase.reduce((sum, j) => sum + (j.total || 0), 0);
+      const pct = totalCount > 0 ? Math.min(100, (totalConfirmed / totalCount) * 100) : 0;
+      const oldest = plexPhase.reduce((a, b) => (a.started_at || 0) < (b.started_at || 0) ? a : b);
+
+      document.getElementById('activationLabel').textContent = 'Confirming in Plex…';
+      document.getElementById('activationProgressBar').style.width = pct + '%';
+      document.getElementById('activationCount').textContent = `${totalConfirmed}/${totalCount}`;
+      document.getElementById('activationElapsed').textContent = oldest.started_at
+        ? formatElapsed(oldest.started_at)
+        : '0:00';
+    }
+  } catch (e) {
+    console.error('pollActivationStatus failed', e);
+  }
+}
+
+function startActivationStatusPolling() {
+  pollActivationStatus();
+  activationPollTimer = setInterval(pollActivationStatus, 2000);
+}
+
 // Init
 loadProviders();
 loadLanguages();
 loadSummary();
 loadMovies(1);
 refreshLangStatus();
+startActivationStatusPolling();
 </script>
 </body>
 </html>
