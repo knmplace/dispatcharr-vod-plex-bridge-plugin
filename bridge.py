@@ -2553,9 +2553,20 @@ class BridgeCore:
         removed = 0
         for section, entries in by_section.items():
             try:
+                # v2.4.1 fix: this must be type=4 (Episode), not type=2 (Show).
+                # Querying with type=2 returned Show-level objects lacking
+                # grandparentTitle/parentIndex/index, so `key` below never
+                # matched `wanted` and every episode delete silently no-opped
+                # -- both on manual deactivation and the background reconcile
+                # sweep. Net effect: episodes removed from Dispatcharr/disk
+                # stayed live in Plex indefinitely, and rclone's
+                # vod-series mount kept retrying to warm-cache files Plex
+                # still referenced but that no longer existed locally
+                # (observed as a sustained HTTP 503 storm on
+                # rclone-vod-series.service, ~1,800 error lines/48h).
                 resp = requests.get(
                     f"{plex_url}/library/sections/{section}/all",
-                    params={"X-Plex-Token": plex_token, "type": "2"},
+                    params={"X-Plex-Token": plex_token, "type": "4"},
                     headers={"Accept": "application/json"},
                     timeout=15,
                 )
@@ -2574,6 +2585,7 @@ class BridgeCore:
                     + str([(it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index")) for it in items])
                 )
 
+                section_removed = 0
                 for item in items:
                     key = (
                         item.get("grandparentTitle", ""),
@@ -2591,9 +2603,23 @@ class BridgeCore:
                     )
                     if del_resp.status_code in (200, 204):
                         removed += 1
+                        section_removed += 1
                         logger.info(f"Plex: deleted episode {title} (key {rating_key})")
                     else:
                         logger.warning(f"Plex delete episode {title} returned {del_resp.status_code}")
+
+                # v2.4.1: added diagnostic -- a total match failure here (the
+                # exact symptom of the type=2/type=4 bug above) previously
+                # logged nothing, so it went unnoticed until Plex accumulated
+                # months of orphaned episodes. Now surfaced as a WARNING with
+                # enough context (wanted keys vs. what Plex actually returned)
+                # to diagnose a recurrence without re-adding print debugging.
+                if section_removed == 0 and wanted:
+                    logger.warning(
+                        f"Plex episode delete: 0/{len(wanted)} matched in section {section} -- "
+                        f"wanted={wanted} not found among {len(items)} Plex item(s); "
+                        "these episodes were NOT removed from Plex"
+                    )
             except Exception as e:
                 logger.error(f"Plex episode removal failed for section {section}: {e}")
 
