@@ -117,6 +117,17 @@ class BridgeCore:
     STALE_TRACKING_ENTRY_MAXAGE_SECS = 3600
     STALE_TRACKING_SWEEP_INTERVAL_SECS = 600
 
+    # Per-provider (M3U account) health check, surfaced on the Health tab
+    # next to Dispatcharr Db / Plex. Hits each active XC account's own
+    # player_api.php the same way Dispatcharr's own background profile
+    # refresh does, so a provider-side outage (e.g. WarpTV's XC API
+    # dropping connections intermittently -- bead b80) shows up at a glance
+    # instead of only being visible by grepping container logs after the
+    # fact. 8h is frequent enough to catch a provider that's been down for
+    # a while without adding meaningful background request volume.
+    PROVIDER_CHECK_INTERVAL_SECS = 8 * 3600
+    PROVIDER_CHECK_TIMEOUT_SECS = 8
+
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
@@ -161,6 +172,10 @@ class BridgeCore:
         self._last_tmdb_detection = 0.0
         self._tmdb_detection_results = {}  # series_id (str) -> {results: [{tmdb_id, title, year, confidence, poster_path}], searched: bool, manual_pick: tmdb_id or None}
         self._last_tracking_sweep = 0.0
+        self._last_provider_check = 0.0
+        self._provider_status = []  # [{id, name, status: ok|error|unknown, message, checked_at}]
+        self._external_ip = None
+        self._external_ip_checked_at = 0.0
         self._activity_log = deque(maxlen=self.ACTIVITY_LOG_MAXLEN)
         self._diagnostic_log = deque(maxlen=5000)
         max_concurrent_heads = int(settings.get("head_request_max_concurrent", 5))
@@ -470,6 +485,7 @@ class BridgeCore:
                     self._reconcile_all_series_tmdb_ids()
                 except Exception as e:
                     logger.error(f"Series tmdb reconcile sweep error: {e}")
+                self._save_state()
 
             if now - self._last_tmdb_detection >= self.TMDB_DETECTION_INTERVAL_SECS:
                 self._last_tmdb_detection = now
@@ -477,6 +493,14 @@ class BridgeCore:
                     self._run_tmdb_detection_sweep()
                 except Exception as e:
                     logger.error(f"TMDB detection sweep error: {e}")
+                self._save_state()
+
+            if now - self._last_provider_check >= self.PROVIDER_CHECK_INTERVAL_SECS:
+                self._last_provider_check = now
+                try:
+                    self._check_all_providers()
+                except Exception as e:
+                    logger.error(f"Provider health check sweep error: {e}")
 
             if now - self._last_tracking_sweep >= self.STALE_TRACKING_SWEEP_INTERVAL_SECS:
                 self._last_tracking_sweep = now
@@ -1035,6 +1059,15 @@ class BridgeCore:
                 self._series_categories = state.get("series_categories", [])
                 self._series_tmdb_state = state.get("series_tmdb_state", {})
                 self._tmdb_detection_results = state.get("tmdb_detection_results", {})
+                # v2.4.2: persist across restarts -- these previously reset to
+                # 0.0 in __init__ on every process restart, so the 24h TMDB
+                # detection sweep (_run_tmdb_detection_sweep, populates the
+                # dashboard TMDB tab) needed 24h of *continuous* uptime to
+                # ever fire once. Frequent restarts during active development
+                # kept resetting the clock before it completed, leaving the
+                # tab permanently empty despite a valid TMDB API key.
+                self._last_tmdb_reconcile = state.get("last_tmdb_reconcile", 0.0)
+                self._last_tmdb_detection = state.get("last_tmdb_detection", 0.0)
                 if "diagnostic_log" in state:
                     self._diagnostic_log.extend(state["diagnostic_log"])
             except Exception as e:
@@ -1059,6 +1092,8 @@ class BridgeCore:
                 "series_categories": self._series_categories,
                 "series_tmdb_state": self._series_tmdb_state,
                 "tmdb_detection_results": self._tmdb_detection_results,
+                "last_tmdb_reconcile": self._last_tmdb_reconcile,
+                "last_tmdb_detection": self._last_tmdb_detection,
                 "diagnostic_log": list(self._diagnostic_log)[-1000:],
             }, f)
         except Exception as e:
@@ -2530,6 +2565,39 @@ class BridgeCore:
 
         return {"status": "ok", "deactivated": len(deactivated), "plex_removed": plex_removed}
 
+    def _plex_delete_batch(self, plex_url, plex_token, items, label):
+        """Fire Plex DELETE /library/metadata/{ratingKey} for each (rating_key,
+        title) in `items` concurrently instead of one-at-a-time. Deactivating
+        a large series/batch was taking 5-10 minutes because each delete
+        blocked up to timeout=10s and ran sequentially."""
+        if not items:
+            return 0
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _delete_one(rating_key, title):
+            try:
+                resp = requests.delete(
+                    f"{plex_url}/library/metadata/{rating_key}",
+                    params={"X-Plex-Token": plex_token},
+                    timeout=10,
+                )
+                if resp.status_code in (200, 204):
+                    logger.info(f"Plex: deleted {label} {title} (key {rating_key})")
+                    return True
+                logger.warning(f"Plex delete {label} {title} returned {resp.status_code}")
+                return False
+            except Exception as e:
+                logger.warning(f"Plex delete {label} {title} failed: {e}")
+                return False
+
+        removed = 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for ok in pool.map(lambda it: _delete_one(*it), items):
+                if ok:
+                    removed += 1
+        return removed
+
     def _plex_delete_episodes(self, plex_match_info):
         """Mirrors _plex_delete_movies() for episodes. Episode STRM filenames
         don't embed the episode id (unlike movies' {id}.mkv), so matching is
@@ -2585,28 +2653,22 @@ class BridgeCore:
                     + str([(it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index")) for it in items])
                 )
 
-                section_removed = 0
+                to_delete = []
                 for item in items:
                     key = (
                         item.get("grandparentTitle", ""),
                         str(item.get("parentIndex", "")),
                         str(item.get("index", "")),
                     )
-                    if key not in wanted:
-                        continue
-                    rating_key = item.get("ratingKey")
-                    title = item.get("title", "?")
-                    del_resp = requests.delete(
-                        f"{plex_url}/library/metadata/{rating_key}",
-                        params={"X-Plex-Token": plex_token},
-                        timeout=10,
-                    )
-                    if del_resp.status_code in (200, 204):
-                        removed += 1
-                        section_removed += 1
-                        logger.info(f"Plex: deleted episode {title} (key {rating_key})")
-                    else:
-                        logger.warning(f"Plex delete episode {title} returned {del_resp.status_code}")
+                    if key in wanted:
+                        to_delete.append((item.get("ratingKey"), item.get("title", "?")))
+
+                # v2.4.2: parallelized -- was one sequential requests.delete()
+                # per episode (each up to timeout=10s), so deactivating a
+                # 30-60 episode series took 5-10 minutes. A small thread pool
+                # cuts that to roughly the slowest single call.
+                section_removed = self._plex_delete_batch(plex_url, plex_token, to_delete, "episode")
+                removed += section_removed
 
                 # v2.4.1: added diagnostic -- a total match failure here (the
                 # exact symptom of the type=2/type=4 bug above) previously
@@ -3664,7 +3726,90 @@ class BridgeCore:
         else:
             checks["plex"] = {"status": "unconfigured"}
 
-        return {"health": checks, "maintenance": self._maint_stats}
+        # Provider checks are run on their own 8h background timer
+        # (_check_all_providers), not on every dashboard load -- this just
+        # serves whatever was last cached, plus runs one on-demand if none
+        # has ever completed yet (fresh install / first restart).
+        if not self._provider_status and self._last_provider_check == 0.0:
+            self._last_provider_check = time.time()
+            try:
+                self._check_all_providers()
+            except Exception as e:
+                logger.error(f"On-demand provider health check failed: {e}")
+
+        if self._external_ip is None:
+            try:
+                self._fetch_external_ip()
+            except Exception as e:
+                logger.error(f"External IP lookup failed: {e}")
+
+        return {
+            "health": checks,
+            "maintenance": self._maint_stats,
+            "providers": self._provider_status,
+            "providers_checked_at": self._last_provider_check or None,
+            "external_ip": self._external_ip,
+        }
+
+    def _fetch_external_ip(self):
+        """Cheap, rarely-changing lookup -- cached indefinitely once
+        successful and only retried on health_check() if it never
+        succeeded, so this never adds meaningful background traffic."""
+        try:
+            resp = requests.get("https://api.ipify.org", params={"format": "text"}, timeout=5)
+            if resp.status_code == 200 and resp.text.strip():
+                self._external_ip = resp.text.strip()
+                self._external_ip_checked_at = time.time()
+        except Exception as e:
+            logger.warning(f"External IP lookup failed: {e}")
+
+    def _check_all_providers(self):
+        """Probe every active Xtream-Codes M3U account's own player_api.php
+        (same endpoint Dispatcharr's background profile refresh uses) so a
+        provider-side outage shows up on the Health tab instead of only
+        being discoverable by grepping container logs after the fact (see
+        bead b80 -- WarpTV LIVE 3 intermittently dropping this exact call).
+        Non-XC accounts (plain M3U URL, no per-account auth endpoint to
+        probe) are reported using Dispatcharr's own last-known status field
+        instead of an extra network call."""
+        try:
+            from apps.m3u.models import M3UAccount
+        except Exception as e:
+            logger.error(f"Provider health check: model import failed: {e}")
+            return
+
+        results = []
+        now = time.time()
+        for acc in M3UAccount.objects.filter(is_active=True).order_by("name"):
+            entry = {"id": acc.id, "name": acc.name, "checked_at": now}
+            if acc.account_type == "XC" and acc.server_url and acc.username and acc.password:
+                try:
+                    resp = requests.get(
+                        f"{acc.server_url.rstrip('/')}/player_api.php",
+                        params={"username": acc.username, "password": acc.password},
+                        timeout=self.PROVIDER_CHECK_TIMEOUT_SECS,
+                    )
+                    if resp.status_code == 200:
+                        entry["status"] = "ok"
+                        entry["message"] = "HTTP 200"
+                    else:
+                        entry["status"] = "error"
+                        entry["message"] = f"HTTP {resp.status_code}"
+                except Exception as e:
+                    entry["status"] = "error"
+                    entry["message"] = str(e)[:200]
+            else:
+                # Fall back to whatever Dispatcharr's own last refresh found.
+                entry["status"] = "ok" if acc.status == "success" else (
+                    "unknown" if acc.status in ("idle", "pending_setup") else "error"
+                )
+                entry["message"] = acc.last_message or acc.get_status_display()
+            results.append(entry)
+
+        self._provider_status = results
+        errors = [r["name"] for r in results if r["status"] == "error"]
+        if errors:
+            logger.warning(f"Provider health check: {len(errors)} provider(s) failing: {errors}")
 
     def get_plex_sessions(self, settings):
         plex_url = settings.get("plex_url", "")
@@ -3869,15 +4014,59 @@ class BridgeCore:
         # concurrent /refresh call, and Plex's scanner does not coalesce
         # overlapping scans of the same or different sections cleanly.
         with self._plex_scan_lock:
+            for attempt in range(2):
+                try:
+                    resp = requests.get(
+                        f"{plex_url}/library/sections/{section}/refresh",
+                        headers={"X-Plex-Token": plex_token},
+                        timeout=10,
+                    )
+                    if resp.status_code not in (200, 204):
+                        logger.error(f"Plex scan trigger failed: section {section} returned HTTP {resp.status_code}")
+                        self._log_diagnostic("error", f"_trigger_plex_scan: section={section} HTTP {resp.status_code}: {resp.text[:200]}")
+                        return False
+                except Exception as e:
+                    logger.error(f"Plex scan failed: {e}")
+                    self._log_diagnostic("error", f"_trigger_plex_scan: section={section} exception {type(e).__name__}: {str(e)[:150]}")
+                    return False
+
+                # Plex can return 200 for /refresh without actually queuing a
+                # scan (observed live: silently no-opped while unrelated
+                # "provider.subscription.refresh" activities sat stuck at
+                # 50%). Confirm a library.update.section activity for this
+                # section actually shows up in /activities before trusting
+                # the 200 -- if not, retry once.
+                if self._confirm_plex_scan_queued(plex_url, plex_token, section):
+                    logger.info(f"Plex library scan triggered and confirmed queued (section {section})")
+                    return True
+                self._log_diagnostic("warn", f"_trigger_plex_scan: section={section} refresh returned 200 but no scan activity appeared (attempt {attempt + 1}/2)")
+                time.sleep(2)
+
+            logger.error(f"Plex scan trigger for section {section} returned 200 but never queued a scan after retry")
+            self._log_diagnostic("error", f"_trigger_plex_scan: section={section} gave up after retry, scan never queued")
+            return False
+
+    def _confirm_plex_scan_queued(self, plex_url, plex_token, section):
+        """Poll /activities briefly for a library.update.section activity
+        matching this section, confirming Plex actually queued the scan
+        rather than silently no-opping the /refresh call."""
+        deadline = time.time() + 6
+        while time.time() < deadline:
             try:
-                requests.get(
-                    f"{plex_url}/library/sections/{section}/refresh",
-                    headers={"X-Plex-Token": plex_token},
-                    timeout=10,
+                resp = requests.get(
+                    f"{plex_url}/activities",
+                    headers={"X-Plex-Token": plex_token, "Accept": "application/json"},
+                    timeout=5,
                 )
-                logger.info(f"Plex library scan triggered (section {section})")
-            except Exception as e:
-                logger.error(f"Plex scan failed: {e}")
+                if resp.status_code == 200:
+                    activities = resp.json().get("MediaContainer", {}).get("Activity", [])
+                    for act in activities:
+                        if act.get("type") == "library.update.section" and str(act.get("Context", {}).get("librarySectionID")) == str(section):
+                            return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
 
     def _plex_delete_movies(self, movie_ids):
         plex_url = self.settings.get("plex_url", "")
@@ -3898,8 +4087,8 @@ class BridgeCore:
 
             items = resp.json().get("MediaContainer", {}).get("Metadata", [])
             id_set = {str(mid) for mid in movie_ids}
-            removed = 0
 
+            to_delete = []
             for item in items:
                 parts = item.get("Media", [{}])[0].get("Part", [])
                 for part in parts:
@@ -3908,20 +4097,11 @@ class BridgeCore:
                     if not m:
                         m = re.search(r'\[(\d+)\]\.(mkv|mp4)$', filename)
                     if m and m.group(1) in id_set:
-                        rating_key = item.get("ratingKey")
-                        title = item.get("title", "?")
-                        del_resp = requests.delete(
-                            f"{plex_url}/library/metadata/{rating_key}",
-                            params={"X-Plex-Token": plex_token},
-                            timeout=10,
-                        )
-                        if del_resp.status_code in (200, 204):
-                            removed += 1
-                            logger.info(f"Plex: deleted {title} (key {rating_key})")
-                        else:
-                            logger.warning(f"Plex delete {title} returned {del_resp.status_code}")
+                        to_delete.append((item.get("ratingKey"), item.get("title", "?")))
                         break
 
+            # v2.4.2: parallelized -- see _plex_delete_batch docstring.
+            removed = self._plex_delete_batch(plex_url, plex_token, to_delete, "movie")
             logger.info(f"Plex cleanup: removed {removed} items")
             return removed
         except Exception as e:

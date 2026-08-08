@@ -8,3 +8,4 @@ __pycache__/
 logs/
 .share.notes/
 *.code-workspace
+*.zip

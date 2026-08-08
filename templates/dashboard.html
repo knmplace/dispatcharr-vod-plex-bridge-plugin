@@ -289,7 +289,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .health-dot.ok { background: var(--green); }
 .health-dot.error { background: var(--red); }
-.health-dot.unconfigured { background: var(--text2); }
+.health-dot.unconfigured, .health-dot.unknown { background: var(--text2); }
 
 /* Toasts */
 #toastStack { position: fixed; bottom: 1rem; right: 1rem; z-index: 999; display: flex; flex-direction: column; gap: 0.5rem; max-width: 360px; }
@@ -985,6 +985,7 @@ async function activateSeriesSelected(btnEl) {
     }
     clearAllSeriesSelections();
     loadSummary();
+    loadSeries(seriesCurrentPage);
   } catch (e) {
     showToast('Activate failed', String(e), 'error');
   } finally {
@@ -1009,6 +1010,7 @@ async function deactivateSeriesSelected(btnEl) {
     }
     clearAllSeriesSelections();
     loadSummary();
+    loadSeries(seriesCurrentPage);
   } catch (e) {
     showToast('Deactivate failed', String(e), 'error');
   } finally {
@@ -1033,6 +1035,7 @@ async function reactivateSeriesSelected(btnEl) {
     }
     clearAllSeriesSelections();
     loadSummary();
+    loadSeries(seriesCurrentPage);
   } catch (e) {
     showToast('Reactivate failed', String(e), 'error');
   } finally {
@@ -1988,12 +1991,30 @@ async function loadHealth() {
   const data = await api('/api/health');
   const body = document.getElementById('healthBody');
   const h = data.health || {};
-  body.innerHTML = Object.entries(h).map(([k, v]) => {
+  let rows = Object.entries(h).map(([k, v]) => {
     const cls = v.status || 'error';
     const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     const msg = v.message ? ` — ${v.message}` : v.http_status ? ` — HTTP ${v.http_status}` : '';
     return `<div class="health-item"><span><span class="health-dot ${cls}"></span>${label}</span><span style="font-size:0.75rem;color:var(--text2)">${v.status}${msg}</span></div>`;
-  }).join('');
+  });
+
+  const providers = data.providers || [];
+  rows = rows.concat(providers.map(p => {
+    const cls = p.status || 'error';
+    const msg = p.message ? ` — ${escapeHtml(p.message)}` : '';
+    return `<div class="health-item"><span><span class="health-dot ${cls}"></span>${escapeHtml(p.name)}</span><span style="font-size:0.75rem;color:var(--text2)">${p.status}${msg}</span></div>`;
+  }));
+
+  if (providers.length) {
+    const checkedLabel = data.providers_checked_at ? timeAgo(data.providers_checked_at) : 'never';
+    rows.push(`<div class="health-item" style="opacity:0.7;"><span style="font-size:0.72rem;">Providers last checked</span><span style="font-size:0.72rem;color:var(--text2)">${checkedLabel} (every 8h)</span></div>`);
+  }
+
+  if (data.external_ip) {
+    rows.push(`<div class="health-item"><span><span class="health-dot ok"></span>External IP</span><span style="font-size:0.75rem;color:var(--text2)">${escapeHtml(data.external_ip)}</span></div>`);
+  }
+
+  body.innerHTML = rows.join('');
 
   renderMaintenance(data.maintenance || {});
 }
