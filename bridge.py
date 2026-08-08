@@ -1888,6 +1888,7 @@ class BridgeCore:
                 "finished_at": None,
                 "activated": [],
                 "activated_names": [],
+                "series_names": [],
                 "failed": [],
                 "failed_names": [],
                 "strm_generated": 0,
@@ -2076,6 +2077,7 @@ class BridgeCore:
 
         activated = []
         activated_names = []
+        series_names = []
         failed = []
         failed_names = []
 
@@ -2167,6 +2169,8 @@ class BridgeCore:
                 }
                 activated.append(eid)
                 activated_names.append(f"{episode.series.name} S{episode.season_number:02d}E{episode.episode_number:02d}")
+                if episode.series.name not in series_names:
+                    series_names.append(episode.series.name)
                 self._log_diagnostic("info",
                     f"Episode {eid}: activated (provider={provider_name}, current_streams={current_streams})")
             except Exception as e:
@@ -2231,6 +2235,9 @@ class BridgeCore:
 
         job["activated"].extend(activated)
         job["activated_names"].extend(activated_names)
+        for sn in series_names:
+            if sn not in job["series_names"]:
+                job["series_names"].append(sn)
         job["failed"].extend(failed)
         job["failed_names"].extend(failed_names)
         job["strm_generated"] += strm_count
@@ -2655,8 +2662,12 @@ class BridgeCore:
 
                 to_delete = []
                 for item in items:
+                    # series_name in `wanted` is filesystem-sanitized (STRM
+                    # folder naming strips ':' etc.), so sanitize Plex's raw
+                    # grandparentTitle the same way -- same fix as
+                    # _fetch_plex_episode_sizes's colon-title matching bug.
                     key = (
-                        item.get("grandparentTitle", ""),
+                        self._clean_title(item.get("grandparentTitle", "")),
                         str(item.get("parentIndex", "")),
                         str(item.get("index", "")),
                     )
@@ -2840,7 +2851,13 @@ class BridgeCore:
                 items = resp.json().get("MediaContainer", {}).get("Metadata", [])
                 by_key = {}
                 for it in items:
-                    key = (it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index"))
+                    # entry["series_name"] is filesystem-sanitized (STRM
+                    # folder naming strips characters like ':' that Plex's
+                    # raw grandparentTitle keeps -- e.g. "Alert: Missing
+                    # Persons Unit" vs "Alert Missing Persons Unit"), so
+                    # sanitize Plex's title the same way here to keep the
+                    # match symmetric, rather than ever matching raw.
+                    key = (self._clean_title(it.get("grandparentTitle", "")), it.get("parentIndex"), it.get("index"))
                     by_key[key] = it
 
                 found_count = 0
@@ -3060,7 +3077,11 @@ class BridgeCore:
                     continue
 
                 items = resp.json().get("MediaContainer", {}).get("Metadata", [])
-                by_title = {it.get("title", ""): it for it in items}
+                # series_clean_title is filesystem-sanitized (e.g. colons
+                # stripped for STRM folder naming), so sanitize Plex's raw
+                # title the same way here -- same fix as
+                # _fetch_plex_episode_sizes's grandparentTitle matching.
+                by_title = {self._clean_title(it.get("title", "")): it for it in items}
 
                 for sid, entry in pairs:
                     item = by_title.get(entry.get("series_clean_title", ""))
@@ -4014,59 +4035,65 @@ class BridgeCore:
         # concurrent /refresh call, and Plex's scanner does not coalesce
         # overlapping scans of the same or different sections cleanly.
         with self._plex_scan_lock:
-            for attempt in range(2):
-                try:
-                    resp = requests.get(
-                        f"{plex_url}/library/sections/{section}/refresh",
-                        headers={"X-Plex-Token": plex_token},
-                        timeout=10,
-                    )
-                    if resp.status_code not in (200, 204):
-                        logger.error(f"Plex scan trigger failed: section {section} returned HTTP {resp.status_code}")
-                        self._log_diagnostic("error", f"_trigger_plex_scan: section={section} HTTP {resp.status_code}: {resp.text[:200]}")
+            # Plex can queue a library.update.section activity immediately
+            # (satisfying a naive "did it appear" check) but then never
+            # actually run it if unrelated activities -- observed live:
+            # "provider.subscription.refresh" entries stuck at
+            # completed:1/total:2 -- are occupying its task queue. So this
+            # nudges /refresh repeatedly (not just once) and confirms
+            # completion via the section's actual item count going up,
+            # rather than trusting that a scan activity merely appeared.
+            baseline_count = self._get_plex_section_item_count(plex_url, plex_token, section)
+            deadline = time.time() + 45
+            nudge_interval = 8
+            last_nudge = 0
+            while time.time() < deadline:
+                if time.time() - last_nudge >= nudge_interval:
+                    try:
+                        resp = requests.get(
+                            f"{plex_url}/library/sections/{section}/refresh",
+                            headers={"X-Plex-Token": plex_token},
+                            timeout=10,
+                        )
+                        if resp.status_code not in (200, 204):
+                            logger.error(f"Plex scan trigger failed: section {section} returned HTTP {resp.status_code}")
+                            self._log_diagnostic("error", f"_trigger_plex_scan: section={section} HTTP {resp.status_code}: {resp.text[:200]}")
+                            return False
+                    except Exception as e:
+                        logger.error(f"Plex scan failed: {e}")
+                        self._log_diagnostic("error", f"_trigger_plex_scan: section={section} exception {type(e).__name__}: {str(e)[:150]}")
                         return False
-                except Exception as e:
-                    logger.error(f"Plex scan failed: {e}")
-                    self._log_diagnostic("error", f"_trigger_plex_scan: section={section} exception {type(e).__name__}: {str(e)[:150]}")
-                    return False
+                    last_nudge = time.time()
 
-                # Plex can return 200 for /refresh without actually queuing a
-                # scan (observed live: silently no-opped while unrelated
-                # "provider.subscription.refresh" activities sat stuck at
-                # 50%). Confirm a library.update.section activity for this
-                # section actually shows up in /activities before trusting
-                # the 200 -- if not, retry once.
-                if self._confirm_plex_scan_queued(plex_url, plex_token, section):
-                    logger.info(f"Plex library scan triggered and confirmed queued (section {section})")
-                    return True
-                self._log_diagnostic("warn", f"_trigger_plex_scan: section={section} refresh returned 200 but no scan activity appeared (attempt {attempt + 1}/2)")
+                if baseline_count is not None:
+                    current_count = self._get_plex_section_item_count(plex_url, plex_token, section)
+                    if current_count is not None and current_count > baseline_count:
+                        logger.info(f"Plex library scan triggered and confirmed (section {section}, {baseline_count} -> {current_count} items)")
+                        self._log_diagnostic("info", f"_trigger_plex_scan: section={section} item count increased {baseline_count} -> {current_count}")
+                        return True
                 time.sleep(2)
 
-            logger.error(f"Plex scan trigger for section {section} returned 200 but never queued a scan after retry")
-            self._log_diagnostic("error", f"_trigger_plex_scan: section={section} gave up after retry, scan never queued")
+            logger.error(f"Plex scan trigger for section {section} never completed within 45s")
+            self._log_diagnostic("error", f"_trigger_plex_scan: section={section} gave up, item count never increased after 45s")
             return False
 
-    def _confirm_plex_scan_queued(self, plex_url, plex_token, section):
-        """Poll /activities briefly for a library.update.section activity
-        matching this section, confirming Plex actually queued the scan
-        rather than silently no-opping the /refresh call."""
-        deadline = time.time() + 6
-        while time.time() < deadline:
-            try:
-                resp = requests.get(
-                    f"{plex_url}/activities",
-                    headers={"X-Plex-Token": plex_token, "Accept": "application/json"},
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    activities = resp.json().get("MediaContainer", {}).get("Activity", [])
-                    for act in activities:
-                        if act.get("type") == "library.update.section" and str(act.get("Context", {}).get("librarySectionID")) == str(section):
-                            return True
-            except Exception:
-                pass
-            time.sleep(1)
-        return False
+    def _get_plex_section_item_count(self, plex_url, plex_token, section):
+        """Returns the current total item (leaf) count for a Plex library
+        section, or None on any error. Used to confirm a triggered scan
+        actually ran to completion rather than trusting the /refresh HTTP
+        response or a transient scan activity entry."""
+        try:
+            resp = requests.get(
+                f"{plex_url}/library/sections/{section}/all",
+                headers={"X-Plex-Token": plex_token, "Accept": "application/json"},
+                params={"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 0},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("MediaContainer", {}).get("totalSize")
+        except Exception:
+            pass
+        return None
 
     def _plex_delete_movies(self, movie_ids):
         plex_url = self.settings.get("plex_url", "")

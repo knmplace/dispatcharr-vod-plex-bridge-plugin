@@ -46,9 +46,13 @@ a { color: var(--accent); text-decoration: none; }
   .mode-toggle { order: 3; width: 100%; justify-content: center; }
 }
 
-/* Live activation status pill — shown only while an activation job is
-   queued/running, so the dashboard makes clear something is still working
-   in the background instead of looking idle/stuck (see bead vpv). */
+/* Live activation status pills — one per queued/running/plex-scanning
+   activation job, shown side by side, so the dashboard makes clear
+   something is still working in the background instead of looking idle/
+   stuck (see bead vpv), and a second activation started while an earlier
+   one is still confirming in Plex gets its OWN pill instead of clobbering
+   the first job's stats. */
+.activation-stack { display: flex; align-items: center; gap: 0.5rem; position: relative; }
 .activation-status {
   display: flex; align-items: center; gap: 0.6rem;
   background: var(--surface2); border: 1.5px solid var(--accent); border-radius: 999px;
@@ -65,11 +69,12 @@ a { color: var(--accent); text-decoration: none; }
 }
 .activation-status.has-error .activation-dot { background: #e5484d; animation: none; }
 .activation-status.plex-phase .activation-dot { background: #a855f7; }
+.activation-job-label { font-weight: 700; color: var(--text); white-space: nowrap; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
 .activation-label { font-weight: 700; color: var(--text); white-space: nowrap; }
 .activation-status.has-error .activation-label { color: #e5484d; }
 .activation-status.plex-phase .activation-label { color: #a855f7; }
 .activation-progress {
-  width: 84px; height: 5px; border-radius: 3px; background: var(--border);
+  width: 64px; height: 5px; border-radius: 3px; background: var(--border);
   overflow: hidden; flex-shrink: 0;
 }
 .activation-progress-bar {
@@ -80,6 +85,21 @@ a { color: var(--accent); text-decoration: none; }
 .activation-status.plex-phase .activation-progress-bar { background: #a855f7; }
 .activation-count { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
 .activation-elapsed { font-variant-numeric: tabular-nums; color: var(--text2); white-space: nowrap; }
+.activation-overflow-toggle {
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface2); border: 1.5px solid var(--border); border-radius: 999px;
+  padding: 0.45rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: var(--text2);
+  cursor: pointer; white-space: nowrap;
+}
+.activation-overflow-toggle:hover { color: var(--text); border-color: var(--accent); }
+.activation-overflow-menu {
+  display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 200;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35); padding: 0.4rem; min-width: 240px;
+  flex-direction: column; gap: 0.4rem;
+}
+.activation-overflow-menu.open { display: flex; }
+.activation-overflow-menu .activation-status { width: 100%; justify-content: flex-start; }
 @keyframes activation-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(0.7); }
@@ -89,7 +109,7 @@ a { color: var(--accent); text-decoration: none; }
   to { opacity: 1; transform: translateY(0); }
 }
 @media (max-width: 768px) {
-  .activation-status { order: 4; width: 100%; justify-content: center; }
+  .activation-stack { order: 4; width: 100%; justify-content: center; flex-wrap: wrap; }
 }
 
 /* Tabs */
@@ -358,13 +378,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="mode-btn active" data-mode="movies" onclick="switchMode('movies')">Movies</div>
     <div class="mode-btn" data-mode="series" onclick="switchMode('series')">Series</div>
   </div>
-  <div class="activation-status" id="activationStatus" style="display:none;">
-    <span class="activation-dot"></span>
-    <span class="activation-label" id="activationLabel">Activating…</span>
-    <span class="activation-progress"><span class="activation-progress-bar" id="activationProgressBar"></span></span>
-    <span class="activation-count" id="activationCount">0/0</span>
-    <span class="activation-elapsed" id="activationElapsed">0:00</span>
-  </div>
+  <div class="activation-stack" id="activationStack" style="display:none;"></div>
   <div class="header-stats">
     <span>Catalog: <span class="stat-val" id="hdrTotal">-</span></span>
     <span>Movies Activated: <span class="stat-val" id="hdrActivated">-</span></span>
@@ -2256,13 +2270,19 @@ function toggleLogAutoRefresh() {
   }
 }
 
-// Live activation status pill — polls queued/running episode activation
-// jobs and shows a pulsing indicator + progress + elapsed time between
-// Movies/Series and the catalog stats, so a long series activation doesn't
-// look "stuck" while it drip-feeds in the background (see bead vpv). Hidden
-// entirely when nothing is queued/running.
+// Live activation status pills — polls queued/running/plex-scanning episode
+// activation jobs and renders one pill PER JOB (see bead vpv originally,
+// extended so a second activation started while an earlier one is still
+// "Confirming in Plex" gets its own pill instead of clobbering the first
+// job's stats). Each pill tracks its own job end-to-end: it appears as soon
+// as its job is created, shows "Activating..." while STRM/NFO generation is
+// in progress, then flips to "Confirming in Plex..." once that job's own
+// batches finish -- independently of any other job's phase. Up to 2 pills
+// show inline; anything beyond that collapses into a "+N more" dropdown.
+// The whole stack hides once nothing is queued/running/plex_scanning.
 let activationPollTimer = null;
 let activationKnownJobIds = new Set();
+const ACTIVATION_INLINE_LIMIT = 2;
 
 function formatElapsed(startedAt) {
   const secs = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
@@ -2271,25 +2291,59 @@ function formatElapsed(startedAt) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function activationJobLabel(job) {
+  // Prefer show names once episodes have actually landed (most useful,
+  // identifies exactly what's activating); fall back to the destination
+  // category name for jobs that haven't produced any names yet.
+  const names = job.series_names || [];
+  if (names.length === 1) return names[0];
+  if (names.length > 1) return `${names[0]} +${names.length - 1} more`;
+  return job.category_name || 'Episodes';
+}
+
+function renderActivationPill(job, phase) {
+  const isPlex = phase === 'plex_scanning';
+  const label = isPlex ? 'Confirming in Plex…' : 'Activating…';
+  const done = isPlex ? (job.plex_confirmed || 0) : (job.done || 0);
+  const total = job.total || 0;
+  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  const elapsed = job.started_at ? formatElapsed(job.started_at) : '0:00';
+  const jobLabel = activationJobLabel(job);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'activation-status' + (isPlex ? ' plex-phase' : '');
+  wrap.title = `${jobLabel} — ${label}`;
+  wrap.innerHTML = `
+    <span class="activation-dot"></span>
+    <span class="activation-job-label">${escapeHtml(jobLabel)}</span>
+    <span class="activation-label">${label}</span>
+    <span class="activation-progress"><span class="activation-progress-bar" style="width:${pct}%"></span></span>
+    <span class="activation-count">${done}/${total}</span>
+    <span class="activation-elapsed">${elapsed}</span>
+  `;
+  return wrap;
+}
+
 async function pollActivationStatus() {
-  const el = document.getElementById('activationStatus');
+  const stack = document.getElementById('activationStack');
   try {
     const data = await api('/api/episodes/activation-jobs');
     const jobs = data.jobs || [];
-    const active = jobs.filter(j => j.status === 'queued' || j.status === 'running');
-    const plexPhase = jobs.filter(j => j.status === 'plex_scanning');
+    const visible = jobs
+      .filter(j => j.status === 'queued' || j.status === 'running' || j.status === 'plex_scanning')
+      .sort((a, b) => (a.created_at || 0) - (b.created_at || 0)); // oldest first, newest slides in on the right
     const errored = jobs.filter(j => j.status === 'error' && !activationKnownJobIds.has('seen:' + j.job_id));
 
     // Surface a toast the first time we see a job land in "error" status,
     // then remember it so we don't re-toast on every subsequent poll.
     errored.forEach(j => {
-      showToast('Activation job failed', `"${j.category_name || 'destination'}" — job stopped, see Logs tab`, 'error');
+      showToast('Activation job failed', `"${activationJobLabel(j)}" — job stopped, see Logs tab`, 'error');
       activationKnownJobIds.add('seen:' + j.job_id);
     });
 
-    if (active.length === 0 && plexPhase.length === 0) {
-      el.style.display = 'none';
-      el.classList.remove('plex-phase');
+    if (visible.length === 0) {
+      stack.style.display = 'none';
+      stack.innerHTML = '';
       // A job just finished since the last poll — refresh header counts.
       if (activationKnownJobIds.has('running')) {
         activationKnownJobIds.delete('running');
@@ -2298,47 +2352,40 @@ async function pollActivationStatus() {
       return;
     }
     activationKnownJobIds.add('running');
-    el.style.display = 'flex';
-    el.classList.remove('has-error');
+    stack.style.display = 'flex';
 
-    if (active.length > 0) {
-      // Our own batch-processing phase: STRM/NFO generation + per-batch scan trigger.
-      el.classList.remove('plex-phase');
-      const running = active.find(j => j.status === 'running') || active[0];
-      const totalDone = active.reduce((sum, j) => sum + (j.done || 0), 0);
-      const totalCount = active.reduce((sum, j) => sum + (j.total || 0), 0);
-      const pct = totalCount > 0 ? Math.min(100, (totalDone / totalCount) * 100) : 0;
-      const queuedBehind = active.length - 1;
+    const inline = visible.slice(0, ACTIVATION_INLINE_LIMIT);
+    const overflow = visible.slice(ACTIVATION_INLINE_LIMIT);
 
-      document.getElementById('activationLabel').textContent = queuedBehind > 0
-        ? `Activating (+${queuedBehind} queued)…`
-        : 'Activating…';
-      document.getElementById('activationProgressBar').style.width = pct + '%';
-      document.getElementById('activationCount').textContent = `${totalDone}/${totalCount}`;
-      document.getElementById('activationElapsed').textContent = running.started_at
-        ? formatElapsed(running.started_at)
-        : '0:00';
-    } else {
-      // All of our own batches are done; Plex is still analyzing the files
-      // in the background (library scan / HEAD probes). Keep the pill up
-      // with a live confirmed/pending count so it doesn't look "stuck".
-      el.classList.add('plex-phase');
-      const totalConfirmed = plexPhase.reduce((sum, j) => sum + (j.plex_confirmed || 0), 0);
-      const totalCount = plexPhase.reduce((sum, j) => sum + (j.total || 0), 0);
-      const pct = totalCount > 0 ? Math.min(100, (totalConfirmed / totalCount) * 100) : 0;
-      const oldest = plexPhase.reduce((a, b) => (a.started_at || 0) < (b.started_at || 0) ? a : b);
+    stack.innerHTML = '';
+    inline.forEach(job => {
+      stack.appendChild(renderActivationPill(job, job.status === 'plex_scanning' ? 'plex_scanning' : 'active'));
+    });
 
-      document.getElementById('activationLabel').textContent = 'Confirming in Plex…';
-      document.getElementById('activationProgressBar').style.width = pct + '%';
-      document.getElementById('activationCount').textContent = `${totalConfirmed}/${totalCount}`;
-      document.getElementById('activationElapsed').textContent = oldest.started_at
-        ? formatElapsed(oldest.started_at)
-        : '0:00';
+    if (overflow.length > 0) {
+      const toggle = document.createElement('div');
+      toggle.className = 'activation-overflow-toggle';
+      toggle.textContent = `+${overflow.length} more`;
+      const menu = document.createElement('div');
+      menu.className = 'activation-overflow-menu';
+      overflow.forEach(job => {
+        menu.appendChild(renderActivationPill(job, job.status === 'plex_scanning' ? 'plex_scanning' : 'active'));
+      });
+      toggle.onclick = (e) => { e.stopPropagation(); menu.classList.toggle('open'); };
+      const holder = document.createElement('div');
+      holder.style.position = 'relative';
+      holder.appendChild(toggle);
+      holder.appendChild(menu);
+      stack.appendChild(holder);
     }
   } catch (e) {
     console.error('pollActivationStatus failed', e);
   }
 }
+
+document.addEventListener('click', () => {
+  document.querySelectorAll('.activation-overflow-menu.open').forEach(m => m.classList.remove('open'));
+});
 
 function startActivationStatusPolling() {
   pollActivationStatus();
