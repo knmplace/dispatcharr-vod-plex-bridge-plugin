@@ -632,7 +632,10 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="panel">
       <div class="panel-header">
         <span>System Health</span>
-        <button class="btn btn-outline btn-sm" onclick="loadHealth()">Refresh</button>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn btn-outline btn-sm" onclick="forceRefreshProviders()">Force Refresh Providers</button>
+          <button class="btn btn-outline btn-sm" onclick="loadHealth()">Refresh</button>
+        </div>
       </div>
       <div class="panel-body" id="healthBody">
         <div class="loading"><span class="spinner"></span> Checking...</div>
@@ -1919,6 +1922,24 @@ function stopStreamRefresh() {
 function downloadBugReport() {
   const hours = document.getElementById('bugReportHours').value;
   window.location.href = `${BASE}/api/bug-report?hours=${encodeURIComponent(hours)}`;
+}
+
+async function forceRefreshProviders() {
+  const btn = event.target;
+  const originalText = btn.textContent;
+  btn.textContent = 'Checking...';
+  btn.disabled = true;
+  try {
+    await api('/api/health/refresh-providers', 'POST');
+    await new Promise(r => setTimeout(r, 500));
+    await loadHealth();
+    btn.textContent = originalText;
+    btn.disabled = false;
+  } catch (e) {
+    btn.textContent = 'Error';
+    btn.disabled = false;
+    console.error('Provider refresh failed:', e);
+  }
 }
 
 // Health

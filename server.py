@@ -252,6 +252,10 @@ def _dispatch(environ, start_response, server, bridge, settings):
     if path == "/api/health" and method == "GET":
         return _json_response(start_response, bridge.health_check(settings))
 
+    if path == "/api/health/refresh-providers" and method == "POST":
+        bridge._check_all_providers()
+        return _json_response(start_response, {"status": "ok", "message": "Provider health check triggered"})
+
     if path == "/api/plex/sessions" and method == "GET":
         return _json_response(start_response, bridge.get_plex_sessions(settings))
 

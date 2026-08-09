@@ -3809,6 +3809,12 @@ class BridgeCore:
                         f"{acc.server_url.rstrip('/')}/player_api.php",
                         params={"username": acc.username, "password": acc.password},
                         timeout=self.PROVIDER_CHECK_TIMEOUT_SECS,
+                        # Some providers front their XC API with Cloudflare
+                        # rules that 520 any request lacking a browser-like
+                        # User-Agent (observed live: AMBER BABY 1 -- Dispatcharr's
+                        # own XC client always sends one and succeeds against
+                        # the same endpoint/credentials). Match that default.
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
                     )
                     if resp.status_code == 200:
                         entry["status"] = "ok"
