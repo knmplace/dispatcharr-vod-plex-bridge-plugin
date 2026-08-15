@@ -4301,13 +4301,21 @@ class BridgeCore:
 
         return count
 
-    # Provider category tag at the start of a stored name, for example
-    # "EN - ", "4K-EN - ", "NF - ", "A+ - ". Dispatcharr keeps these as part
-    # of Movie.name and Series.name. Leaving one in the generated filename
-    # stops Plex identifying the title.
+    # (code note: category-prefix stripping below is from PR #2, PiratesIRC)
+    # Provider category tag at the start of a stored name, e.g. "EN - ",
+    # "4K-EN - ", "NF - ", "A+ - ". Some providers keep these as part of
+    # Movie.name/Series.name. Leaving one in the generated filename stops
+    # Plex identifying the title.
     _CATEGORY_PREFIX = re.compile(r"^([A-Z0-9+]{1,5}(?:-[A-Z0-9+]{1,5})?)\s+-\s+")
 
     def _clean_title(self, name):
+        # (code note: from PR #2 -- guard tightened after live data showed a
+        # false-positive: "2LDK - 2003" is a real film title (2LDK, 2003),
+        # not a tagged title. Stripping left only the bare year "2003",
+        # which is never a valid title on its own -- a real category tag is
+        # always followed by an actual title, not just a date. Rejecting
+        # strips that leave nothing but a year closes that case without
+        # narrowing the tags the prefix still catches.)
         prefix_match = self._CATEGORY_PREFIX.match(name or "")
         if prefix_match:
             tag = prefix_match.group(1)
@@ -4318,7 +4326,9 @@ class BridgeCore:
             # starts with a number and a dash ("9 - ...", "300 - ...")
             # intact.
             if letters >= 2 or (letters >= 1 and "+" in tag):
-                name = name[prefix_match.end():]
+                remainder = name[prefix_match.end():].strip()
+                if not re.fullmatch(r"\(?\d{4}\)?", remainder):
+                    name = name[prefix_match.end():]
         name = re.sub(r"\s*\[.*?\]", "", name)
         name = re.sub(r"\s*\((?:4K|HDR|UHD|FHD|HD|SD)\)", "", name, flags=re.I)
         name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
