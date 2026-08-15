@@ -4301,7 +4301,24 @@ class BridgeCore:
 
         return count
 
+    # Provider category tag at the start of a stored name, for example
+    # "EN - ", "4K-EN - ", "NF - ", "A+ - ". Dispatcharr keeps these as part
+    # of Movie.name and Series.name. Leaving one in the generated filename
+    # stops Plex identifying the title.
+    _CATEGORY_PREFIX = re.compile(r"^([A-Z0-9+]{1,5}(?:-[A-Z0-9+]{1,5})?)\s+-\s+")
+
     def _clean_title(self, name):
+        prefix_match = self._CATEGORY_PREFIX.match(name or "")
+        if prefix_match:
+            tag = prefix_match.group(1)
+            letters = sum(ch.isalpha() for ch in tag)
+            # Two letters covers the film tags (EN, NF, TOP, 4K-EN). One
+            # letter plus a plus sign covers the series tags (A+, P+, D+,
+            # 4K-A+). Requiring at least one letter keeps a title that
+            # starts with a number and a dash ("9 - ...", "300 - ...")
+            # intact.
+            if letters >= 2 or (letters >= 1 and "+" in tag):
+                name = name[prefix_match.end():]
         name = re.sub(r"\s*\[.*?\]", "", name)
         name = re.sub(r"\s*\((?:4K|HDR|UHD|FHD|HD|SD)\)", "", name, flags=re.I)
         name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
