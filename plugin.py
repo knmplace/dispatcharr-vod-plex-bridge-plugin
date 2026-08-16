@@ -107,6 +107,22 @@ class Plugin:
     def stop(self, context):
         log = context.get("logger", logger)
         log.info("VOD To Plex plugin stopping...")
+        # Only stop a server THIS process started.
+        #
+        # Dispatcharr runs plugin discovery in worker_process_init, so every
+        # new Celery prefork child triggers a forced reload, which unloads the
+        # plugin and calls this method. Without this guard, a process that
+        # never started the server falls through to the remote shutdown path
+        # in _do_stop_server and kills a healthy server owned by another
+        # worker. With --autoscale that happens every few minutes.
+        #
+        # A deliberate Stop Server click is unaffected: it calls
+        # _stop_server(), not this method.
+        with _server_lock:
+            owns_server = _server_instance is not None
+        if not owns_server:
+            log.info("VOD To Plex: unload in a process that does not own the server; leaving it running")
+            return
         settings = context.get("settings", {})
         self._do_stop_server(log, settings)
 
