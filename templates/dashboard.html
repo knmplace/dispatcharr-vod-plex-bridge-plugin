@@ -31,8 +31,9 @@ a { color: var(--accent); text-decoration: none; }
 
 /* Header */
 .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0.6rem 1.2rem; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; }
-.header h1 { font-size: 1.1rem; font-weight: 600; }
+.header h1 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }
 .header h1 span { color: var(--accent); }
+.header-logo { width: 28px; height: 28px; border-radius: 6px; object-fit: cover; }
 .header-stats { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text2); }
 .header-stats .stat-val { color: var(--text); font-weight: 600; }
 
@@ -373,7 +374,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 </div>
 
 <div class="header">
-  <h1><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v{{PLUGIN_VERSION}}</span></h1>
+  <h1><img src="/logo.png" alt="" class="header-logo"><span>VOD</span> To Plex <span style="font-size:0.7rem;color:var(--text2);font-weight:400;">plugin v{{PLUGIN_VERSION}}</span></h1>
   <div class="mode-toggle" id="modeToggle">
     <div class="mode-btn active" data-mode="movies" onclick="switchMode('movies')">Movies</div>
     <div class="mode-btn" data-mode="series" onclick="switchMode('series')">Series</div>
