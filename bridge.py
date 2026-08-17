@@ -2650,8 +2650,14 @@ class BridgeCore:
                     continue
 
                 items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+                # series_name is frozen at activation time -- if _clean_title()'s
+                # rules changed since then (e.g. PR #2's category-prefix strip),
+                # a pre-change stored name no longer matches grandparentTitle
+                # below (which is always cleaned with TODAY's rules), so the
+                # Plex delete silently matches 0 items. Re-clean here so both
+                # sides always use the same, current logic.
                 wanted = {
-                    (e.get("series_name", ""), str(e.get("season_number", "")), str(e.get("episode_number", "")))
+                    (self._clean_title(e.get("series_name", "")), str(e.get("season_number", "")), str(e.get("episode_number", "")))
                     for e in entries
                 }
                 logger.info(f"Plex episode delete: wanted={wanted}")
