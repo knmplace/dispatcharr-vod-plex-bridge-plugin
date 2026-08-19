@@ -272,6 +272,17 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.activate_movies(body))
 
+    if path == "/api/movies/activate-async" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.activate_movies_async(body))
+
+    if path == "/api/movies/activation-jobs" and method == "GET":
+        return _json_response(start_response, bridge.list_movie_jobs())
+
+    if re.match(r"^/api/movies/activation-jobs/[^/]+$", path) and method == "GET":
+        job_id = path.split("/")[-1]
+        return _json_response(start_response, bridge.get_movie_job_status(job_id))
+
     if path == "/api/movies/deactivate" and method == "POST":
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.deactivate_movies(body))

@@ -1452,6 +1452,31 @@ async function runMovieAction(btnEl, path, movieIds, verb) {
   }
 }
 
+// Queues movie activation as a background job (pill + Plex-confirmed toast
+// handled by pollActivationStatus()/renderActivationPill()) instead of
+// blocking on the full synchronous activate_movies() response. The old
+// synchronous /api/movies/activate stays reachable via runMovieAction()
+// for any other caller.
+async function queueMovieActivation(btnEl, movieIds) {
+  if (btnEl) btnEl.classList.add('is-busy');
+  try {
+    const data = await api('/api/movies/activate-async', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ movie_ids: movieIds }),
+    });
+    if (data.status === 'error') {
+      showToast('Activate failed', data.message || 'Unknown error', 'error');
+    }
+    return data;
+  } catch (e) {
+    showToast('Activate failed', String(e), 'error');
+    throw e;
+  } finally {
+    if (btnEl) btnEl.classList.remove('is-busy');
+  }
+}
+
 function updateStickyOffsets() {
   const header = document.querySelector('.header');
   const tabs = document.querySelector('.tabs');
@@ -1817,7 +1842,7 @@ async function quickActivate(id, isActive, btnEl) {
   if (isActive) {
     await runMovieAction(btnEl, '/api/movies/deactivate', [id], 'Deactivate');
   } else {
-    await runMovieAction(btnEl, '/api/movies/activate', [id], 'Activate');
+    await queueMovieActivation(btnEl, [id]);
   }
   loadMovies(currentPage);
   loadSummary();
@@ -1825,7 +1850,7 @@ async function quickActivate(id, isActive, btnEl) {
 
 async function activateSelected(btnEl) {
   if (selectedMovies.size === 0) return;
-  await runMovieAction(btnEl, '/api/movies/activate', [...selectedMovies], 'Activate');
+  await queueMovieActivation(btnEl, [...selectedMovies]);
   selectedMovies.clear();
   loadMovies(currentPage);
   loadSummary();
@@ -2314,12 +2339,13 @@ function formatElapsed(startedAt) {
 }
 
 function activationJobLabel(job) {
-  // Prefer show names once episodes have actually landed (most useful,
-  // identifies exactly what's activating); fall back to the destination
-  // category name for jobs that haven't produced any names yet.
-  const names = job.series_names || [];
+  // Prefer show/movie names once items have actually landed (most useful,
+  // identifies exactly what's activating); fall back to a generic label
+  // for jobs that haven't produced any names yet.
+  const names = job.series_names || job.movie_names || [];
   if (names.length === 1) return names[0];
   if (names.length > 1) return `${names[0]} +${names.length - 1} more`;
+  if (job._kind === 'movie') return job.category_name || 'Movies';
   return job.category_name || 'Episodes';
 }
 
@@ -2349,18 +2375,37 @@ function renderActivationPill(job, phase) {
 async function pollActivationStatus() {
   const stack = document.getElementById('activationStack');
   try {
-    const data = await api('/api/episodes/activation-jobs');
-    const jobs = data.jobs || [];
+    const [episodeData, movieData] = await Promise.all([
+      api('/api/episodes/activation-jobs'),
+      api('/api/movies/activation-jobs'),
+    ]);
+    // Job ids are per-endpoint counters, so both sources can produce "1" --
+    // tag with a source-prefixed key so pills/toasts never collide.
+    const episodeJobs = (episodeData.jobs || []).map(j => ({ ...j, _kind: 'episode', _key: 'ep:' + j.job_id }));
+    const movieJobs = (movieData.jobs || []).map(j => ({ ...j, _kind: 'movie', _key: 'mv:' + j.job_id }));
+    const jobs = episodeJobs.concat(movieJobs);
     const visible = jobs
       .filter(j => j.status === 'queued' || j.status === 'running' || j.status === 'plex_scanning')
       .sort((a, b) => (a.created_at || 0) - (b.created_at || 0)); // oldest first, newest slides in on the right
-    const errored = jobs.filter(j => j.status === 'error' && !activationKnownJobIds.has('seen:' + j.job_id));
+    const errored = jobs.filter(j => j.status === 'error' && !activationKnownJobIds.has('seen:' + j._key));
+    const finished = jobs.filter(j => j.status === 'done' && !activationKnownJobIds.has('seen:' + j._key));
 
     // Surface a toast the first time we see a job land in "error" status,
     // then remember it so we don't re-toast on every subsequent poll.
     errored.forEach(j => {
       showToast('Activation job failed', `"${activationJobLabel(j)}" — job stopped, see Logs tab`, 'error');
-      activationKnownJobIds.add('seen:' + j.job_id);
+      activationKnownJobIds.add('seen:' + j._key);
+    });
+
+    // Surface a completion toast the first time we see a job finish
+    // (Plex-confirmed), then remember it so we don't re-toast on later polls.
+    finished.forEach(j => {
+      activationKnownJobIds.add('seen:' + j._key);
+      if (!j.activated || !j.activated.length) return;
+      const label = j._kind === 'movie'
+        ? `${j.activated.length} movie${j.activated.length === 1 ? '' : 's'} activated`
+        : `${j.activated.length} episode${j.activated.length === 1 ? '' : 's'} activated`;
+      showToast(label, activationJobLabel(j), 'success');
     });
 
     if (visible.length === 0) {

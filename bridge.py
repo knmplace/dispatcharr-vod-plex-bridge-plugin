@@ -164,6 +164,20 @@ class BridgeCore:
         self._episode_job_stop = threading.Event()
         self._episode_job_counter = 0
         self._episode_job_worker_thread = None
+        # Movie activation queue: same rationale as the episode queue above
+        # (bead vpv) -- activate_movies_async() only enqueues and returns
+        # immediately; a single worker thread drains one batch at a time so
+        # a large multi-select activation can't stack concurrent Plex scans
+        # on top of anything else in flight. The original synchronous
+        # activate_movies() / POST /api/movies/activate is left untouched
+        # as a fallback (explicit user requirement, bead 30f).
+        self._movie_jobs = {}
+        self._movie_job_queue = deque()
+        self._movie_job_lock = threading.Lock()
+        self._movie_job_wake = threading.Event()
+        self._movie_job_stop = threading.Event()
+        self._movie_job_counter = 0
+        self._movie_job_worker_thread = None
         self._last_removed_check = 0.0
         self._last_removed_episode_check = 0.0
         self._last_stream_refresh_check = 0.0
@@ -207,6 +221,7 @@ class BridgeCore:
         )
         self._start_stall_watchdog()
         self._start_episode_job_worker()
+        self._start_movie_job_worker()
         threading.Thread(target=self._backfill_series_tmdb_state, daemon=True).start()
 
     def _start_episode_job_worker(self):
@@ -216,6 +231,14 @@ class BridgeCore:
             name="vod-bridge-episode-activation-worker",
         )
         self._episode_job_worker_thread.start()
+
+    def _start_movie_job_worker(self):
+        self._movie_job_worker_thread = threading.Thread(
+            target=self._movie_job_worker_loop,
+            daemon=True,
+            name="vod-bridge-movie-activation-worker",
+        )
+        self._movie_job_worker_thread.start()
 
     def _backfill_series_tmdb_state(self):
         """One-time-per-restart repair for series activated before bead czo
@@ -280,6 +303,8 @@ class BridgeCore:
         self._watchdog_stop.set()
         self._episode_job_stop.set()
         self._episode_job_wake.set()  # unblock the worker if it's waiting on a new job
+        self._movie_job_stop.set()
+        self._movie_job_wake.set()  # unblock the worker if it's waiting on a new job
         if self._watchdog_thread is not None:
             # Bound the wait: the loop only checks the stop event every 10s
             # and may be mid-way through a Plex/DB call, so give it a window
@@ -299,6 +324,14 @@ class BridgeCore:
             if self._episode_job_worker_thread.is_alive():
                 logger.warning(
                     "VOD To Plex: episode activation worker did not stop "
+                    "within 15s of shutdown — it will keep running until it "
+                    "finishes its current batch and observes the stop signal."
+                )
+        if self._movie_job_worker_thread is not None:
+            self._movie_job_worker_thread.join(timeout=15)
+            if self._movie_job_worker_thread.is_alive():
+                logger.warning(
+                    "VOD To Plex: movie activation worker did not stop "
                     "within 15s of shutdown — it will keep running until it "
                     "finishes its current batch and observes the stop signal."
                 )
@@ -4993,6 +5026,309 @@ class BridgeCore:
             }
 
         return {"status": "ok", "activated": 0, "names": [], "failed": []}
+
+    MOVIE_JOB_BATCH_SIZE = 25
+    MOVIE_JOB_BATCH_DELAY_SECS = 5
+    MOVIE_JOB_RETENTION_SECS = 600
+
+    def activate_movies_async(self, body):
+        """Enqueue movie activation as a background job and return
+        immediately, mirroring activate_episodes()/EPISODE job queue above.
+        The original synchronous activate_movies() / POST /api/movies/activate
+        is left completely untouched as a fallback (explicit user
+        requirement — the existing path is proven-good and must not be
+        modified in place).
+
+        Returns immediately with {"status": "queued", "job_id", "total"} --
+        poll get_movie_job_status(job_id) or list_movie_jobs() for progress.
+        """
+        movie_ids = body.get("movie_ids", [])
+        if not movie_ids:
+            return {"status": "error", "message": "No movie_ids provided"}
+
+        pending_ids = [str(mid) for mid in movie_ids if str(mid) not in self._activated]
+        if not pending_ids:
+            return {"status": "ok", "activated": 0, "strm_generated": 0, "names": [], "failed": [], "failed_names": []}
+
+        batches = [
+            pending_ids[i:i + self.MOVIE_JOB_BATCH_SIZE]
+            for i in range(0, len(pending_ids), self.MOVIE_JOB_BATCH_SIZE)
+        ]
+
+        with self._movie_job_lock:
+            self._movie_job_counter += 1
+            job_id = str(self._movie_job_counter)
+            self._movie_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "queued",
+                "total": len(pending_ids),
+                "done": 0,
+                "batches_total": len(batches),
+                "batches_done": 0,
+                "batches": batches,
+                "created_at": time.time(),
+                "started_at": None,
+                "finished_at": None,
+                "activated": [],
+                "activated_names": [],
+                "movie_names": [],
+                "failed": [],
+                "failed_names": [],
+                "strm_generated": 0,
+            }
+            queue_position = len(self._movie_job_queue)
+            self._movie_job_queue.append(job_id)
+
+        self._log_diagnostic("info",
+            f"Movie activation job {job_id} queued: {len(pending_ids)} movies in {len(batches)} batch(es), "
+            f"position {queue_position} in queue")
+        self._movie_job_wake.set()
+
+        return {
+            "status": "queued",
+            "job_id": job_id,
+            "total": len(pending_ids),
+            "batches": len(batches),
+            "queue_position": queue_position,
+        }
+
+    def get_movie_job_status(self, job_id):
+        with self._movie_job_lock:
+            job = self._movie_jobs.get(str(job_id))
+            if job is None:
+                return {"status": "error", "message": "Job not found"}
+            return dict(job, batches=None)  # omit raw batch id lists from the response payload
+
+    def list_movie_jobs(self):
+        """Returns active (queued/running) jobs, most-recent-first, mirroring
+        list_episode_jobs(). Finished jobs are pruned by the worker loop
+        after a short grace period rather than kept forever."""
+        with self._movie_job_lock:
+            jobs = [dict(j, batches=None) for j in self._movie_jobs.values()]
+        jobs.sort(key=lambda j: j["created_at"], reverse=True)
+        return {"jobs": jobs}
+
+    def _movie_job_worker_loop(self):
+        """Single consumer for _movie_job_queue: pulls one batch at a time
+        (from the oldest still-incomplete job) and processes it via
+        _activate_movie_batch(), so exactly one batch's worth of DB/Plex/
+        provider load is ever in flight regardless of how many activation
+        jobs are queued behind it. Mirrors _episode_job_worker_loop()."""
+        while not self._movie_job_stop.is_set():
+            job_id = None
+            with self._movie_job_lock:
+                if self._movie_job_queue:
+                    job_id = self._movie_job_queue[0]
+
+            if job_id is None:
+                self._movie_job_wake.wait(timeout=10)
+                self._movie_job_wake.clear()
+                continue
+
+            with self._movie_job_lock:
+                job = self._movie_jobs.get(job_id)
+                if job is None or not job["batches"]:
+                    self._movie_job_queue.popleft()
+                    continue
+                if job["status"] == "queued":
+                    job["status"] = "running"
+                    job["started_at"] = time.time()
+                batch = job["batches"].pop(0)
+
+            try:
+                self._activate_movie_batch(batch, job)
+            except Exception as e:
+                logger.error(f"Movie activation job {job_id} batch failed: {e}")
+                self._log_diagnostic("error", f"Movie activation job {job_id}: batch failed: {type(e).__name__}: {str(e)[:200]}")
+
+            run_plex_wait = False
+            with self._movie_job_lock:
+                job["batches_done"] += 1
+                job["done"] = len(job["activated"]) + len(job["failed"])
+                if not job["batches"]:
+                    job["status"] = "plex_scanning"
+                    job["plex_confirmed"] = 0
+                    self._movie_job_queue.popleft()
+                    titles = ", ".join(f'"{n}"' for n in job["activated_names"])
+                    self._log_event(
+                        "info",
+                        f'Activated {len(job["activated"])} movie(s): {titles} '
+                        f'- generated {job["strm_generated"]} STRM file(s)',
+                    )
+                    if job["failed"]:
+                        failed_titles = ", ".join(f'"{n}"' for n in job["failed_names"])
+                        self._log_event("warn", f'Movie activation skipped {len(job["failed"])} movie(s): {failed_titles}')
+                    self._log_diagnostic("info",
+                        f'Movie activation job {job_id} complete: {len(job["activated"])} activated, {len(job["failed"])} failed - awaiting Plex confirmation')
+                    run_plex_wait = True
+                else:
+                    # More batches remain for this job -- pace the next one
+                    # so Plex isn't hit with another scan wave back to back.
+                    time.sleep(self.MOVIE_JOB_BATCH_DELAY_SECS)
+
+            if run_plex_wait:
+                self._wait_for_plex_movie_confirmation(job_id, job)
+
+            self._prune_finished_movie_jobs()
+
+    def _activate_movie_batch(self, movie_ids, job):
+        """Activates one batch of movies and, if any succeeded, generates
+        their STRM/NFO, fetches confirmed sizes, and triggers a Plex scan
+        for just this batch. Same per-movie logic as the synchronous
+        activate_movies() (DB lookup, relation lookup, capacity-gated audio
+        probe, estimated size), duplicated here (not shared) so the
+        original synchronous path is never touched by this new async path.
+        Mutates job's activated/failed lists and strm_generated count in
+        place."""
+        try:
+            from apps.vod.models import Movie
+        except Exception as e:
+            job["failed"].extend({"id": mid, "name": f"#{mid}", "message": str(e)} for mid in movie_ids)
+            job["failed_names"].extend(f"#{mid}" for mid in movie_ids)
+            return
+
+        activated = []
+        activated_names = []
+        failed = []
+        failed_names = []
+
+        for mid in movie_ids:
+            mid = str(mid)
+            if mid in self._activated:
+                continue
+
+            try:
+                movie = Movie.objects.get(id=int(mid))
+            except Exception:
+                failed.append({"id": mid, "name": f"#{mid}", "message": "Movie not found"})
+                failed_names.append(f"#{mid}")
+                continue
+
+            relations = list(movie.m3u_relations.all())
+            if not relations:
+                failed.append({"id": mid, "name": movie.name, "message": "No stream mapping for movie"})
+                failed_names.append(movie.name)
+                continue
+
+            chosen_relation = None
+            audio_checks = {}
+            for relation in relations:
+                if not self._account_has_capacity(relation.m3u_account_id):
+                    logger.info(
+                        f"Skipping audio probe for movie {mid} via account "
+                        f"{relation.m3u_account_id} — no free connection slot"
+                    )
+                    continue
+                result = self._probe_audio_for_relation(movie, relation)
+                audio_checks[str(relation.stream_id)] = result
+                self._record_audio_probe_stats(movie, relation, result, persist=False)
+                self._log_audio_probe_result(movie, relation, result)
+                if result.get("status") == "ok":
+                    chosen_relation = relation
+                    break
+
+            if chosen_relation is None:
+                failed.append({
+                    "id": mid,
+                    "name": movie.name,
+                    "message": "No provider stream with detectable audio found",
+                })
+                failed_names.append(movie.name)
+                continue
+
+            estimated_size = self._resolve_estimated_size(movie, relations)
+
+            self._activated[mid] = {
+                "activated_at": time.time(),
+                "audio_checks": audio_checks,
+                "stream_pick": chosen_relation.stream_id,
+                "estimated_size": estimated_size,
+            }
+            activated.append(mid)
+            activated_names.append(movie.name)
+
+        self._save_state()
+
+        if activated:
+            strm_count = self._generate_strm_for_movies(activated)
+            self._save_state()
+            self._log_diagnostic("info", f"Movie activation job {job['job_id']}: fetching {len(activated)} confirmed sizes from Plex before scan trigger...")
+            sizes = self._fetch_plex_movie_sizes(activated)
+            for mid in activated:
+                size = sizes.get(mid)
+                if size:
+                    entry = self._activated.get(mid)
+                    if entry and entry.get("confirmed_size") != size:
+                        entry["confirmed_size"] = size
+                        self._log_diagnostic("debug", f"Movie {mid}: pre-scan size confirmed {size} bytes")
+            if sizes:
+                self._save_state()
+            self._trigger_plex_scan()
+            for mid in activated:
+                entry = self._activated.get(mid)
+                if not entry or not entry.get("confirmed_size"):
+                    threading.Thread(
+                        target=self._size_reconcile_fast_path,
+                        args=(mid,),
+                        daemon=True,
+                    ).start()
+
+            job["activated"].extend(activated)
+            job["activated_names"].extend(activated_names)
+            job["movie_names"].extend(activated_names)
+            job["strm_generated"] += strm_count
+
+        job["failed"].extend(failed)
+        job["failed_names"].extend(failed_names)
+
+    def _wait_for_plex_movie_confirmation(self, job_id, job):
+        """After our own batches finish, Plex is still analyzing the files
+        in the background. Poll Plex's own library JSON via
+        _fetch_plex_movie_sizes() every few seconds so the dashboard can
+        show a live completed/pending count for this phase too. Mirrors
+        _wait_for_plex_episode_confirmation()."""
+        mids = list(job["activated"])
+        if not mids:
+            with self._movie_job_lock:
+                job["status"] = "done"
+                job["finished_at"] = time.time()
+            return
+
+        deadline = time.time() + self.PLEX_CONFIRM_TIMEOUT_SECS
+        pending = set(mids)
+        while pending and time.time() < deadline and not self._movie_job_stop.is_set():
+            try:
+                sizes = self._fetch_plex_movie_sizes(list(pending))
+            except Exception as e:
+                logger.error(f"Movie activation job {job_id}: Plex confirmation poll failed: {e}")
+                sizes = {}
+            pending -= set(sizes.keys())
+            with self._movie_job_lock:
+                job["plex_confirmed"] = len(mids) - len(pending)
+            if not pending:
+                break
+            time.sleep(self.PLEX_CONFIRM_POLL_SECS)
+
+        with self._movie_job_lock:
+            job["plex_confirmed"] = len(mids) - len(pending)
+            job["status"] = "done"
+            job["finished_at"] = time.time()
+        if pending:
+            self._log_diagnostic("warn",
+                f'Movie activation job {job_id}: Plex confirmation timed out after {self.PLEX_CONFIRM_TIMEOUT_SECS}s '
+                f'with {len(pending)}/{len(mids)} movie(s) still unconfirmed by Plex')
+        else:
+            self._log_diagnostic("info", f'Movie activation job {job_id}: Plex confirmed all {len(mids)} movie(s)')
+
+    def _prune_finished_movie_jobs(self):
+        cutoff = time.time() - self.MOVIE_JOB_RETENTION_SECS
+        with self._movie_job_lock:
+            stale = [
+                jid for jid, j in self._movie_jobs.items()
+                if j["status"] in ("done", "error") and j.get("finished_at") and j["finished_at"] < cutoff
+            ]
+            for jid in stale:
+                del self._movie_jobs[jid]
 
     def check_movie_audio(self, body):
         movie_ids = body.get("movie_ids", [])
