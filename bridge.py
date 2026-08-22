@@ -1106,6 +1106,9 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
 
+        if not self._activated:
+            self._recover_activated_from_sidecars()
+
         lang_file = os.path.join(self._data_dir, "language_cache.json")
         if os.path.exists(lang_file):
             try:
@@ -1114,10 +1117,60 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"Failed to load language cache: {e}")
 
-    def _save_state(self):
-        state_file = os.path.join(self._data_dir, "bridge_state.json")
+    def _recover_activated_from_sidecars(self):
+        """Disaster recovery: only runs when self._activated came back empty
+        after _load_state() (bridge_state.json missing, corrupted, or itself
+        wiped) -- rebuilds movie activations from the per-title *.meta.json
+        sidecars _write_activation_sidecars() maintains next to each STRM, so
+        titles don't require a manual reactivate just because the one state
+        file was lost. A genuinely fresh install with nothing activated yet
+        also has no sidecars to find, so this is a safe no-op in that case."""
+        strm_dir = self.settings.get("strm_output_dir", "/data/strm")
+        if not os.path.isdir(strm_dir):
+            return
+
+        recovered = 0
         try:
-            with open(state_file, "w") as f:
+            for folder_name in os.listdir(strm_dir):
+                sidecar_path = os.path.join(strm_dir, folder_name, f"{folder_name}.meta.json")
+                if not os.path.isfile(sidecar_path):
+                    continue
+                try:
+                    with open(sidecar_path, "r") as f:
+                        sidecar = json.load(f)
+                except Exception:
+                    continue
+                if sidecar.get("kind") != "movie" or not sidecar.get("id"):
+                    continue
+                mid = str(sidecar["id"])
+                self._activated[mid] = {
+                    "activated_at": sidecar.get("activated_at") or time.time(),
+                    "stream_pick": sidecar.get("stream_pick"),
+                    "confirmed_size": sidecar.get("confirmed_size"),
+                    "estimated_size": sidecar.get("estimated_size"),
+                    "strm_folder": folder_name,
+                }
+                recovered += 1
+        except Exception as e:
+            logger.error(f"Sidecar recovery scan failed: {e}")
+            return
+
+        if recovered:
+            logger.warning(f"Recovered {recovered} movie activation(s) from sidecar files after empty/missing bridge_state.json")
+            self._save_state()
+
+    def _save_state(self):
+        # Write-to-temp-then-rename so a crash/restart mid-write can never
+        # leave bridge_state.json truncated/corrupted. _load_state() treats
+        # any load error as "no state" and falls back to an empty
+        # self._activated, which breaks playback for every activated title
+        # until each one is manually reactivated -- os.replace() is atomic
+        # on both POSIX and Windows, so readers only ever see the old
+        # complete file or the new complete file, never a partial write.
+        state_file = os.path.join(self._data_dir, "bridge_state.json")
+        tmp_file = state_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
                 json.dump({
                 "activated": self._activated,
                 "episodes_activated": self._episodes_activated,
@@ -1129,8 +1182,57 @@ class BridgeCore:
                 "last_tmdb_detection": self._last_tmdb_detection,
                 "diagnostic_log": list(self._diagnostic_log)[-1000:],
             }, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, state_file)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+            return
+
+        self._write_activation_sidecars()
+
+    def _write_activation_sidecars(self):
+        """Mirror each activated title's key playback fields (confirmed_size,
+        stream_pick, activated_at) into a small human-readable .json next to
+        its STRM file. bridge_state.json is the only thing get_movie_info()/
+        get_redirect_url() actually read -- these sidecars are a durable,
+        per-title backup: if that one file is ever lost/corrupted despite the
+        atomic write above (e.g. the data dir itself is wiped), _load_state()
+        can rebuild self._activated by scanning sidecars back in instead of
+        every title requiring a manual reactivate. Best-effort: a failure
+        writing one sidecar must never block activation or state saving."""
+        strm_dir = self.settings.get("strm_output_dir", "/data/strm")
+
+        for mid, entry in self._activated.items():
+            folder_name = entry.get("strm_folder")
+            if not folder_name:
+                continue
+            try:
+                folder = os.path.join(strm_dir, folder_name)
+                sidecar_path = os.path.join(folder, f"{folder_name}.meta.json")
+                sidecar = {
+                    "id": mid,
+                    "kind": "movie",
+                    "activated_at": entry.get("activated_at"),
+                    "stream_pick": entry.get("stream_pick"),
+                    "confirmed_size": entry.get("confirmed_size"),
+                    "estimated_size": entry.get("estimated_size"),
+                }
+                tmp_path = sidecar_path + ".tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(sidecar, f)
+                os.replace(tmp_path, sidecar_path)
+            except Exception as e:
+                logger.debug(f"Sidecar write skipped for movie {mid}: {e}")
+
+        # Episodes intentionally excluded for now: entry["strm_folder"] is a
+        # relative category/series/season path (resolved against
+        # _series_category_path(), not strm_output_dir) and the actual
+        # per-episode filename lives in a separate "strm_stem" field, so
+        # locating the right sidecar path safely needs more than this
+        # generic helper knows. Episodes also don't get real .strm files
+        # (synthetic listing entries only, per za8) so the payoff is lower.
+        # Revisit if episode reactivation-after-loss becomes a real problem.
 
     def _save_languages(self):
         lang_file = os.path.join(self._data_dir, "language_cache.json")
@@ -3043,21 +3145,42 @@ class BridgeCore:
         through a Dispatcharr task (none exists for episodes) and doesn't
         write back to episode/series fields — bitrate is used in-memory only
         and never persisted to custom_properties, to avoid duplicating what
-        Dispatcharr's own refresh_series_episodes already owns."""
-        try:
-            from core.xtream_codes import Client as XtreamCodesClient
-            account = relation.m3u_account
-            with XtreamCodesClient(
-                server_url=account.server_url,
-                username=account.username,
-                password=account.password,
-                user_agent=account.get_user_agent().user_agent,
-            ) as client:
-                vod_info = client.get_vod_info(relation.stream_id)
-        except Exception as e:
-            logger.debug(f"_fetch_episode_relation_bitrate: fetch failed for relation {relation.id}: {e}")
+        Dispatcharr's own refresh_series_episodes already owns.
+
+        This calls Dispatcharr's XtreamCodesClient directly rather than
+        through a Dispatcharr task wrapper, so — same as movies' bitrate
+        fetch — there's no guarantee the client's HTTP call has its own
+        timeout. Run it on a daemon thread with a bounded join() so a
+        slow/dead provider can't stall the calling thread."""
+        result = {}
+
+        def _run():
+            try:
+                from core.xtream_codes import Client as XtreamCodesClient
+                account = relation.m3u_account
+                with XtreamCodesClient(
+                    server_url=account.server_url,
+                    username=account.username,
+                    password=account.password,
+                    user_agent=account.get_user_agent().user_agent,
+                ) as client:
+                    result["vod_info"] = client.get_vod_info(relation.stream_id)
+            except Exception as e:
+                result["error"] = e
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=10)
+
+        if t.is_alive():
+            logger.warning(f"_fetch_episode_relation_bitrate: get_vod_info timed out for relation {relation.id} — proceeding without bitrate")
+            self._log_diagnostic("warn", f"Episode relation {relation.id}: bitrate fetch timed out after 10s, proceeding without it")
+            return None
+        if result.get("error"):
+            logger.debug(f"_fetch_episode_relation_bitrate: fetch failed for relation {relation.id}: {result['error']}")
             return None
 
+        vod_info = result.get("vod_info")
         if not vod_info:
             return None
         info = vod_info.get("info", {})
@@ -5782,13 +5905,44 @@ class BridgeCore:
         provider doesn't supply it for this relation. Bitrate availability
         is per-provider, not just per-movie (e.g. the same title may report
         bitrate via one M3U account but not another), so callers should try
-        every relation for a movie rather than stopping at the first one."""
+        every relation for a movie rather than stopping at the first one.
+
+        refresh_movie_advanced_data() has no timeout on its own provider
+        HTTP call (see CLAUDE.md) — a slow/dead provider can hang forever.
+        Run it on a daemon thread with a bounded join() so a bad provider
+        can't stall the calling thread (request thread on the sync
+        activation path, worker thread on the async path)."""
         try:
             from apps.vod.tasks import refresh_movie_advanced_data
-            refresh_movie_advanced_data(relation.id, force_refresh=force_refresh)
+        except Exception as e:
+            logger.debug(f"_fetch_relation_bitrate: import failed for relation {relation.id}: {e}")
+            return None
+
+        result = {}
+
+        def _run():
+            try:
+                refresh_movie_advanced_data(relation.id, force_refresh=force_refresh)
+                result["ok"] = True
+            except Exception as e:
+                result["error"] = e
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=10)
+
+        if t.is_alive():
+            logger.warning(f"_fetch_relation_bitrate: refresh_movie_advanced_data timed out for relation {relation.id} — proceeding without bitrate")
+            self._log_diagnostic("warn", f"Relation {relation.id}: bitrate refresh timed out after 10s, proceeding without it")
+            return None
+        if result.get("error"):
+            logger.debug(f"_fetch_relation_bitrate: refresh failed for relation {relation.id}: {result['error']}")
+            return None
+
+        try:
             relation.refresh_from_db()
         except Exception as e:
-            logger.debug(f"_fetch_relation_bitrate: refresh failed for relation {relation.id}: {e}")
+            logger.debug(f"_fetch_relation_bitrate: refresh_from_db failed for relation {relation.id}: {e}")
             return None
 
         detailed = (relation.custom_properties or {}).get("detailed_info", {})
