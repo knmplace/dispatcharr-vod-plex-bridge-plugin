@@ -104,7 +104,7 @@ def _create_app(server, bridge, settings):
             return _dispatch(environ, start_response, server, bridge, settings)
         except Exception as e:
             logger.exception("Unhandled error in request dispatch")
-            path = unquote(environ.get("PATH_INFO", "/"))
+            path = _request_path(environ)
             bridge._log_event("error", f"Unhandled error on {path}: {e}")
             return _text_response(start_response, 500, "Internal server error")
         finally:
@@ -117,9 +117,26 @@ def _create_app(server, bridge, settings):
     return app
 
 
+def _request_path(environ):
+    """PATH_INFO as a string that matches real filenames on disk.
+
+    PEP 3333 gives the application a PATH_INFO whose characters are the raw
+    request bytes decoded as latin-1, so a UTF-8 path arrives mangled and
+    matches nothing on disk. Re-encoding to bytes and decoding as UTF-8
+    restores the real name. A pure ASCII path round trips unchanged, and
+    anything that is not valid UTF-8 is left exactly as it arrived.
+    """
+    raw = environ.get("PATH_INFO", "/")
+    try:
+        raw = raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return unquote(raw)
+
+
 def _dispatch(environ, start_response, server, bridge, settings):
     method = environ["REQUEST_METHOD"]
-    path = unquote(environ.get("PATH_INFO", "/"))
+    path = _request_path(environ)
 
     if settings.get("debug_connections") and path not in _NOISY_POLL_PATHS:
         client_ip = environ.get("REMOTE_ADDR", "unknown")
