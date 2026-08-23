@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -128,6 +129,12 @@ class BridgeCore:
     PROVIDER_CHECK_INTERVAL_SECS = 8 * 3600
     PROVIDER_CHECK_TIMEOUT_SECS = 8
 
+    # Fixed worker cap for the bitrate-lookup pool (see _bitrate_lookup_pool
+    # in __init__). Small on purpose -- these are metadata-only lookups, not
+    # stream connections, so a handful of workers is plenty of throughput
+    # while still bounding how many can be stuck-on-a-dead-provider at once.
+    BITRATE_LOOKUP_POOL_WORKERS = 4
+
     def __init__(self, settings):
         self.settings = settings
         self._activated = {}
@@ -135,6 +142,19 @@ class BridgeCore:
         self._series_categories = []  # [{id, name, strm_folder, plex_library_section}]
         self._series_tmdb_state = {}  # series_id (str) -> {tmdb_id, is_placeholder, series_dir, series_name, category_id}
         self._plex_scan_lock = threading.Lock()  # serializes _trigger_plex_scan calls (movies + series)
+        # Bounded pool for bitrate-lookup calls (_fetch_relation_bitrate /
+        # _fetch_episode_relation_bitrate). A bare threading.Thread per call
+        # with only a caller-side join(timeout=) bounds how long the CALLER
+        # waits but not the spawned thread itself -- a dead/slow provider
+        # leaks one orphaned thread per relation processed, unbounded over a
+        # large batch (confirmed live: v2.4.6 regression, 67-episode
+        # Millennium activation vs a stuck provider leaked dozens of threads
+        # and starved the WSGI pool). Routing these calls through a small
+        # fixed-size executor instead caps concurrent in-flight/stuck lookups
+        # regardless of batch size.
+        self._bitrate_lookup_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.BITRATE_LOOKUP_POOL_WORKERS, thread_name_prefix="bitrate-lookup"
+        )
         self._languages = {}
         self._data_dir = "/data/vod-plex-bridge"
         self._lang_detect_running = False
@@ -3150,37 +3170,37 @@ class BridgeCore:
         This calls Dispatcharr's XtreamCodesClient directly rather than
         through a Dispatcharr task wrapper, so — same as movies' bitrate
         fetch — there's no guarantee the client's HTTP call has its own
-        timeout. Run it on a daemon thread with a bounded join() so a
-        slow/dead provider can't stall the calling thread."""
-        result = {}
-
+        timeout. Submitted to the shared _bitrate_lookup_pool (fixed-size
+        executor) rather than a bare per-call thread: a plain
+        threading.Thread with only a caller-side join(timeout=) bounds how
+        long THIS call waits but not the spawned thread itself, so a
+        dead/slow provider leaked one orphaned thread per relation
+        processed -- unbounded over a large batch (confirmed live: v2.4.6
+        regression, 67-episode activation vs a stuck provider leaked dozens
+        of threads and starved the WSGI pool). The pool caps how many such
+        lookups can be stuck at once, independent of batch size."""
         def _run():
-            try:
-                from core.xtream_codes import Client as XtreamCodesClient
-                account = relation.m3u_account
-                with XtreamCodesClient(
-                    server_url=account.server_url,
-                    username=account.username,
-                    password=account.password,
-                    user_agent=account.get_user_agent().user_agent,
-                ) as client:
-                    result["vod_info"] = client.get_vod_info(relation.stream_id)
-            except Exception as e:
-                result["error"] = e
+            from core.xtream_codes import Client as XtreamCodesClient
+            account = relation.m3u_account
+            with XtreamCodesClient(
+                server_url=account.server_url,
+                username=account.username,
+                password=account.password,
+                user_agent=account.get_user_agent().user_agent,
+            ) as client:
+                return client.get_vod_info(relation.stream_id)
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join(timeout=10)
-
-        if t.is_alive():
+        future = self._bitrate_lookup_pool.submit(_run)
+        try:
+            vod_info = future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
             logger.warning(f"_fetch_episode_relation_bitrate: get_vod_info timed out for relation {relation.id} — proceeding without bitrate")
             self._log_diagnostic("warn", f"Episode relation {relation.id}: bitrate fetch timed out after 10s, proceeding without it")
             return None
-        if result.get("error"):
-            logger.debug(f"_fetch_episode_relation_bitrate: fetch failed for relation {relation.id}: {result['error']}")
+        except Exception as e:
+            logger.debug(f"_fetch_episode_relation_bitrate: fetch failed for relation {relation.id}: {e}")
             return None
 
-        vod_info = result.get("vod_info")
         if not vod_info:
             return None
         info = vod_info.get("info", {})
@@ -5909,34 +5929,37 @@ class BridgeCore:
 
         refresh_movie_advanced_data() has no timeout on its own provider
         HTTP call (see CLAUDE.md) — a slow/dead provider can hang forever.
-        Run it on a daemon thread with a bounded join() so a bad provider
-        can't stall the calling thread (request thread on the sync
-        activation path, worker thread on the async path)."""
+        Submitted to the shared _bitrate_lookup_pool (fixed-size executor)
+        rather than a bare per-call thread: a plain threading.Thread with
+        only a caller-side join(timeout=) bounds how long THIS call waits
+        but not the spawned thread itself, so a dead/slow provider leaked
+        one orphaned thread per relation processed -- unbounded over a large
+        batch (confirmed live: v2.4.6 regression). The pool caps how many
+        such lookups can be stuck at once, independent of batch size."""
         try:
             from apps.vod.tasks import refresh_movie_advanced_data
         except Exception as e:
             logger.debug(f"_fetch_relation_bitrate: import failed for relation {relation.id}: {e}")
             return None
 
-        result = {}
-
         def _run():
-            try:
-                refresh_movie_advanced_data(relation.id, force_refresh=force_refresh)
-                result["ok"] = True
-            except Exception as e:
-                result["error"] = e
+            # _bitrate_lookup_pool workers are long-lived (unlike the
+            # disposable per-call daemon threads this replaced), so a stale
+            # Django DB connection on this thread must be cleared before
+            # each ORM-touching call, not just once at thread start.
+            from django.db import close_old_connections
+            close_old_connections()
+            refresh_movie_advanced_data(relation.id, force_refresh=force_refresh)
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join(timeout=10)
-
-        if t.is_alive():
+        future = self._bitrate_lookup_pool.submit(_run)
+        try:
+            future.result(timeout=10)
+        except concurrent.futures.TimeoutError:
             logger.warning(f"_fetch_relation_bitrate: refresh_movie_advanced_data timed out for relation {relation.id} — proceeding without bitrate")
             self._log_diagnostic("warn", f"Relation {relation.id}: bitrate refresh timed out after 10s, proceeding without it")
             return None
-        if result.get("error"):
-            logger.debug(f"_fetch_relation_bitrate: refresh failed for relation {relation.id}: {result['error']}")
+        except Exception as e:
+            logger.debug(f"_fetch_relation_bitrate: refresh failed for relation {relation.id}: {e}")
             return None
 
         try:
