@@ -4661,7 +4661,12 @@ class BridgeCore:
         links = []
         try:
             entries = sorted(os.listdir(real_target))
-        except OSError:
+        except OSError as exc:
+            # An unreadable directory and a genuinely empty one used to produce
+            # the same empty page, so a path that failed to resolve looked like
+            # a series with no episodes. Report the failure instead of
+            # reporting emptiness.
+            logger.warning("Series listing failed for %r: %s", real_target, exc)
             entries = []
 
         for entry in entries:
