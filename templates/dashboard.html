@@ -2124,6 +2124,12 @@ function renderMaintenance(m) {
     : 'not run yet';
   rows.push(`<div class="health-item"><span>Removed (missing from catalog)<br>${namesLine(lastRemoved && lastRemoved.removed_names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.removed_total||0} total — last: ${removedDetail}</span></div>`);
 
+  const lastRemovedEp = m.last_removed_episode_check;
+  const removedEpDetail = lastRemovedEp
+    ? `${lastRemovedEp.checked} checked, ${lastRemovedEp.removed} removed - ${timeAgo(lastRemovedEp.ts)}`
+    : 'not run yet';
+  rows.push(`<div class="health-item"><span>Removed episodes (missing from catalog)<br>${namesLine(lastRemovedEp && lastRemovedEp.removed_names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.removed_episode_total||0} total - last: ${removedEpDetail}</span></div>`);
+
   const lastAudio = m.last_audio_check;
   const audioDetail = lastAudio
     ? `"${escapeHtml(lastAudio.name || '#' + lastAudio.movie_id)}" — ${lastAudio.status} via ${escapeHtml(lastAudio.provider || 'unknown provider')} (stream ${escapeHtml(String(lastAudio.stream_id || '?'))}) — ${timeAgo(lastAudio.ts)}`
