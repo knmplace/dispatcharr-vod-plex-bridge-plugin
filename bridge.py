@@ -4623,6 +4623,13 @@ class BridgeCore:
         name = re.sub(r"\s*\((?:4K|HDR|UHD|FHD|HD|SD)\)", "", name, flags=re.I)
         name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
         name = re.sub(r"\s*-\s*\d{4}\s*$", "", name)
+        # Provider-tagged country suffix, e.g. "Hanna (US)" / "Our Girl (GB)"
+        # -- Plex's own title for the same show has no such suffix, so
+        # leaving it in place broke the activated<->Plex episode match key
+        # (_fetch_plex_episode_sizes), which left "Confirming in Plex..."
+        # stuck at 0/N forever since the two sides' series_name never
+        # matched (confirmed live: "EN - Hanna (US)" job stuck 0/58).
+        name = re.sub(r"\s*\([A-Z]{2,3}\)\s*$", "", name)
         name = re.sub(r'[<>:"/\\|?*]', "", name)
         return name.strip()
 
