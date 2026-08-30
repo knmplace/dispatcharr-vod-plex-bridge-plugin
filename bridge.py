@@ -4598,6 +4598,21 @@ class BridgeCore:
     # Plex identifying the title.
     _CATEGORY_PREFIX = re.compile(r"^([A-Z0-9+]{1,5}(?:-[A-Z0-9+]{1,5})?)\s+-\s+")
 
+    # Country codes providers actually append as a trailing "(XX)"/"(XXX)"
+    # tag (ISO 3166-1 alpha-2 plus a few informal alpha-3 variants providers
+    # use loosely, e.g. UK/USA). An allowlist -- not "any 2-3 capital
+    # letters" -- because a real title can legitimately end in a
+    # parenthetical acronym (e.g. a film titled "...(UK)"); only strip a
+    # suffix that's actually a country code.
+    _COUNTRY_SUFFIX_CODES = frozenset({
+        "US", "USA", "GB", "UK", "CA", "AU", "NZ", "IE", "FR", "DE", "ES",
+        "IT", "PT", "NL", "BE", "CH", "AT", "SE", "NO", "DK", "FI", "PL",
+        "RU", "UA", "GR", "TR", "IN", "PK", "BD", "CN", "JP", "KR", "TW",
+        "HK", "SG", "MY", "TH", "PH", "VN", "ID", "MX", "BR", "AR", "CL",
+        "CO", "ZA", "EG", "SA", "AE", "IL", "AL", "RS", "HR", "RO", "BG",
+        "CZ", "SK", "HU",
+    })
+
     def _clean_title(self, name):
         # (code note: from PR #2 -- guard tightened after live data showed a
         # false-positive: "2LDK - 2003" is a real film title (2LDK, 2003),
@@ -4628,8 +4643,12 @@ class BridgeCore:
         # leaving it in place broke the activated<->Plex episode match key
         # (_fetch_plex_episode_sizes), which left "Confirming in Plex..."
         # stuck at 0/N forever since the two sides' series_name never
-        # matched (confirmed live: "EN - Hanna (US)" job stuck 0/58).
-        name = re.sub(r"\s*\([A-Z]{2,3}\)\s*$", "", name)
+        # matched (confirmed live: "EN - Hanna (US)" job stuck 0/58). Only
+        # strip when the tag is a real country code (_COUNTRY_SUFFIX_CODES)
+        # -- a title that just happens to end in "(XX)" is left alone.
+        suffix_match = re.search(r"\s*\(([A-Z]{2,3})\)\s*$", name)
+        if suffix_match and suffix_match.group(1) in self._COUNTRY_SUFFIX_CODES:
+            name = name[:suffix_match.start()]
         name = re.sub(r'[<>:"/\\|?*]', "", name)
         return name.strip()
 
