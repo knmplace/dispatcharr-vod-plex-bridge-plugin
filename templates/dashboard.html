@@ -312,6 +312,31 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 .health-dot.error { background: var(--red); }
 .health-dot.unconfigured, .health-dot.unknown { background: var(--text2); }
 
+/* Reports */
+.reports-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
+.report-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); display: flex; flex-direction: column; overflow: hidden; }
+.report-card-header { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline; }
+.report-card-title { font-size: 0.82rem; font-weight: 600; color: var(--text); }
+.report-card-total { font-size: 0.75rem; color: var(--text2); }
+.report-card-total b { color: var(--accent); font-weight: 700; }
+.report-chart { padding: 0.6rem 0.8rem 0.2rem; }
+.report-chart svg { display: block; width: 100%; height: 60px; overflow: visible; }
+.report-chart-bar { fill: var(--accent); }
+.report-chart-bar.empty { fill: var(--border); }
+.report-chart-caption { font-size: 0.65rem; color: var(--text2); display: flex; justify-content: space-between; padding: 0.1rem 0.8rem 0.5rem; }
+.report-list { max-height: 220px; overflow-y: auto; border-top: 1px solid var(--border); }
+.report-list-empty { padding: 0.8rem; font-size: 0.78rem; color: var(--text2); text-align: center; }
+.report-list-item { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; padding: 0.4rem 0.8rem; border-bottom: 1px solid var(--border); font-size: 0.78rem; }
+.report-list-item:last-child { border-bottom: none; }
+.report-list-item .name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.report-list-item .ts { color: var(--text2); font-size: 0.7rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.totals-comparison { display: flex; flex-direction: column; gap: 0.35rem; padding-bottom: 0.8rem; margin-bottom: 0.8rem; border-bottom: 1px solid var(--border); }
+.totals-row { display: grid; grid-template-columns: 140px 1fr 2.5rem; align-items: center; gap: 0.6rem; font-size: 0.75rem; }
+.totals-label { color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.totals-bar-track { background: var(--surface2); border-radius: 3px; height: 10px; overflow: hidden; }
+.totals-bar-fill { background: var(--accent); height: 100%; border-radius: 3px; }
+.totals-count { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+
 /* Toasts */
 #toastStack { position: fixed; bottom: 1rem; right: 1rem; z-index: 999; display: flex; flex-direction: column; gap: 0.5rem; max-width: 360px; }
 .toast { background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); padding: 0.6rem 0.8rem; font-size: 0.8rem; box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: toast-in 0.15s ease-out; }
@@ -393,7 +418,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="tab" data-tab="streams" onclick="switchTab('streams')">Now Playing <span class="badge" id="streamBadge" style="display:none">0</span></div>
     <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
     <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
-    <div class="tab" data-tab="tmdbResults" onclick="switchTab('tmdbResults')">TMDB Results <span class="badge" id="tmdbBadge" style="display:none">0</span></div>
+    <div class="tab" data-tab="reports" onclick="switchTab('reports')">Reports</div>
     <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
   </div>
   <div class="tabs-stats">
@@ -645,7 +670,8 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 
     <div class="panel">
       <div class="panel-header">
-        <span>Maintenance Activity</span>
+        <span>Maintenance Overview</span>
+        <span style="font-size:0.72rem;color:var(--text2);">Full history and per-run detail on the <a href="#" onclick="switchTab('reports');return false;" style="color:var(--accent, #4a9eff);">Reports</a> tab</span>
       </div>
       <div class="panel-body" id="maintBody">
         <div class="loading"><span class="spinner"></span> Loading...</div>
@@ -675,6 +701,23 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       </div>
     </div>
 
+  </div>
+
+  <!-- Reports Tab -->
+  <div class="tab-pane" id="pane-reports">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Maintenance Activity</span>
+        <button class="btn btn-outline btn-sm" onclick="loadReports()">Refresh</button>
+      </div>
+      <div class="panel-body">
+        <div class="totals-comparison" id="reportsTotalsChart"></div>
+        <div id="reportsSummary">
+          <div class="loading"><span class="spinner"></span> Loading...</div>
+        </div>
+      </div>
+    </div>
+    <div class="reports-grid" id="reportsBody"></div>
   </div>
 
   <!-- Series Settings Tab -->
@@ -725,21 +768,6 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     </div>
   </div>
 
-  <!-- TMDB Results Tab -->
-  <div class="tab-pane" id="pane-tmdbResults">
-    <div class="panel">
-      <div class="panel-header">
-        <span>TMDB Detection Results</span>
-        <button class="btn btn-primary btn-sm" onclick="loadTmdbResults()">Refresh</button>
-      </div>
-      <div class="panel-body">
-        <div id="tmdbResultsContainer">
-          <div style="color:var(--text2);font-size:0.85rem;">Loading...</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
 </div>
 
 <script>
@@ -767,7 +795,7 @@ function switchTab(tab) {
   if (tab === 'streams') startStreamRefresh();
   else stopStreamRefresh();
   if (tab === 'health') loadHealth();
-  if (tab === 'tmdbResults') loadTmdbResults();
+  if (tab === 'reports') loadReports();
   if (tab === 'logs') { loadProxyLog(); startLogAutoRefresh(); }
   else stopLogAutoRefresh();
   if (tab === 'seriesSettings') loadSeriesCategories();
@@ -1969,85 +1997,6 @@ async function forceRefreshProviders() {
 }
 
 // Health
-async function loadTmdbResults() {
-  const container = document.getElementById('tmdbResultsContainer');
-  container.innerHTML = '<div style="color:var(--text2);font-size:0.85rem;">Loading...</div>';
-
-  const data = await api('/api/series/tmdb-results');
-  const results = data.results || [];
-
-  // Update badge
-  const badge = document.getElementById('tmdbBadge');
-  if (results.length > 0) {
-    badge.textContent = results.length;
-    badge.style.display = 'inline';
-  } else {
-    badge.style.display = 'none';
-  }
-
-  if (results.length === 0) {
-    container.innerHTML = '<div style="color:var(--green);font-size:0.9rem;">✓ No pending TMDB matches. All series resolved!</div>';
-    return;
-  }
-
-  container.innerHTML = results.map(series => `
-    <div class="panel" style="margin-bottom:1rem;">
-      <div class="panel-header">
-        <span>${escapeHtml(series.name)} (${series.year || '?'})</span>
-        <span style="font-size:0.7rem;color:var(--text2);">Series ID: ${series.series_id}</span>
-      </div>
-      <div class="panel-body">
-        <div style="display:flex;flex-direction:column;gap:0.8rem;">
-          ${series.results.map((result, idx) => `
-            <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:0.6rem;display:flex;gap:0.8rem;">
-              <div style="flex:0 0 50px;">
-                ${result.poster_path ? `<img src="https://image.tmdb.org/t/p/w92${result.poster_path}" style="width:50px;height:75px;border-radius:4px;object-fit:cover;" alt="${escapeHtml(result.name)}">` : '<div style="width:50px;height:75px;background:var(--border);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:0.7rem;color:var(--text2);">No Poster</div>'}
-              </div>
-              <div style="flex:1;">
-                <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">${escapeHtml(result.name)}</div>
-                <div style="font-size:0.75rem;color:var(--text2);margin-bottom:6px;">Year: ${result.year || '?'} • TMDB ID: ${result.tmdb_id}</div>
-                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem;">
-                  <div style="background:var(--green);color:#000;padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:600;">Confidence: ${Math.round(result.confidence)}%</div>
-                </div>
-                ${result.overview ? `<div style="font-size:0.75rem;color:var(--text2);line-height:1.4;max-height:3em;overflow:hidden;">${escapeHtml(result.overview)}</div>` : ''}
-              </div>
-              <div style="flex:0 0 120px;display:flex;align-items:center;">
-                <button class="btn btn-green" onclick="acceptTmdbResult(${series.series_id}, ${idx})" style="width:100%;font-size:0.8rem;">Accept</button>
-              </div>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    </div>
-  `).join('');
-}
-
-async function acceptTmdbResult(seriesId, resultIndex) {
-  const btn = event.target;
-  btn.disabled = true;
-  btn.textContent = 'Accepting...';
-
-  try {
-    const response = await api('/api/series/tmdb-accept', 'POST', {
-      series_id: seriesId,
-      result_index: resultIndex
-    });
-
-    if (response.status === 'ok') {
-      showMessage('✓ TMDB ID accepted and NFO updated', 'green');
-      await loadTmdbResults();
-    } else {
-      showMessage('✗ Failed to accept TMDB match: ' + (response.error || 'unknown error'), 'red');
-      btn.disabled = false;
-      btn.textContent = 'Accept';
-    }
-  } catch (err) {
-    showMessage('✗ Error: ' + err.message, 'red');
-    btn.disabled = false;
-    btn.textContent = 'Accept';
-  }
-}
-
 async function loadHealth() {
   const data = await api('/api/health');
   const body = document.getElementById('healthBody');
@@ -2096,39 +2045,78 @@ function namesLine(names) {
   return `<div style="font-size:0.7rem;color:var(--text2);margin-top:2px;">${shown}${more}</div>`;
 }
 
+// Health tab: compact overview only — totals + last-run time, no name
+// lists or per-item detail. Full breakdown lives on the Reports tab
+// (renderReports below) so this block stays scannable at a glance.
 function renderMaintenance(m) {
   const body = document.getElementById('maintBody');
+  const rows = [];
+
+  const item = (label, total, lastTs) =>
+    `<div class="health-item"><span>${label}</span><span style="font-size:0.75rem;color:var(--text2)">${total||0} total — last: ${lastTs ? timeAgo(lastTs) : 'not run yet'}</span></div>`;
+
+  rows.push(item('Auto Refreshed (scheduled)', m.auto_refreshed_total, m.last_auto_refresh && m.last_auto_refresh.ts));
+  rows.push(item('Manually Refreshed', m.manual_refreshed_total, m.last_manual_refresh && m.last_manual_refresh.ts));
+  rows.push(item('Reactivated (movies)', m.reactivated_total, m.last_reactivate && m.last_reactivate.ts));
+  rows.push(item('Reactivated (episodes)', m.reactivated_episode_total, m.last_reactivate_episode && m.last_reactivate_episode.ts));
+  rows.push(item('Removed movies (missing from catalog)', m.removed_total, m.last_removed_check && m.last_removed_check.ts));
+  rows.push(item('Removed episodes (missing from catalog)', m.removed_episode_total, m.last_removed_episode_check && m.last_removed_episode_check.ts));
+  rows.push(item('Audio Checks', m.audio_checked_total, m.last_audio_check && m.last_audio_check.ts));
+  rows.push(item('Plex Size Reconcile', null, m.last_size_reconcile && m.last_size_reconcile.ts));
+
+  body.innerHTML = rows.join('');
+}
+
+// Reports tab: full maintenance history/detail. The top summary panel keeps
+// the old "last run" one-liners (including routine "checked, none removed"
+// cleanup-pass stats — episode-removal row per PR #5 from PiratesIRC, the
+// plugin tracked removed_episode_total / last_removed_episode_check
+// already, it just had nowhere to surface). Below that, one scrollable
+// card per category backed by maintenance_history (30-day event log).
+async function loadReports() {
+  const data = await api('/api/health');
+  renderReportsSummary(data.maintenance || {});
+  renderTotalsComparison(data.maintenance_history || {});
+  renderReports(data.maintenance_history || {});
+}
+
+// Horizontal bar chart comparing 30-day event totals across all categories.
+function renderTotalsComparison(history) {
+  const el = document.getElementById('reportsTotalsChart');
+  if (!el) return;
+  const cats = [
+    ['Removed Movies', history.removed_movies],
+    ['Removed Episodes', history.removed_episodes],
+    ['Reactivated Movies', history.reactivated_movies],
+    ['Reactivated Episodes', history.reactivated_episodes],
+    ['Deactivated Movies', history.deactivated_movies],
+    ['Deactivated Episodes', history.deactivated_episodes],
+    ['Audio Missing', history.audio_missing],
+  ].map(([label, events]) => [label, (events || []).length]);
+  const max = Math.max(1, ...cats.map(([, n]) => n));
+  el.innerHTML = cats.map(([label, n]) => `
+    <div class="totals-row">
+      <span class="totals-label">${label}</span>
+      <div class="totals-bar-track"><div class="totals-bar-fill" style="width:${(n / max * 100).toFixed(1)}%"></div></div>
+      <span class="totals-count">${n}</span>
+    </div>`).join('');
+}
+
+function renderReportsSummary(m) {
+  const body = document.getElementById('reportsSummary');
   const rows = [];
 
   const lastRefresh = m.last_auto_refresh;
   const refreshDetail = lastRefresh
     ? `${lastRefresh.refreshed} refreshed, ${lastRefresh.skipped_playing} skipped (playing) — ${timeAgo(lastRefresh.ts)}`
     : 'not run yet';
-  rows.push(`<div class="health-item"><span>Auto Refreshed (scheduled)<br>${namesLine(lastRefresh && lastRefresh.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.auto_refreshed_total||0} total — last: ${refreshDetail}</span></div>`);
+  rows.push(`<div class="health-item"><span>Auto Refreshed (scheduled)</span><span style="font-size:0.75rem;color:var(--text2)">${m.auto_refreshed_total||0} total — last: ${refreshDetail}</span></div>`);
 
   const lastManual = m.last_manual_refresh;
   const manualDetail = lastManual
     ? `${lastManual.refreshed} refreshed — ${timeAgo(lastManual.ts)}`
     : 'not run yet';
-  rows.push(`<div class="health-item"><span>Manually Refreshed<br>${namesLine(lastManual && lastManual.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.manual_refreshed_total||0} total — last: ${manualDetail}</span></div>`);
-
-  const lastReactivate = m.last_reactivate;
-  const reactivateDetail = lastReactivate
-    ? `${lastReactivate.reactivated} reactivated — ${timeAgo(lastReactivate.ts)}`
-    : 'not run yet';
-  rows.push(`<div class="health-item"><span>Reactivated<br>${namesLine(lastReactivate && lastReactivate.names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.reactivated_total||0} total — last: ${reactivateDetail}</span></div>`);
-
-  const lastRemoved = m.last_removed_check;
-  const removedDetail = lastRemoved
-    ? `${lastRemoved.checked} checked, ${lastRemoved.removed} removed — ${timeAgo(lastRemoved.ts)}`
-    : 'not run yet';
-  rows.push(`<div class="health-item"><span>Removed (missing from catalog)<br>${namesLine(lastRemoved && lastRemoved.removed_names)}</span><span style="font-size:0.75rem;color:var(--text2)">${m.removed_total||0} total — last: ${removedDetail}</span></div>`);
-
-  const lastAudio = m.last_audio_check;
-  const audioDetail = lastAudio
-    ? `"${escapeHtml(lastAudio.name || '#' + lastAudio.movie_id)}" — ${lastAudio.status} via ${escapeHtml(lastAudio.provider || 'unknown provider')} (stream ${escapeHtml(String(lastAudio.stream_id || '?'))}) — ${timeAgo(lastAudio.ts)}`
-    : 'not run yet';
-  rows.push(`<div class="health-item"><span>Audio Checks</span><span style="font-size:0.75rem;color:var(--text2)">${m.audio_checked_total||0} total, ${m.audio_missing_total||0} missing — last: ${audioDetail}</span></div>`);
+  rows.push(`<div class="health-item"><span>Manually Refreshed</span><span style="font-size:0.75rem;color:var(--text2)">${m.manual_refreshed_total||0} total — last: ${manualDetail}</span></div>`);
 
   const lastSizeReconcile = m.last_size_reconcile;
   const sizeReconcileDetail = lastSizeReconcile
@@ -2137,6 +2125,71 @@ function renderMaintenance(m) {
   rows.push(`<div class="health-item"><span>Plex Size Reconcile<br>${namesLine(lastSizeReconcile && lastSizeReconcile.names)}</span><span style="font-size:0.75rem;color:var(--text2)">last: ${sizeReconcileDetail}</span></div>`);
 
   body.innerHTML = rows.join('');
+}
+
+// MM/DD/YY HH:MM, 24-hour, local time.
+function formatTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth()+1)}/${pad(d.getDate())}/${pad(d.getFullYear()%100)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Hand-rolled inline-SVG bar chart, no chart library/CDN dependency.
+// `events` is newest-first; buckets into `days` daily counts ending today.
+function dailyBarChart(events, days) {
+  const dayMs = 86400000;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const startMs = today.getTime() - (days - 1) * dayMs;
+  const counts = new Array(days).fill(0);
+  for (const e of events) {
+    if (!e.ts) continue;
+    const idx = Math.floor((e.ts * 1000 - startMs) / dayMs);
+    if (idx >= 0 && idx < days) counts[idx]++;
+  }
+  const max = Math.max(1, ...counts);
+  const w = 100, h = 60, gap = 1;
+  const barW = (w / days) - gap;
+  const bars = counts.map((c, i) => {
+    const barH = c === 0 ? 1 : (c / max) * (h - 4);
+    const x = i * (w / days);
+    const y = h - barH;
+    const cls = c === 0 ? 'report-chart-bar empty' : 'report-chart-bar';
+    return `<rect class="${cls}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${barH.toFixed(2)}"><title>${counts[i]} on day ${i+1}</title></rect>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+function reportCard(title, events, days) {
+  events = events || [];
+  const listHtml = events.length
+    ? events.map(e => `<div class="report-list-item"><span class="name" title="${escapeHtml(e.name || '')}">${escapeHtml(e.name || '(unknown)')}</span><span class="ts">${formatTs(e.ts)}</span></div>`).join('')
+    : `<div class="report-list-empty">No events in the last ${days} days</div>`;
+  return `
+    <div class="report-card">
+      <div class="report-card-header">
+        <span class="report-card-title">${title}</span>
+        <span class="report-card-total"><b>${events.length}</b> in last ${days}d</span>
+      </div>
+      <div class="report-chart">${dailyBarChart(events, days)}</div>
+      <div class="report-chart-caption"><span>${days}d ago</span><span>today</span></div>
+      <div class="report-list">${listHtml}</div>
+    </div>`;
+}
+
+function renderReports(history) {
+  const body = document.getElementById('reportsBody');
+  const days = 30;
+  const cards = [
+    ['Removed Movies (missing from catalog)', history.removed_movies],
+    ['Removed Episodes (missing from catalog)', history.removed_episodes],
+    ['Reactivated Movies', history.reactivated_movies],
+    ['Reactivated Episodes', history.reactivated_episodes],
+    ['Deactivated Movies (manual)', history.deactivated_movies],
+    ['Deactivated Episodes (manual)', history.deactivated_episodes],
+    ['Audio Checks (missing audio)', history.audio_missing],
+  ];
+  body.innerHTML = cards.map(([title, events]) => reportCard(title, events, days)).join('');
 }
 
 // Actions

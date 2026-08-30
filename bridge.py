@@ -104,6 +104,18 @@ class BridgeCore:
     # activity rotates through its history faster than a quiet one.
     ACTIVITY_LOG_MAXLEN = 500
 
+    # Reports tab per-event history (maint_history.json) -- events older
+    # than this are dropped on every write. 30 days keeps card lists/charts
+    # meaningful without the file growing unbounded on a long-running
+    # instance.
+    HISTORY_RETENTION_DAYS = 30
+
+    # Reports tab list length cap per category in the API payload -- history
+    # retains the full 30-day window on disk, but a busy library could still
+    # produce a long list in that window; this keeps the dashboard
+    # payload/DOM bounded while the underlying file keeps full retention.
+    HISTORY_PAYLOAD_LIMIT = 200
+
     # _last_play_log, _redirect_locks, _recent_redirects, and
     # _stall_last_switch all gain one entry per distinct movie (or
     # movie+stream) ever played/redirected/stalled, and — unlike
@@ -231,6 +243,26 @@ class BridgeCore:
             "last_audio_check": None,     # {"ts", "movie_id", "name", "stream_id", "provider", "status"}
             "last_size_reconcile": None,  # {"ts", "checked", "confirmed", "names"}
         }
+        # Per-event history for the Reports tab (scrollable lists + charts),
+        # separate from _maint_stats above (which only ever tracks totals +
+        # the single most-recent event per category). Kept in its own file
+        # (maint_history.json) with its own lock and save path, deliberately
+        # NOT routed through _save_state()'s full-state fsync -- history
+        # writes happen on the same no-op cleanup passes that PR #5's review
+        # (2026-08-30) just stopped fsyncing bridge_state.json for, so
+        # coupling them back to that path would undo that fix. Each list
+        # holds {"ts", "name", ...} events, newest last, pruned to the last
+        # HISTORY_RETENTION_DAYS on every write.
+        self._maint_history = {
+            "removed_movies": [],
+            "removed_episodes": [],
+            "reactivated_movies": [],
+            "reactivated_episodes": [],
+            "deactivated_movies": [],
+            "deactivated_episodes": [],
+            "audio_missing": [],
+        }
+        self._maint_history_lock = threading.Lock()
 
     def initialize(self):
         os.makedirs(self._data_dir, exist_ok=True)
@@ -691,14 +723,17 @@ class BridgeCore:
         removed = [mid for mid in self._activated.keys() if mid not in existing_ids]
 
         if not removed:
+            # In-memory only on the no-op path -- _save_state() does a full
+            # atomic fsync of the entire activation dict plus a per-title
+            # sidecar rewrite for every activated movie, which is wasteful to
+            # run on every routine pass just to persist a timestamp. This
+            # "last checked" value is lost on restart and reverts to the last
+            # real save; that's an accepted trade against paying full-state
+            # I/O every ~35min on a large library for a check that changed
+            # nothing (PR #5 review, 2026-08-30).
             self._maint_stats["last_removed_check"] = {
                 "ts": time.time(), "checked": len(activated_ids), "removed": 0,
             }
-            self._save_state()
-            self._log_event(
-                "info",
-                f"Cleanup check: {len(activated_ids)} activated movie(s) checked, none removed",
-            )
             return
 
         # Names must be resolved before removal — the movie's own catalog row
@@ -726,6 +761,8 @@ class BridgeCore:
             "removed_names": removed_names,
         }
         self._save_state()
+        for name in removed_names:
+            self._append_history("removed_movies", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in removed_names)
         self._log_event(
@@ -808,14 +845,11 @@ class BridgeCore:
                 )
 
         if not removed:
+            # See matching comment in _reconcile_removed_movies(): skip the
+            # full _save_state() write on the no-op path, in-memory only.
             self._maint_stats["last_removed_episode_check"] = {
                 "ts": time.time(), "checked": len(activated_ids), "removed": 0,
             }
-            self._save_state()
-            self._log_event(
-                "info",
-                f"Cleanup check: {len(activated_ids)} activated episode(s) checked, none removed",
-            )
             return
 
         removed_names = [
@@ -854,6 +888,8 @@ class BridgeCore:
             "removed_names": removed_names, "plex_removed": plex_removed,
         }
         self._save_state()
+        for name in removed_names:
+            self._append_history("removed_episodes", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in removed_names)
         self._log_event(
@@ -1060,6 +1096,8 @@ class BridgeCore:
             "ts": time.time(), "reactivated": reactivated, "names": names,
         }
         self._save_state()
+        for name in names:
+            self._append_history("reactivated_movies", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in names)
         self._log_event(
@@ -1128,6 +1166,8 @@ class BridgeCore:
 
         if not self._activated:
             self._recover_activated_from_sidecars()
+
+        self._load_history()
 
         lang_file = os.path.join(self._data_dir, "language_cache.json")
         if os.path.exists(lang_file):
@@ -1254,6 +1294,48 @@ class BridgeCore:
         # (synthetic listing entries only, per za8) so the payoff is lower.
         # Revisit if episode reactivation-after-loss becomes a real problem.
 
+    def _load_history(self):
+        history_file = os.path.join(self._data_dir, "maint_history.json")
+        if not os.path.exists(history_file):
+            return
+        try:
+            with open(history_file, "r") as f:
+                loaded = json.load(f)
+            for key in self._maint_history:
+                if isinstance(loaded.get(key), list):
+                    self._maint_history[key] = loaded[key]
+        except Exception as e:
+            logger.error(f"Failed to load maintenance history: {e}")
+
+    def _save_history(self):
+        # Deliberately separate from _save_state()'s tmp-then-rename+fsync
+        # of the whole activation state -- history events are appended far
+        # more often (every reconciliation pass) and don't need the same
+        # crash-durability guarantee bridge_state.json does (worst case on
+        # loss: Reports tab history is thin until new events repopulate it,
+        # nothing breaks). Still atomic-rename to avoid a truncated file.
+        history_file = os.path.join(self._data_dir, "maint_history.json")
+        tmp_file = history_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(self._maint_history, f)
+            os.replace(tmp_file, history_file)
+        except Exception as e:
+            logger.error(f"Failed to save maintenance history: {e}")
+
+    def _append_history(self, category, entry):
+        """Append one event dict (must include 'ts') to a Reports-tab history
+        category, prune anything older than HISTORY_RETENTION_DAYS, and
+        persist. category must be a key already present in _maint_history."""
+        cutoff = time.time() - (self.HISTORY_RETENTION_DAYS * 86400)
+        with self._maint_history_lock:
+            bucket = self._maint_history.setdefault(category, [])
+            bucket.append(entry)
+            self._maint_history[category] = [
+                e for e in bucket if e.get("ts", 0) >= cutoff
+            ]
+            self._save_history()
+
     def _save_languages(self):
         lang_file = os.path.join(self._data_dir, "language_cache.json")
         try:
@@ -1297,6 +1379,12 @@ class BridgeCore:
             "provider": result.get("provider_name"),
             "status": result.get("status"),
         }
+        if result.get("status") == "missing":
+            self._append_history("audio_missing", {
+                "ts": result.get("checked_at") or time.time(),
+                "name": movie.name,
+                "provider": result.get("provider_name"),
+            })
         if persist:
             self._save_state()
 
@@ -2471,6 +2559,8 @@ class BridgeCore:
             "ts": time.time(), "reactivated": reactivated, "names": names,
         }
         self._save_state()
+        for name in names:
+            self._append_history("reactivated_episodes", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in names)
         self._log_event(
@@ -2720,6 +2810,14 @@ class BridgeCore:
         if deactivated:
             self._remove_strm_for_episodes(removal_info)
             plex_removed = self._plex_delete_episodes(plex_match_info)
+            for eid in deactivated:
+                entry = plex_match_info.get(eid, {})
+                name = (
+                    f'{entry.get("series_name", "?")} '
+                    f'S{entry.get("season_number", "?")}'
+                    f'E{entry.get("episode_number", "?")}'
+                )
+                self._append_history("deactivated_episodes", {"ts": time.time(), "name": name})
             self._log_event(
                 "info",
                 f"Deactivated {len(deactivated)} episode(s) — removed {plex_removed} from Plex",
@@ -3949,10 +4047,18 @@ class BridgeCore:
         return {
             "health": checks,
             "maintenance": self._maint_stats,
+            "maintenance_history": self._maintenance_history_payload(),
             "providers": self._provider_status,
             "providers_checked_at": self._last_provider_check or None,
             "external_ip": self._external_ip,
         }
+
+    def _maintenance_history_payload(self):
+        with self._maint_history_lock:
+            return {
+                category: list(reversed(events))[: self.HISTORY_PAYLOAD_LIMIT]
+                for category, events in self._maint_history.items()
+            }
 
     def _fetch_external_ip(self):
         """Cheap, rarely-changing lookup -- cached indefinitely once
@@ -4100,6 +4206,8 @@ class BridgeCore:
             self._remove_strm_for_movies(deactivated, folder_hints=folder_hints)
             plex_removed = self._plex_delete_movies(deactivated)
             names = self._movie_names(deactivated)
+            for name in names:
+                self._append_history("deactivated_movies", {"ts": time.time(), "name": name})
             titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
                 "info",
@@ -5021,6 +5129,12 @@ class BridgeCore:
             "provider": result.get("provider_name"),
             "status": result.get("status"),
         }
+        if result.get("status") == "missing":
+            self._append_history("audio_missing", {
+                "ts": result.get("checked_at") or time.time(),
+                "name": movie.name,
+                "provider": result.get("provider_name"),
+            })
         self._save_state()
 
         audio_count = result.get("audio_stream_count")
