@@ -4646,6 +4646,8 @@ class BridgeCore:
         # matched (confirmed live: "EN - Hanna (US)" job stuck 0/58). Only
         # strip when the tag is a real country code (_COUNTRY_SUFFIX_CODES)
         # -- a title that just happens to end in "(XX)" is left alone.
+        # Live-verified 2026-08-30: full 36-episode "EN - Our Girl (GB)"
+        # activation, 35/35 Plex-confirmed, 0 failed, no hang.
         suffix_match = re.search(r"\s*\(([A-Z]{2,3})\)\s*$", name)
         if suffix_match and suffix_match.group(1) in self._COUNTRY_SUFFIX_CODES:
             name = name[:suffix_match.start()]
