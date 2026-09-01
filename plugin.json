@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "2.4.9",
+  "version": "2.5.0",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -136,6 +136,19 @@
       "default": 7,
       "help_text": "How often each activated movie's cached provider pick is automatically cleared so the next play re-resolves fresh (light touch only — no STRM/Plex changes, movies currently playing are skipped). Set to 0 to disable. Use the dashboard's Refresh/Reactivate buttons for an on-demand or full fix.",
       "min": 0
+    },
+    {
+      "id": "_section_content_filtering",
+      "label": "Content Filtering",
+      "type": "info",
+      "description": "Controls which categories are shown on the dashboard."
+    },
+    {
+      "id": "hide_adult_categories",
+      "label": "Hide Adult Categories",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Excludes any category whose name contains \"Adult\" or \"Adults\" (e.g. 'Adult', 'FOR ADULTS', 'VOD Adults') from the dashboard's movie/series browse, category filters, and catalog summary. Uncheck to show adult categories again."
     },
     {
       "id": "_section_language",

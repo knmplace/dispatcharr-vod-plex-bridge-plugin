@@ -9,3 +9,18 @@ logs/
 .share.notes/
 *.code-workspace
 *.zip
+tests/
+pytest.ini
+.claude/
+.playwright-mcp/
+channel-mapping-scratch/
+
+# Local/provider details -- never commit real host IPs, provider names, or
+# scratch dumps pulled from the live catalog (screenshots, snapshots, debug
+# output can capture these even when the code doesn't).
+*.env
+.env.*
+*-scratch/
+*.scratch.*
+debug-*.txt
+debug-*.json

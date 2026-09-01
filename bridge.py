@@ -1470,9 +1470,12 @@ class BridgeCore:
         try:
             from apps.vod.models import VODCategory, M3UMovieRelation
             from django.db.models import Count
+            hide_adult = self._hide_adult_categories()
             for cat in VODCategory.objects.annotate(
                 movie_count=Count("m3umovierelation")
             ).filter(movie_count__gt=0).order_by("-movie_count"):
+                if hide_adult and self._is_adult_category_name(cat.name):
+                    continue
                 categories.append(
                     {
                         "id": cat.id,
@@ -1500,6 +1503,143 @@ class BridgeCore:
             "categories": categories,
         }
 
+    def _movie_provider_names(self, movie_ids):
+        """movie id (str) -> provider/M3U account name, one query for the
+        whole set. Used to label duplicate-group members so the user can see
+        WHICH provider each candidate in "score 99 vs 82" came from, not just
+        the numbers -- ties (e.g. 81 vs 81) are otherwise indistinguishable."""
+        if not movie_ids:
+            return {}
+        from apps.vod.models import M3UMovieRelation
+
+        names = {}
+        for row in (
+            M3UMovieRelation.objects.filter(movie_id__in=movie_ids)
+            .select_related("m3u_account")
+            .order_by("movie_id", "-m3u_account__priority", "id")
+        ):
+            mid = str(row.movie_id)
+            if mid not in names and row.m3u_account:
+                names[mid] = row.m3u_account.name
+        return names
+
+    def _series_provider_names(self, series_ids):
+        """series id (str) -> provider/M3U account name, one query for the
+        whole set. See _movie_provider_names."""
+        if not series_ids:
+            return {}
+        from apps.vod.models import M3USeriesRelation
+
+        names = {}
+        for row in (
+            M3USeriesRelation.objects.filter(series_id__in=series_ids)
+            .select_related("m3u_account")
+            .order_by("series_id", "-m3u_account__priority", "id")
+        ):
+            sid = str(row.series_id)
+            if sid not in names and row.m3u_account:
+                names[sid] = row.m3u_account.name
+        return names
+
+    _ADULT_CATEGORY_NAME_RE = re.compile(r"\badult(s)?\b", re.IGNORECASE)
+
+    @classmethod
+    def _is_adult_category_name(cls, name):
+        # Name-pattern match rather than hardcoded IDs -- category IDs are
+        # provider/environment-specific, but "adult"/"Adult(s)" as a whole
+        # word in the category name is stable across catalogs (confirmed
+        # live: "Adult", "FOR ADULTS", "VOD Adults").
+        return bool(cls._ADULT_CATEGORY_NAME_RE.search(name or ""))
+
+    def _adult_category_ids(self):
+        try:
+            from apps.vod.models import VODCategory
+
+            return {
+                cat.id for cat in VODCategory.objects.all()
+                if self._is_adult_category_name(cat.name)
+            }
+        except Exception:
+            return set()
+
+    def _hide_adult_categories(self):
+        return self.settings.get("hide_adult_categories", True)
+
+    @staticmethod
+    def _normalize_title_for_grouping(name):
+        name = (name or "").casefold().strip()
+        # Doubled year tag, e.g. "42 (2013) (2013)" -- strip repeats first so
+        # the single trailing-year strip below still catches the remainder.
+        name = re.sub(r"\s*\(((?:19|20)\d{2})\)(?:\s*\(\1\))+\s*$", r" (\1)", name)
+        name = re.sub(r"\s*\(((?:19|20)\d{2})\)\s*$", "", name)
+        name = re.sub(r"\s*-\s*((?:19|20)\d{2})\s*$", "", name)
+        name = re.sub(r"^(the|a|an)\s+", "", name)
+        name = re.sub(r"[^\w\s]", " ", name)
+        name = re.sub(r"\s+", " ", name)
+        return name.strip()
+
+    @staticmethod
+    def _group_duplicates(items):
+        """Cluster same-title rows into duplicate groups (bead cuyc, Phase 1).
+
+        Read-only: never touches Dispatcharr's own Movie/Series rows, just
+        groups the already-fetched dict rows so the caller can collapse them
+        into one card / pick a tie-break winner. Clustering key is normalized
+        name + year (adjacent years treated as the same title, since
+        providers sometimes disagree on premiere vs. import year), then any
+        cluster containing two differing non-null tmdb_id values is split
+        back apart -- a shared title/year with confirmed different tmdb_id
+        means they're genuinely different titles. Members within a group are
+        sorted best-first by "_rank_signal" (caller-supplied, higher wins).
+        """
+        # Indexed by norm_name first so placement is O(candidates sharing
+        # that title) instead of O(every bucket ever created) -- the naive
+        # linear scan over buckets.items() went quadratic on a full ~85k-row
+        # catalog (tens of thousands of distinct titles) and pegged the WSGI
+        # thread at 100%+ CPU for minutes, wedging the plugin server.
+        by_name = {}
+        for item in items:
+            norm_name = BridgeCore._normalize_title_for_grouping(item.get("name"))
+            year = item.get("year")
+            candidates = by_name.setdefault(norm_name, [])
+            placed = False
+            for bucket_year, members in candidates:
+                if year is None or bucket_year is None or abs(year - bucket_year) <= 1:
+                    members.append(item)
+                    placed = True
+                    break
+            if not placed:
+                candidates.append((year, [item]))
+
+        buckets = {}
+        for norm_name, candidates in by_name.items():
+            for idx, (year, members) in enumerate(candidates):
+                buckets[(norm_name, idx)] = members
+
+        groups = []
+        for members in buckets.values():
+            tmdb_ids = {m.get("tmdb_id") for m in members if m.get("tmdb_id")}
+            if len(tmdb_ids) <= 1:
+                clusters = [members]
+            else:
+                by_tmdb = {}
+                for m in members:
+                    tid = m.get("tmdb_id") or None
+                    by_tmdb.setdefault(tid, []).append(m)
+                # Members with no tmdb_id can't be told apart from a
+                # confirmed match, so fold them into the first real
+                # tmdb-identified cluster rather than stranding them alone.
+                unidentified = by_tmdb.pop(None, [])
+                clusters = list(by_tmdb.values())
+                if unidentified:
+                    clusters[0].extend(unidentified)
+            groups.extend(clusters)
+
+        for group in groups:
+            group.sort(key=lambda m: m.get("_rank_signal", 0), reverse=True)
+
+        return groups
+
     def list_movies(self, query):
         try:
             from apps.vod.models import Movie
@@ -1512,6 +1652,7 @@ class BridgeCore:
             category_ids = [v for v in query.get("category_id", []) if v]
             languages = [v for v in query.get("language", []) if v]
             activated_only = query.get("activated_only", [""])[0]
+            group_duplicates = query.get("group_duplicates", [""])[0]
 
             qs = Movie.objects.all()
 
@@ -1538,6 +1679,11 @@ class BridgeCore:
             elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
+            if self._hide_adult_categories():
+                adult_ids = self._adult_category_ids()
+                if adult_ids:
+                    qs = qs.exclude(m3u_relations__category_id__in=adult_ids)
+
             if activated_only:
                 activated_ids = [int(mid) for mid in self._activated.keys() if mid.isdigit()]
                 if activated_ids:
@@ -1553,49 +1699,49 @@ class BridgeCore:
                     f"list_movies: total={total} page={page} per_page={per_page} "
                     f"filters(search={bool(search)}, director={bool(director)}, "
                     f"providers={provider_ids}, categories={category_ids}, "
-                    f"languages={languages}, activated_only={bool(activated_only)})",
+                    f"languages={languages}, activated_only={bool(activated_only)}, "
+                    f"group_duplicates={bool(group_duplicates)})",
                 )
 
-            offset = (page - 1) * per_page
-            movies = []
-            for m in qs.select_related("logo")[offset : offset + per_page]:
-                mid = str(m.id)
-                poster = ""
-                try:
-                    if m.logo and m.logo.url:
-                        poster = m.logo.url
-                except Exception:
-                    pass
-                trailer_key = None
-                director_name = None
-                try:
-                    cp = getattr(m, "custom_properties", None) or {}
-                    if isinstance(cp, str):
-                        import json as _json
-                        cp = _json.loads(cp)
-                    trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
-                    director_name = cp.get("director") or None
-                except Exception:
-                    pass
-
-                movies.append(
-                    {
-                        "id": mid,
-                        "name": m.name,
-                        "year": getattr(m, "year", None),
-                        "rating": getattr(m, "rating", None),
-                        "genre": getattr(m, "genre", ""),
-                        "tmdb_id": getattr(m, "tmdb_id", None),
-                        "poster": poster,
-                        "description": getattr(m, "description", ""),
-                        "uuid": str(getattr(m, "uuid", "")),
-                        "activated": mid in self._activated,
-                        "trailer_key": trailer_key,
-                        "director": director_name,
-                        "language": self._languages.get(mid),
-                        "audio_check": self._current_audio_summary(mid) if mid in self._activated else None,
-                    }
-                )
+            if group_duplicates:
+                # Duplicate grouping (bead cuyc) needs the full filtered set
+                # clustered before paginating, same reason list_series()
+                # materializes fully for its activated_category sort --
+                # collapsing rows into groups changes what "page N" means, so
+                # it can't be done on a DB-level slice.
+                all_movies = [self._movie_to_dict(m) for m in qs.select_related("logo")]
+                groups = self._group_duplicates(all_movies)
+                total = len(groups)
+                offset = (page - 1) * per_page
+                page_groups = groups[offset : offset + per_page]
+                page_group_ids = [g["id"] for group in page_groups for g in group]
+                provider_names = self._movie_provider_names(page_group_ids)
+                movies = []
+                for group in page_groups:
+                    best = {k: v for k, v in group[0].items() if k != "_rank_signal"}
+                    best["duplicate_count"] = len(group)
+                    best["duplicate_ids"] = [g["id"] for g in group[1:]]
+                    best["rank_score"] = group[0].get("_rank_signal", 0)
+                    best["provider_name"] = provider_names.get(str(group[0]["id"]))
+                    best["duplicate_members"] = [
+                        {
+                            "id": g["id"],
+                            "name": g.get("name"),
+                            "year": g.get("year"),
+                            "tmdb_id": g.get("tmdb_id"),
+                            "poster": bool(g.get("poster")),
+                            "rank_score": g.get("_rank_signal", 0),
+                            "provider_name": provider_names.get(str(g["id"])),
+                        }
+                        for g in group
+                    ]
+                    movies.append(best)
+            else:
+                offset = (page - 1) * per_page
+                movies = [
+                    {k: v for k, v in self._movie_to_dict(m).items() if k != "_rank_signal"}
+                    for m in qs.select_related("logo")[offset : offset + per_page]
+                ]
 
             return {
                 "movies": movies,
@@ -1609,6 +1755,45 @@ class BridgeCore:
             if self.settings.get("debug_connections"):
                 self._log_event("debug", f"list_movies query failed: {e}")
             return {"movies": [], "total": 0, "error": str(e)}
+
+    def _movie_to_dict(self, m):
+        mid = str(m.id)
+        poster = ""
+        try:
+            if m.logo and m.logo.url:
+                poster = m.logo.url
+        except Exception:
+            pass
+        trailer_key = None
+        director_name = None
+        try:
+            cp = getattr(m, "custom_properties", None) or {}
+            if isinstance(cp, str):
+                import json as _json
+                cp = _json.loads(cp)
+            trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
+            director_name = cp.get("director") or None
+        except Exception:
+            pass
+
+        tmdb_id = getattr(m, "tmdb_id", None)
+        return {
+            "id": mid,
+            "name": m.name,
+            "year": getattr(m, "year", None),
+            "rating": getattr(m, "rating", None),
+            "genre": getattr(m, "genre", ""),
+            "tmdb_id": tmdb_id,
+            "poster": poster,
+            "description": getattr(m, "description", ""),
+            "uuid": str(getattr(m, "uuid", "")),
+            "activated": mid in self._activated,
+            "trailer_key": trailer_key,
+            "director": director_name,
+            "language": self._languages.get(mid),
+            "audio_check": self._current_audio_summary(mid) if mid in self._activated else None,
+            "_rank_signal": (1 if poster else 0) + (1 if tmdb_id else 0),
+        }
 
     def list_activated(self):
         return {
@@ -1646,6 +1831,11 @@ class BridgeCore:
                 qs = qs.filter(m3u_relations__m3u_account_id__in=[int(p) for p in provider_ids]).distinct()
             elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
+
+            if self._hide_adult_categories():
+                adult_ids = self._adult_category_ids()
+                if adult_ids:
+                    qs = qs.exclude(m3u_relations__category_id__in=adult_ids)
 
             ids = list(qs.values_list("id", flat=True))
             return {"movie_ids": [str(i) for i in ids], "count": len(ids)}
@@ -1766,6 +1956,28 @@ class BridgeCore:
                 counts[sid] = counts.get(sid, 0) + 1
         return counts
 
+    def _fetched_episode_counts(self, series_ids):
+        """id -> locally-fetched episode count for the given series ids, via
+        a single batched query instead of s.episodes.count() per series --
+        that per-row query pattern was the dominant cost of a series-browse
+        page load (confirmed live: 30-45s loads on the full/grouped catalog,
+        one round trip per series), since _series_to_dict() runs across the
+        entire filtered set (not just the current page) whenever
+        group_duplicates or the activated_category sort is active."""
+        if not series_ids:
+            return {}
+        from apps.vod.models import Episode
+        from django.db.models import Count
+
+        counts = {}
+        for row in (
+            Episode.objects.filter(series_id__in=series_ids)
+            .values("series_id")
+            .annotate(cnt=Count("id"))
+        ):
+            counts[row["series_id"]] = row["cnt"]
+        return counts
+
     def _activated_series_categories(self):
         """series_id (str) -> activated_category name, same aggregation
         approach as _activated_series_episode_counts -- used both to render
@@ -1794,6 +2006,7 @@ class BridgeCore:
             category_ids = [v for v in query.get("category_id", []) if v]
             activated_only = query.get("activated_only", [""])[0]
             sort_by = query.get("sort", [""])[0]
+            group_duplicates = query.get("group_duplicates", [""])[0]
 
             activated_counts = self._activated_series_episode_counts()
             activated_categories = self._activated_series_categories() if sort_by == "activated_category" else None
@@ -1826,6 +2039,11 @@ class BridgeCore:
             elif category_ids:
                 qs = qs.filter(m3u_relations__category_id__in=[int(c) for c in category_ids]).distinct()
 
+            if self._hide_adult_categories():
+                adult_ids = self._adult_category_ids()
+                if adult_ids:
+                    qs = qs.exclude(m3u_relations__category_id__in=adult_ids)
+
             if activated_only:
                 activated_ids = [int(sid) for sid in activated_counts.keys() if sid.isdigit()]
                 if activated_ids:
@@ -1843,7 +2061,43 @@ class BridgeCore:
                 )
 
             offset = (page - 1) * per_page
-            if sort_by == "activated_category":
+            if group_duplicates:
+                # Same reasoning as list_movies(): grouping changes what
+                # "page N" means, so it must happen on the full filtered set
+                # before slicing, not on a DB-level page slice.
+                series_rows = list(qs.select_related("logo"))
+                fetched_episode_counts = self._fetched_episode_counts([s.id for s in series_rows])
+                all_series = [
+                    self._series_to_dict(s, activated_counts, activated_categories, fetched_episode_counts)
+                    for s in series_rows
+                ]
+                groups = self._group_duplicates(all_series)
+                total = len(groups)
+                page_groups = groups[offset : offset + per_page]
+                page_group_ids = [g["id"] for group in page_groups for g in group]
+                provider_names = self._series_provider_names(page_group_ids)
+                series_list = []
+                for group in page_groups:
+                    best = {k: v for k, v in group[0].items() if k != "_rank_signal"}
+                    best["duplicate_count"] = len(group)
+                    best["duplicate_ids"] = [g["id"] for g in group[1:]]
+                    best["rank_score"] = group[0].get("_rank_signal", 0)
+                    best["provider_name"] = provider_names.get(str(group[0]["id"]))
+                    best["duplicate_members"] = [
+                        {
+                            "id": g["id"],
+                            "name": g.get("name"),
+                            "year": g.get("year"),
+                            "tmdb_id": g.get("tmdb_id"),
+                            "episode_count": g.get("episode_count"),
+                            "poster": bool(g.get("poster")),
+                            "rank_score": g.get("_rank_signal", 0),
+                            "provider_name": provider_names.get(str(g["id"])),
+                        }
+                        for g in group
+                    ]
+                    series_list.append(best)
+            elif sort_by == "activated_category":
                 # Category name isn't a DB column on Series (it's derived from
                 # our own activation-state dict), so this sort has to happen
                 # in Python across the full filtered set before paginating,
@@ -1857,73 +2111,18 @@ class BridgeCore:
                     )
                 )
                 page_series = all_series[offset : offset + per_page]
+                fetched_episode_counts = self._fetched_episode_counts([s.id for s in page_series])
+                series_list = [
+                    {k: v for k, v in self._series_to_dict(s, activated_counts, activated_categories, fetched_episode_counts).items() if k != "_rank_signal"}
+                    for s in page_series
+                ]
             else:
-                page_series = qs.select_related("logo")[offset : offset + per_page]
-
-            series_list = []
-            for s in page_series:
-                sid = str(s.id)
-                poster = ""
-                try:
-                    if s.logo and s.logo.url:
-                        poster = s.logo.url
-                except Exception:
-                    pass
-                trailer_key = None
-                try:
-                    cp = getattr(s, "custom_properties", None) or {}
-                    if isinstance(cp, str):
-                        import json as _json
-                        cp = _json.loads(cp)
-                    trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
-                except Exception:
-                    cp = {}
-
-                if activated_categories is not None:
-                    activated_category = activated_categories.get(sid)
-                else:
-                    activated_category = None
-                    if sid in activated_counts:
-                        for entry in self._episodes_activated.values():
-                            if str(entry.get("series_id")) == sid:
-                                category_id = entry.get("category_id")
-                                if category_id:
-                                    cat = self._resolve_series_category(category_id)
-                                    if cat:
-                                        activated_category = cat.get("name")
-                                break
-
-                # The model's own episode_count is Dispatcharr's catalog-reported
-                # figure and is frequently None/stale. Episodes are only actually
-                # fetched into the DB lazily (see _ensure_episodes_fetched), so if
-                # they're already present locally, use that real count instead --
-                # without triggering a fetch here, since this runs per-page over
-                # up to per_page series on every browse load.
-                fetched_episode_count = s.episodes.count()
-                episode_count = fetched_episode_count or getattr(s, "episode_count", None)
-                sid_activated = activated_counts.get(sid, 0)
-                fully_activated = bool(
-                    fetched_episode_count and sid_activated >= fetched_episode_count
-                )
-
-                series_list.append(
-                    {
-                        "id": sid,
-                        "name": s.name,
-                        "year": getattr(s, "year", None),
-                        "rating": getattr(s, "rating", None),
-                        "genre": getattr(s, "genre", ""),
-                        "tmdb_id": getattr(s, "tmdb_id", None),
-                        "poster": poster,
-                        "description": getattr(s, "description", ""),
-                        "uuid": str(getattr(s, "uuid", "")),
-                        "episode_count": episode_count,
-                        "trailer_key": trailer_key,
-                        "activated_episode_count": sid_activated,
-                        "fully_activated": fully_activated,
-                        "activated_category": activated_category,
-                    }
-                )
+                page_series = list(qs.select_related("logo")[offset : offset + per_page])
+                fetched_episode_counts = self._fetched_episode_counts([s.id for s in page_series])
+                series_list = [
+                    {k: v for k, v in self._series_to_dict(s, activated_counts, activated_categories, fetched_episode_counts).items() if k != "_rank_signal"}
+                    for s in page_series
+                ]
 
             return {
                 "series": series_list,
@@ -1937,6 +2136,75 @@ class BridgeCore:
             if self.settings.get("debug_connections"):
                 self._log_event("debug", f"list_series query failed: {e}")
             return {"series": [], "total": 0, "error": str(e)}
+
+    def _series_to_dict(self, s, activated_counts, activated_categories, fetched_episode_counts=None):
+        sid = str(s.id)
+        poster = ""
+        try:
+            if s.logo and s.logo.url:
+                poster = s.logo.url
+        except Exception:
+            pass
+        trailer_key = None
+        try:
+            cp = getattr(s, "custom_properties", None) or {}
+            if isinstance(cp, str):
+                import json as _json
+                cp = _json.loads(cp)
+            trailer_key = cp.get("youtube_trailer") or cp.get("trailer") or None
+        except Exception:
+            pass
+
+        if activated_categories is not None:
+            activated_category = activated_categories.get(sid)
+        else:
+            activated_category = None
+            if sid in activated_counts:
+                for entry in self._episodes_activated.values():
+                    if str(entry.get("series_id")) == sid:
+                        category_id = entry.get("category_id")
+                        if category_id:
+                            cat = self._resolve_series_category(category_id)
+                            if cat:
+                                activated_category = cat.get("name")
+                        break
+
+        # The model's own episode_count is Dispatcharr's catalog-reported
+        # figure and is frequently None/stale. Episodes are only actually
+        # fetched into the DB lazily (see _ensure_episodes_fetched), so if
+        # they're already present locally, use that real count instead --
+        # without triggering a fetch here, since this runs per-page over
+        # up to per_page series on every browse load. Callers batch-fetch
+        # this via _fetched_episode_counts() (one query for the whole set)
+        # instead of a per-row s.episodes.count() -- that was the dominant
+        # cost of a series-browse page load (bead xg8p, confirmed live).
+        if fetched_episode_counts is not None:
+            fetched_episode_count = fetched_episode_counts.get(s.id, 0)
+        else:
+            fetched_episode_count = s.episodes.count()
+        episode_count = fetched_episode_count or getattr(s, "episode_count", None)
+        sid_activated = activated_counts.get(sid, 0)
+        fully_activated = bool(
+            fetched_episode_count and sid_activated >= fetched_episode_count
+        )
+
+        return {
+            "id": sid,
+            "name": s.name,
+            "year": getattr(s, "year", None),
+            "rating": getattr(s, "rating", None),
+            "genre": getattr(s, "genre", ""),
+            "tmdb_id": getattr(s, "tmdb_id", None),
+            "poster": poster,
+            "description": getattr(s, "description", ""),
+            "uuid": str(getattr(s, "uuid", "")),
+            "episode_count": episode_count,
+            "trailer_key": trailer_key,
+            "activated_episode_count": sid_activated,
+            "fully_activated": fully_activated,
+            "activated_category": activated_category,
+            "_rank_signal": episode_count or 0,
+        }
 
     def _ensure_episodes_fetched(self, series):
         """Mirror Dispatcharr's own on-demand episode fetch: episodes are not
@@ -3702,8 +3970,11 @@ class BridgeCore:
             else:
                 qs = qs.annotate(movie_count=Count("m3umovierelation"))
 
+            hide_adult = self._hide_adult_categories()
             cats = []
             for cat in qs.filter(movie_count__gt=0).order_by("name"):
+                if hide_adult and self._is_adult_category_name(cat.name):
+                    continue
                 cats.append(
                     {"id": cat.id, "name": cat.name, "count": cat.movie_count}
                 )
@@ -3754,8 +4025,11 @@ class BridgeCore:
             else:
                 qs = qs.annotate(series_count=Count("m3useriesrelation"))
 
+            hide_adult = self._hide_adult_categories()
             cats = []
             for cat in qs.filter(series_count__gt=0).order_by("name"):
+                if hide_adult and self._is_adult_category_name(cat.name):
+                    continue
                 cats.append(
                     {"id": cat.id, "name": cat.name, "count": cat.series_count}
                 )
