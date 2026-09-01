@@ -218,9 +218,9 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
 }
 .dup-badge::before { content: '\26A0'; font-size: 0.7rem; }
 .activate-btn { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--green); font-size: 1rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
-.movie-card:hover .activate-btn { opacity: 1; }
+.movie-card:hover .activate-btn, .activate-btn.is-busy { opacity: 1; }
 .reactivate-btn { position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,0.7); border: none; color: var(--amber); font-size: 0.9rem; cursor: pointer; border-radius: 4px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; z-index: 2; }
-.movie-card:hover .reactivate-btn { opacity: 1; }
+.movie-card:hover .reactivate-btn, .reactivate-btn.is-busy { opacity: 1; }
 .audio-btn {
   position: absolute;
   top: 4px;
@@ -440,6 +440,7 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="tab" data-tab="logs" onclick="switchTab('logs')">Logs</div>
     <div class="tab" data-tab="health" onclick="switchTab('health')">Health</div>
     <div class="tab" data-tab="reports" onclick="switchTab('reports')">Reports</div>
+    <div class="tab" data-tab="needsAttention" onclick="switchTab('needsAttention')">Needs Attention <span class="badge" id="needsAttentionBadge" style="display:none">0</span></div>
     <div class="tab" data-tab="seriesSettings" onclick="switchTab('seriesSettings')">Series Settings</div>
   </div>
   <div class="tabs-stats">
@@ -747,6 +748,40 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
     <div class="reports-grid" id="reportsBody"></div>
   </div>
 
+  <!-- Needs Attention Tab -->
+  <div class="tab-pane" id="pane-needsAttention">
+    <div class="panel">
+      <div class="panel-header">
+        <span>Needs Attention</span>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn btn-outline btn-sm" onclick="loadNeedsAttention()">Refresh</button>
+          <button class="btn btn-primary btn-sm" id="naRetrySelectedBtn" onclick="retryNeedsAttention()" disabled>Retry Selected</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <p style="font-size:0.8rem;color:var(--text2);margin:0 0 0.75rem;">
+          Movie/episode activations and Plex scans that failed and can be retried. Items clear from this list automatically once a retry succeeds.
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:0.82rem;" id="naTable">
+          <thead>
+            <tr style="text-align:left;border-bottom:1px solid var(--border);">
+              <th style="padding:0.4rem;width:24px;"><input type="checkbox" id="naSelectAll" onchange="toggleNaSelectAll(this)"></th>
+              <th style="padding:0.4rem;">Type</th>
+              <th style="padding:0.4rem;">Name</th>
+              <th style="padding:0.4rem;">Reason</th>
+              <th style="padding:0.4rem;">When</th>
+              <th style="padding:0.4rem;"></th>
+            </tr>
+          </thead>
+          <tbody id="naBody">
+            <tr><td colspan="6" class="loading" style="padding:0.6rem;"><span class="spinner"></span> Loading...</td></tr>
+          </tbody>
+        </table>
+        <div id="naEmpty" style="display:none;font-size:0.85rem;color:var(--text2);padding:1rem 0;text-align:center;">Nothing needs attention right now.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Series Settings Tab -->
   <div class="tab-pane" id="pane-seriesSettings">
     <div class="panel">
@@ -823,6 +858,7 @@ function switchTab(tab) {
   else stopStreamRefresh();
   if (tab === 'health') loadHealth();
   if (tab === 'reports') loadReports();
+  if (tab === 'needsAttention') loadNeedsAttention();
   if (tab === 'logs') { loadProxyLog(); startLogAutoRefresh(); }
   else stopLogAutoRefresh();
   if (tab === 'seriesSettings') loadSeriesCategories();
@@ -865,6 +901,7 @@ let seriesFiltersLoaded = false;
 // would otherwise mean fetching every series' full episode list up front.
 let seriesSelection = new Map(); // key -> {level, seriesId, seriesName, seasonNumber, episodeIds: [] | null}
 let seriesCategoriesCache = [];
+let seriesDestCategoryManuallySet = false;
 let lastCheckedSeriesCheckbox = null; // for shift-click range selection
 
 function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
@@ -873,7 +910,7 @@ function seriesSelKey(level, seriesId, seasonNumber, episodeId) {
   return `episode:${episodeId}`;
 }
 
-function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl, evt, remainingEpisodeCount) {
+function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId, cbEl, evt, remainingEpisodeCount, activatedCategoryId) {
   // Shift+click range selection
   if (evt && evt.shiftKey && lastCheckedSeriesCheckbox && lastCheckedSeriesCheckbox !== cbEl) {
     const allCheckboxes = Array.from(document.querySelectorAll('#seriesGrid .series-select-cb'));
@@ -904,8 +941,10 @@ function toggleSeriesSelect(level, seriesId, seriesName, seasonNumber, episodeId
       level, seriesId, seriesName, seasonNumber,
       episodeIds: level === 'episode' ? [episodeId] : null,
       remainingEpisodeCount: level === 'episode' ? 1 : (remainingEpisodeCount || 0),
+      activatedCategoryId: activatedCategoryId || null,
     });
   }
+  if (seriesSelection.size === 0) seriesDestCategoryManuallySet = false;
   updateSeriesSelectionUI();
 }
 
@@ -930,6 +969,20 @@ function updateSeriesSelectionUI() {
     }
     showsCount.textContent = distinctShows.size;
     episodesCount.textContent = episodeTotal;
+
+    if (!seriesDestCategoryManuallySet) {
+      const catIds = new Set();
+      for (const entry of seriesSelection.values()) {
+        if (entry.activatedCategoryId) catIds.add(String(entry.activatedCategoryId));
+      }
+      const sel = document.getElementById('seriesDestCategorySel');
+      if (catIds.size === 1) {
+        const [onlyCatId] = catIds;
+        if ([...sel.options].some(o => o.value === onlyCatId)) sel.value = onlyCatId;
+      } else {
+        sel.value = '';
+      }
+    }
   } else {
     bar.style.display = 'none';
   }
@@ -947,6 +1000,9 @@ function selectAllSeriesItems() {
 
 function clearAllSeriesSelections() {
   seriesSelection.clear();
+  seriesDestCategoryManuallySet = false;
+  const sel = document.getElementById('seriesDestCategorySel');
+  if (sel) sel.value = '';
   updateSeriesSelectionUI();
 }
 
@@ -964,6 +1020,7 @@ async function loadSeriesCategoriesIntoSelect() {
 
 function onSeriesDestCategoryChange() {
   const sel = document.getElementById('seriesDestCategorySel');
+  seriesDestCategoryManuallySet = true;
   const inline = document.getElementById('seriesAddCatInline');
   if (sel.value === '__add__') {
     inline.style.display = 'flex';
@@ -1139,8 +1196,8 @@ async function quickReactivateEpisode(id, btnEl) {
 function seriesGoBack() {
   if (seriesNav.view === 'episodes') {
     const activatedOnly = seriesNav.activatedOnly;
-    seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null, activatedOnly };
-    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster);
+    seriesNav = { view: 'seasons', seriesId: seriesNav.seriesId, seriesName: seriesNav.seriesName, seriesPoster: seriesNav.seriesPoster, seasonNumber: null, activatedOnly, activatedCategoryId: seriesNav.activatedCategoryId };
+    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster, seriesNav.activatedCategoryId);
   } else if (seriesNav.view === 'seasons') {
     seriesNav = { view: 'series', seriesId: null, seriesName: '', seriesPoster: '', seasonNumber: null };
     loadSeries(seriesCurrentPage);
@@ -1150,9 +1207,9 @@ function seriesGoBack() {
 function toggleSeriesDrillActivatedOnly(checked) {
   seriesNav.activatedOnly = checked;
   if (seriesNav.view === 'episodes') {
-    loadEpisodes(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seasonNumber, seriesNav.seriesPoster);
+    loadEpisodes(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seasonNumber, seriesNav.seriesPoster, seriesNav.activatedCategoryId);
   } else if (seriesNav.view === 'seasons') {
-    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster);
+    loadSeasons(seriesNav.seriesId, seriesNav.seriesName, seriesNav.seriesPoster, seriesNav.activatedCategoryId);
   }
 }
 
@@ -1211,8 +1268,8 @@ async function loadSeries(page) {
       ? `<span class="movie-badge">Active (${s.activated_episode_count})</span>`
       : '';
     const dupBadge = duplicateBadgeHtml(s);
-    return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}${disabled ? disabledReason : ''}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeJsAttr(s.id)}','${escapeJsAttr(s.name)}',null,null,this,event,${remainingCount})">
+    return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" data-series-id="${escapeHtml(s.id)}" data-series-name="${escapeHtml(s.name)}" data-series-poster="${escapeHtml(s.poster||'')}" data-activated-category-id="${escapeHtml(s.activated_category_id||'')}" title="${escapeHtml(s.name)}${s.year ? ' ('+s.year+')' : ''}${disabled ? disabledReason : ''}">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('series','${escapeJsAttr(s.id)}','${escapeJsAttr(s.name)}',null,null,this,event,${remainingCount},'${escapeJsAttr(String(s.activated_category_id||''))}')">
       ${trailerBtn}
       ${actBadge}
       ${dupBadge}
@@ -1227,7 +1284,7 @@ async function loadSeries(page) {
   grid.querySelectorAll('.movie-card').forEach(card => {
     card.addEventListener('click', (e) => {
       if (e.target.classList.contains('series-select-cb')) return;
-      loadSeasons(card.dataset.seriesId, card.dataset.seriesName, card.dataset.seriesPoster);
+      loadSeasons(card.dataset.seriesId, card.dataset.seriesName, card.dataset.seriesPoster, card.dataset.activatedCategoryId);
     });
   });
   updateSeriesSelectionUI();
@@ -1249,10 +1306,10 @@ function seriesPosterCardHtml(poster, label) {
     : `<div class="movie-poster no-poster">${label}</div>`;
 }
 
-async function loadSeasons(seriesId, seriesName, seriesPoster) {
+async function loadSeasons(seriesId, seriesName, seriesPoster, activatedCategoryId) {
   const myToken = ++seriesNavToken;
   const activatedOnly = !!seriesNav.activatedOnly;
-  seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null, activatedOnly };
+  seriesNav = { view: 'seasons', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber: null, activatedOnly, activatedCategoryId };
   document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName}`;
   document.getElementById('seriesBackBtn').style.display = '';
   document.getElementById('seriesSearchBar').style.display = 'none';
@@ -1282,7 +1339,7 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
       ? `<span class="movie-badge">Active (${sn.activated_episode_count})</span>`
       : '';
     return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" data-season-number="${sn.season_number}" title="${label}${disabled ? disabledReason : ''}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${sn.season_number},null,this,event,${remainingCount})">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('season','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${sn.season_number},null,this,event,${remainingCount},'${escapeJsAttr(String(activatedCategoryId||''))}')">
       ${actBadge}
       ${seriesPosterCardHtml(seriesPoster, label)}
       <div class="movie-info">
@@ -1294,16 +1351,16 @@ async function loadSeasons(seriesId, seriesName, seriesPoster) {
   grid.querySelectorAll('.movie-card').forEach(card => {
     card.addEventListener('click', (e) => {
       if (e.target.classList.contains('series-select-cb')) return;
-      loadEpisodes(seriesId, seriesName, parseInt(card.dataset.seasonNumber), seriesPoster);
+      loadEpisodes(seriesId, seriesName, parseInt(card.dataset.seasonNumber), seriesPoster, activatedCategoryId);
     });
   });
   updateSeriesSelectionUI();
 }
 
-async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
+async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster, activatedCategoryId) {
   const myToken = ++seriesNavToken;
   const activatedOnly = !!seriesNav.activatedOnly;
-  seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber, activatedOnly };
+  seriesNav = { view: 'episodes', seriesId, seriesName, seriesPoster: seriesPoster || '', seasonNumber, activatedOnly, activatedCategoryId };
   const seasonLabel = seasonNumber === 0 ? 'Specials' : `Season ${seasonNumber}`;
   document.getElementById('seriesBreadcrumb').textContent = `Series / ${seriesName} / ${seasonLabel}`;
   document.getElementById('seriesBackBtn').style.display = '';
@@ -1333,7 +1390,7 @@ async function loadEpisodes(seriesId, seriesName, seasonNumber, seriesPoster) {
     const disabledReason = activatedOnly ? ' (not activated)' : ' (already activated)';
     const actBadge = ep.activated ? '<span class="movie-badge">Active</span>' : '';
     return `<div class="movie-card ${checked ? 'selected' : ''} ${disabled ? 'fully-activated' : ''}" title="${escapeHtml(titleText)}${disabled ? disabledReason : ''}">
-      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${seasonNumber},'${escapeJsAttr(ep.id)}',this,event,1)">
+      <input type="checkbox" class="series-select-cb" data-sel-key="${key}" ${checked} ${disabled ? 'disabled' : ''} onclick="event.stopPropagation()" onchange="toggleSeriesSelect('episode','${escapeJsAttr(seriesId)}','${escapeJsAttr(seriesName)}',${seasonNumber},'${escapeJsAttr(ep.id)}',this,event,1,'${escapeJsAttr(String(activatedCategoryId||''))}')">
       ${actBadge}
       ${reactivateBtn}
       ${seriesPosterCardHtml(seriesPoster, epLabel)}
@@ -2338,6 +2395,87 @@ async function detectSingleLang(movieId, btn) {
   }
 }
 
+// Needs Attention
+let naItems = [];
+const naKindLabel = { movie: 'Movie', episode: 'Episode', scan: 'Plex Scan' };
+
+async function loadNeedsAttention() {
+  const data = await api('/api/needs-attention');
+  naItems = data.items || [];
+  renderNeedsAttention();
+  updateNeedsAttentionBadge();
+}
+
+function updateNeedsAttentionBadge() {
+  const badge = document.getElementById('needsAttentionBadge');
+  if (naItems.length > 0) {
+    badge.style.display = '';
+    badge.textContent = naItems.length;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function renderNeedsAttention() {
+  const body = document.getElementById('naBody');
+  const empty = document.getElementById('naEmpty');
+  const table = document.getElementById('naTable');
+  const selectAll = document.getElementById('naSelectAll');
+
+  if (!naItems.length) {
+    table.style.display = 'none';
+    empty.style.display = '';
+    updateNaRetryButton();
+    return;
+  }
+  table.style.display = '';
+  empty.style.display = 'none';
+  selectAll.checked = false;
+
+  body.innerHTML = naItems.map(item => `
+    <tr style="border-bottom:1px solid var(--border);">
+      <td style="padding:0.4rem;"><input type="checkbox" class="naRowCheck" value="${escapeJsAttr(item.attn_id)}" onchange="updateNaRetryButton()"></td>
+      <td style="padding:0.4rem;">${escapeHtml(naKindLabel[item.kind] || item.kind)}</td>
+      <td style="padding:0.4rem;">${escapeHtml(item.name || '')}</td>
+      <td style="padding:0.4rem;color:var(--text2);">${escapeHtml(item.message || '')}</td>
+      <td style="padding:0.4rem;color:var(--text2);">${timeAgo(item.created_at)}</td>
+      <td style="padding:0.4rem;"><button class="btn btn-outline btn-sm" onclick="retryNeedsAttention('${escapeJsAttr(item.attn_id)}')">Retry</button></td>
+    </tr>
+  `).join('');
+  updateNaRetryButton();
+}
+
+function toggleNaSelectAll(cb) {
+  document.querySelectorAll('.naRowCheck').forEach(el => el.checked = cb.checked);
+  updateNaRetryButton();
+}
+
+function updateNaRetryButton() {
+  const anyChecked = document.querySelectorAll('.naRowCheck:checked').length > 0;
+  document.getElementById('naRetrySelectedBtn').disabled = !anyChecked;
+}
+
+async function retryNeedsAttention(singleAttnId) {
+  const attnIds = singleAttnId
+    ? [singleAttnId]
+    : Array.from(document.querySelectorAll('.naRowCheck:checked')).map(el => el.value);
+  if (!attnIds.length) return;
+
+  const data = await api('/api/needs-attention/retry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ attn_ids: attnIds })
+  });
+
+  const results = data.results || [];
+  const okCount = results.filter(r => r.status === 'ok').length;
+  const failCount = results.length - okCount;
+  if (okCount) showToast('Retry complete', `${okCount} resolved${failCount ? `, ${failCount} still failing` : ''}`, failCount ? 'error' : 'success');
+  else showToast('Retry failed', results[0] && results[0].message, 'error');
+
+  await loadNeedsAttention();
+}
+
 // Activity Log
 let proxyLogData = [];
 let logRefreshTimer = null;
@@ -2583,6 +2721,7 @@ loadSummary();
 loadMovies(1);
 refreshLangStatus();
 startActivationStatusPolling();
+loadNeedsAttention();
 </script>
 </body>
 </html>

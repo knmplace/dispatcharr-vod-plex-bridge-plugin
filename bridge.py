@@ -151,6 +151,15 @@ class BridgeCore:
         self.settings = settings
         self._activated = {}
         self._episodes_activated = {}  # episode_id (str) -> {activated_at, stream_pick, category_id, strm_folder}
+        # Needs Attention tab: outstanding failures a user can retry from the
+        # dashboard instead of only seeing them in Logs. Keyed by a synthetic
+        # id so movie/episode/scan failures share one list; entries are
+        # removed once a retry succeeds (bead q5f6 -- clear-on-success, per
+        # user decision 2026-09-01: Activation History already covers the
+        # historical record, so this tab stays focused on current action items).
+        self._needs_attention = {}  # attn_id (str) -> {kind, ref_id, name, message, created_at, retry_context}
+        self._needs_attention_lock = threading.Lock()
+        self._needs_attention_seq = 0
         self._series_categories = []  # [{id, name, strm_folder, plex_library_section}]
         self._series_tmdb_state = {}  # series_id (str) -> {tmdb_id, is_placeholder, series_dir, series_name, category_id}
         self._plex_scan_lock = threading.Lock()  # serializes _trigger_plex_scan calls (movies + series)
@@ -1159,6 +1168,8 @@ class BridgeCore:
                 # tab permanently empty despite a valid TMDB API key.
                 self._last_tmdb_reconcile = state.get("last_tmdb_reconcile", 0.0)
                 self._last_tmdb_detection = state.get("last_tmdb_detection", 0.0)
+                self._needs_attention = state.get("needs_attention", {})
+                self._needs_attention_seq = state.get("needs_attention_seq", 0)
                 if "diagnostic_log" in state:
                     self._diagnostic_log.extend(state["diagnostic_log"])
             except Exception as e:
@@ -1240,6 +1251,8 @@ class BridgeCore:
                 "tmdb_detection_results": self._tmdb_detection_results,
                 "last_tmdb_reconcile": self._last_tmdb_reconcile,
                 "last_tmdb_detection": self._last_tmdb_detection,
+                "needs_attention": self._needs_attention,
+                "needs_attention_seq": self._needs_attention_seq,
                 "diagnostic_log": list(self._diagnostic_log)[-1000:],
             }, f)
                 f.flush()
@@ -2155,8 +2168,16 @@ class BridgeCore:
         except Exception:
             pass
 
+        activated_category_id = None
         if activated_categories is not None:
             activated_category = activated_categories.get(sid)
+            if sid in activated_counts:
+                for entry in self._episodes_activated.values():
+                    if str(entry.get("series_id")) == sid:
+                        category_id = entry.get("category_id")
+                        if category_id:
+                            activated_category_id = category_id
+                        break
         else:
             activated_category = None
             if sid in activated_counts:
@@ -2164,6 +2185,7 @@ class BridgeCore:
                     if str(entry.get("series_id")) == sid:
                         category_id = entry.get("category_id")
                         if category_id:
+                            activated_category_id = category_id
                             cat = self._resolve_series_category(category_id)
                             if cat:
                                 activated_category = cat.get("name")
@@ -2203,6 +2225,7 @@ class BridgeCore:
             "activated_episode_count": sid_activated,
             "fully_activated": fully_activated,
             "activated_category": activated_category,
+            "activated_category_id": activated_category_id,
             "_rank_signal": episode_count or 0,
         }
 
@@ -2699,6 +2722,12 @@ class BridgeCore:
                     failed_names.append(episode.name)
                     continue
 
+        for fentry in failed:
+            self._add_needs_attention(
+                "episode", fentry["id"], fentry["name"], fentry["message"],
+                retry_context={"episode_id": fentry["id"], "category_id": category["id"]},
+            )
+
         self._save_state()
 
         strm_count = 0
@@ -2724,7 +2753,14 @@ class BridgeCore:
             if sizes:
                 self._save_state()
                 self._log_diagnostic("info", f"Episode activation: {len(sizes)}/{len(activated)} sizes confirmed before scan trigger")
-            self._trigger_plex_scan(section=category["plex_library_section"])
+            scan_ok = self._trigger_plex_scan(section=category["plex_library_section"])
+            if not scan_ok:
+                self._add_needs_attention(
+                    "scan", category["plex_library_section"],
+                    f"Plex scan: {category.get('name', category['plex_library_section'])}",
+                    "Plex library scan did not confirm completion",
+                    retry_context={"section": category["plex_library_section"]},
+                )
             for eid in activated:
                 entry = self._episodes_activated.get(eid)
                 if not entry or not entry.get("confirmed_size"):
@@ -4592,6 +4628,86 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"STRM removal error for {folder_name}: {e}")
 
+    def _add_needs_attention(self, kind, ref_id, name, message, retry_context=None):
+        """Records an outstanding failure the user can retry from the
+        dashboard's Needs Attention tab. kind is "movie", "episode", or
+        "scan"; retry_context carries whatever the retry action needs
+        (e.g. movie/episode id, or section+category for a scan retry)."""
+        with self._needs_attention_lock:
+            self._needs_attention_seq += 1
+            attn_id = str(self._needs_attention_seq)
+            self._needs_attention[attn_id] = {
+                "kind": kind,
+                "ref_id": str(ref_id) if ref_id is not None else None,
+                "name": name,
+                "message": message,
+                "created_at": time.time(),
+                "retry_context": retry_context or {},
+            }
+        self._save_state()
+        return attn_id
+
+    def _clear_needs_attention(self, attn_id):
+        with self._needs_attention_lock:
+            self._needs_attention.pop(str(attn_id), None)
+        self._save_state()
+
+    def list_needs_attention(self):
+        with self._needs_attention_lock:
+            items = [
+                {"attn_id": attn_id, **entry}
+                for attn_id, entry in self._needs_attention.items()
+            ]
+        items.sort(key=lambda e: e["created_at"], reverse=True)
+        return {"status": "ok", "items": items}
+
+    def retry_needs_attention(self, body):
+        attn_ids = body.get("attn_ids", [])
+        if not attn_ids:
+            return {"status": "error", "message": "No attn_ids provided"}
+
+        results = []
+        for attn_id in attn_ids:
+            attn_id = str(attn_id)
+            entry = self._needs_attention.get(attn_id)
+            if entry is None:
+                results.append({"attn_id": attn_id, "status": "error", "message": "Not found (already resolved?)"})
+                continue
+
+            kind = entry["kind"]
+            ctx = entry.get("retry_context", {})
+            try:
+                if kind == "movie":
+                    result = self.activate_movies({"movie_ids": [ctx.get("movie_id", entry["ref_id"])]})
+                    ok = result.get("status") == "ok" and result.get("activated", 0) > 0
+                elif kind == "episode":
+                    result = self.activate_episodes({
+                        "episode_ids": [ctx.get("episode_id", entry["ref_id"])],
+                        "category_id": ctx.get("category_id"),
+                    })
+                    ok = result.get("status") == "queued"
+                elif kind == "scan":
+                    ok = self._trigger_plex_scan(section=ctx.get("section"))
+                    result = {"status": "ok" if ok else "error"}
+                else:
+                    ok = False
+                    result = {"status": "error", "message": f"Unknown kind: {kind}"}
+            except Exception as e:
+                ok = False
+                result = {"status": "error", "message": str(e)}
+
+            if ok:
+                self._clear_needs_attention(attn_id)
+                results.append({"attn_id": attn_id, "status": "ok"})
+            else:
+                results.append({
+                    "attn_id": attn_id,
+                    "status": "error",
+                    "message": result.get("message", "Retry failed"),
+                })
+
+        return {"status": "ok", "results": results}
+
     def _trigger_plex_scan(self, section=None):
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
@@ -4910,8 +5026,6 @@ class BridgeCore:
                     name = name[prefix_match.end():]
         name = re.sub(r"\s*\[.*?\]", "", name)
         name = re.sub(r"\s*\((?:4K|HDR|UHD|FHD|HD|SD)\)", "", name, flags=re.I)
-        name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
-        name = re.sub(r"\s*-\s*\d{4}\s*$", "", name)
         # Provider-tagged country suffix, e.g. "Hanna (US)" / "Our Girl (GB)"
         # -- Plex's own title for the same show has no such suffix, so
         # leaving it in place broke the activated<->Plex episode match key
@@ -4922,9 +5036,19 @@ class BridgeCore:
         # -- a title that just happens to end in "(XX)" is left alone.
         # Live-verified 2026-08-30: full 36-episode "EN - Our Girl (GB)"
         # activation, 35/35 Plex-confirmed, 0 failed, no hang.
+        # Runs BEFORE the year strip below: a title like "The Hunt (2026)
+        # (FR)" has the country tag trailing, not the year, so stripping
+        # the year first (its regex only matches a trailing "(dddd)")
+        # left the year behind and the match still broke (confirmed live
+        # 2026-09-01: "A+ - The Hunt (2026) (FR)" stuck at 0/6 forever
+        # because our side kept "The Hunt (2026)" while Plex's
+        # grandparentTitle was just "The Hunt"). Stripping the country
+        # suffix first makes the year trailing again so it gets caught too.
         suffix_match = re.search(r"\s*\(([A-Z]{2,3})\)\s*$", name)
         if suffix_match and suffix_match.group(1) in self._COUNTRY_SUFFIX_CODES:
             name = name[:suffix_match.start()]
+        name = re.sub(r"\s*\(\d{4}\)\s*$", "", name)
+        name = re.sub(r"\s*-\s*\d{4}\s*$", "", name)
         name = re.sub(r'[<>:"/\\|?*]', "", name)
         return name.strip()
 
@@ -5524,6 +5648,12 @@ class BridgeCore:
             activated.append(mid)
             activated_names.append(movie.name)
 
+        for fentry in failed:
+            self._add_needs_attention(
+                "movie", fentry["id"], fentry["name"], fentry["message"],
+                retry_context={"movie_id": fentry["id"]},
+            )
+
         self._save_state()
 
         if activated:
@@ -5543,7 +5673,13 @@ class BridgeCore:
             if sizes:
                 self._save_state()
                 self._log_diagnostic("info", f"Movie activation: {len(sizes)}/{len(activated)} sizes confirmed before scan trigger")
-            self._trigger_plex_scan()
+            scan_ok = self._trigger_plex_scan()
+            if not scan_ok:
+                self._add_needs_attention(
+                    "scan", None, "Plex scan: movies",
+                    "Plex library scan did not confirm completion",
+                    retry_context={"section": None},
+                )
             # Background retry threads as fallback (in case initial query found no sizes yet)
             for mid in activated:
                 entry = self._activated.get(mid)
@@ -5811,6 +5947,12 @@ class BridgeCore:
             activated.append(mid)
             activated_names.append(movie.name)
 
+        for fentry in failed:
+            self._add_needs_attention(
+                "movie", fentry["id"], fentry["name"], fentry["message"],
+                retry_context={"movie_id": fentry["id"]},
+            )
+
         self._save_state()
 
         if activated:
@@ -5827,7 +5969,13 @@ class BridgeCore:
                         self._log_diagnostic("debug", f"Movie {mid}: pre-scan size confirmed {size} bytes")
             if sizes:
                 self._save_state()
-            self._trigger_plex_scan()
+            scan_ok = self._trigger_plex_scan()
+            if not scan_ok:
+                self._add_needs_attention(
+                    "scan", None, "Plex scan: movies",
+                    "Plex library scan did not confirm completion",
+                    retry_context={"section": None},
+                )
             for mid in activated:
                 entry = self._activated.get(mid)
                 if not entry or not entry.get("confirmed_size"):

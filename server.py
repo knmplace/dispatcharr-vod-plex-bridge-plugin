@@ -286,6 +286,13 @@ def _dispatch(environ, start_response, server, bridge, settings):
     if path == "/api/stats" and method == "GET":
         return _json_response(start_response, bridge.get_stats())
 
+    if path == "/api/needs-attention" and method == "GET":
+        return _json_response(start_response, bridge.list_needs_attention())
+
+    if path == "/api/needs-attention/retry" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.retry_needs_attention(body))
+
     if path == "/api/movies/activate" and method == "POST":
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.activate_movies(body))

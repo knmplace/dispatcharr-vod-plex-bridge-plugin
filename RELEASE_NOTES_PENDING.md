@@ -1,0 +1,42 @@
+# Pending Release Notes (post-v2.5.0)
+
+Running notes for everything staged on top of `eede7a3` (v2.5.0, tagged) but not yet committed/released. Update this file as each change lands on the test bed (192.168.1.245) so the eventual bundled commit/release captures all of it at once.
+
+**Status: in progress, uncommitted. Deploy target: test bed only (245) until release.**
+
+Deploy policy while this file is open: keep 245 continuously updated with working-tree changes as they're made, not just at session end. See handoff bead `i99i` for full session state.
+
+---
+
+## Features
+
+- **Series destination-category auto-select** (bead `5pj`, GitHub #7) — `_series_to_dict()` in `bridge.py` returns `activated_category_id`; dashboard's shared destination dropdown auto-selects a series' existing activated category on selection, stays editable, resets to blank when selection spans multiple/no categories. Live-verified via Playwright.
+- **"Needs Attention" tab** (bead `q5f6`, GitHub #8) — new persisted `_needs_attention` state in `bridge.py` (movie/episode activation failures, Plex scan failures) with list/retry/clear methods. New routes: `GET /api/needs-attention`, `POST /api/needs-attention/retry`. New dashboard tab with badge count, table (type/name/reason/age), single + multi-select retry. Backend/API verified live; **UI click-through not yet tested** (see Outstanding below).
+
+## Fixes
+
+- **Activate/Reactivate/Deactivate button spinner visibility** — `.activate-btn`/`.reactivate-btn` were only visible on card `:hover` (`opacity: 0` by default), so the existing busy-spinner (`.is-busy::after`, CSS `spin` animation) was invisible if the mouse left the card after clicking — during activation's ~2-3s ffprobe audio-probe delay, this looked like nothing happened. Fixed: `.activate-btn.is-busy`/`.reactivate-btn.is-busy` now force `opacity: 1` regardless of hover state (`templates/dashboard.html`, CSS near line 220-223). Deployed to 245, confirmed no restart needed (static template).
+- **Episode Plex-confirmation hang for country-tagged series titles** — `_clean_title()` (`bridge.py`) stripped the trailing year `(dddd)` *before* stripping a trailing country-suffix tag `(FR)`/`(GB)`/etc, so a title like `"A+ - The Hunt (2026) (FR)"` kept the year (`"The Hunt (2026)"`) because the year regex only matches at end-of-string and the country tag was still shielding it on that pass. Our stored `series_name` (used for confirmation matching) then never matched Plex's `grandparentTitle` ("The Hunt"), so `_wait_for_plex_episode_confirmation()` polled until timeout and the "Plex-confirmed" toast never fired — even though the episodes activated and appeared in Plex correctly. This is the same class of bug as the `"EN - Hanna (US)"` incident fixed 2026-08-30, just for a title shape that combination hadn't covered. Fixed by reordering the country-suffix strip before the year strip. Live-confirmed via bug-report diagnostic log extraction (`series=The Hunt (2026)` — country stripped, year not) before the fix; compile-verified and deployed to 245; **container restart required** (`.py` change, `sys.modules` caching) and performed by the user. The 6 already-activated "The Hunt" episodes had a stale `series_name` (`"The Hunt (2026)"`) baked into persisted state from before the fix — `reactivate_episodes()` doesn't recompute `series_name` or trigger a Plex scan, so it can't self-heal this; the 6 entries in `bridge_state.json` were hand-patched to `"The Hunt"` directly (user-approved) to match what the fixed `_clean_title()` now produces, requiring one more restart to take effect. No code changes needed for this repair — it only affects series already activated before the fix; all future activations store the correct value automatically.
+
+## Testing — Needs Attention click-through (2026-09-01)
+
+Full browser test performed via Playwright against 245: tab renders correctly, badge count reflects entries, single-select and multi-select retry both trigger. Two real bugs found, not yet fixed:
+
+- **Retry duplicates rows on repeated failure** (bead `z25d`) — `retry_needs_attention()` calls `activate_movies()` on retry, which calls `_add_needs_attention()` again for anything still failing; nothing clears/reuses the old entry on a failed retry, so each failed retry attempt adds a new duplicate row. Confirmed live: badge went 1→2→4 across two retry attempts on the same fake movie ID.
+- **Misleading retry-failure toast** (bead `a6ek`) — `activate_movies()`'s top-level return hardcodes `"No provider stream with detectable audio found"` whenever `activated==0` and anything failed, regardless of the real per-item reason (which IS correctly stored, e.g. "Movie not found"). `retry_needs_attention()` surfaces this generic message instead of the actual cause.
+
+Test artifacts (4 synthetic rows for fake movie id 999999999) were created on live 245 during this test and have been cleaned up.
+
+## Incident — state-file data loss on 245 (2026-09-01)
+
+While hand-patching `bridge_state.json` to fix stale `series_name` values for "The Hunt" series (a data remediation, unrelated to any code bug), a save-state race with the still-running container process caused the patch to be clobbered and the process ended up persisting an **empty `episodes_activated` dict and empty `series_categories` list** back to disk. Full detail and lesson learned: bead `eiox`.
+
+- **Scope**: 6 series affected (The Hunt, Our Girl ×2 duplicate folders, Hanna, Ballard, The Red King, Moonflower Murders) — 139 stale `.nfo` files on disk, zero `.strm` files, Plex showing playback errors and hammering the plugin with failed scan attempts. Movies (17 activated) were unaffected.
+- **Recovery**: user manually re-entered the 4 series categories via the dashboard (Mystery=13, Comedy=14, Action=15, Drama=17). All stale series/episode folders under `plugin-strm/series/{drama,action,mystery,comedy}/` were then deliberately wiped (139 nfo files removed, at user's request) to leave a clean slate — no residual state or filesystem records. Affected series need to be **re-activated from scratch** via the dashboard.
+- **No code changes required** for this incident — it was an operational/process mistake (manual state editing while the container was live), not a plugin bug. The lesson (documented in bead `eiox` and Claude memory) is procedural: never hand-patch `bridge_state.json` while the container is running; stop it first, or use the plugin's own API endpoints instead of raw JSON edits whenever an equivalent endpoint exists.
+
+## Outstanding before this can ship
+
+- Needs Attention retry bugs `z25d` and `a6ek` above — not yet fixed. Recommend fixing before bundling, since the feature's core retry flow is what's affected.
+- Check beads `0yv`/`30f` (Activation History tab) for overlap — q5f6's "clear on retry success" design assumes Activation History covers the persistent record; confirmed those beads are still open/unbuilt, so no overlap currently exists, but revisit before either ships.
+- Affected series (The Hunt, Our Girl, Hanna, Ballard, The Red King, Moonflower Murders) need re-activation on 245 post-incident — not yet done as of this writing.
