@@ -1580,7 +1580,19 @@ class BridgeCore:
 
     @staticmethod
     def _normalize_title_for_grouping(name):
-        name = (name or "").casefold().strip()
+        # Strip provider tagging (leading "EN - " prefix, trailing "(GB)"
+        # country suffix) the same way _clean_title() does for Plex-match
+        # keys -- without this, "EN - Our Girl (GB)" and "Our Girl" hash to
+        # different buckets in _group_duplicates() and never collapse into
+        # one duplicate-grouped card despite being the same title (bead 6xj0,
+        # found live 2026-09-02: "Our Girl" showed as 2 ungrouped cards with
+        # Group Duplicates checked). _clean_title() only reads class-level
+        # attributes (_CATEGORY_PREFIX/_COUNTRY_SUFFIX_CODES), not instance
+        # state, so it's safe to call unbound via the class here -- this
+        # function must stay a staticmethod since callers (including the
+        # test suite) invoke it as BridgeCore._normalize_title_for_grouping.
+        name = BridgeCore._clean_title(BridgeCore, name or "")
+        name = name.casefold().strip()
         # Doubled year tag, e.g. "42 (2013) (2013)" -- strip repeats first so
         # the single trailing-year strip below still catches the remainder.
         name = re.sub(r"\s*\(((?:19|20)\d{2})\)(?:\s*\(\1\))+\s*$", r" (\1)", name)
