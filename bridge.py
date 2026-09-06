@@ -15,6 +15,19 @@ import requests
 
 logger = logging.getLogger("vod_plex_bridge.bridge")
 
+
+def _strip_scheme(host):
+    """Strip a leading http:// or https:// from a configured host value.
+
+    dashboard_host has been stored both as a bare host ("192.168.1.245")
+    and, after past host migrations, as a full URL ("http://192.168.1.245").
+    Callers that prepend their own "http://" must normalize first or the
+    result is a malformed double-scheme URL (Plex fails to play STRM files
+    with such a URL, though it silently opens a real provider connection
+    first -- see bead x3y3).
+    """
+    return re.sub(r"^https?://", "", host or "", flags=re.IGNORECASE)
+
 LANG_NAMES = {
     "en": "English", "es": "Spanish", "fr": "French", "de": "German",
     "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ru": "Russian",
@@ -219,6 +232,7 @@ class BridgeCore:
         self._movie_job_stop = threading.Event()
         self._movie_job_counter = 0
         self._movie_job_worker_thread = None
+        self._tmdb_backfill_thread = None
         self._last_removed_check = 0.0
         self._last_removed_episode_check = 0.0
         self._last_stream_refresh_check = 0.0
@@ -283,7 +297,12 @@ class BridgeCore:
         self._start_stall_watchdog()
         self._start_episode_job_worker()
         self._start_movie_job_worker()
-        threading.Thread(target=self._backfill_series_tmdb_state, daemon=True).start()
+        self._tmdb_backfill_thread = threading.Thread(
+            target=self._backfill_series_tmdb_state,
+            daemon=True,
+            name="vod-bridge-tmdb-backfill",
+        )
+        self._tmdb_backfill_thread.start()
 
     def _start_episode_job_worker(self):
         self._episode_job_worker_thread = threading.Thread(
@@ -396,6 +415,12 @@ class BridgeCore:
                     "within 15s of shutdown — it will keep running until it "
                     "finishes its current batch and observes the stop signal."
                 )
+        if self._tmdb_backfill_thread is not None:
+            # One-time repair pass with no stop event -- just bound the wait
+            # so a bind-failure cleanup() call can't hang. If it's still
+            # running after this, it finishes on its own; it isn't tied to
+            # any server socket or request thread.
+            self._tmdb_backfill_thread.join(timeout=5)
         self._save_state()
 
     def _activity_log_path(self):
@@ -4541,7 +4566,7 @@ class BridgeCore:
     def _generate_strm_for_movies(self, movie_ids):
         strm_dir = self.settings.get("strm_output_dir", "/data/strm")
         port = int(self.settings.get("http_port", 8888))
-        host = self.settings.get("dashboard_host", "127.0.0.1")
+        host = _strip_scheme(self.settings.get("dashboard_host", "127.0.0.1"))
         os.makedirs(strm_dir, exist_ok=True)
 
         count = 0
@@ -4955,7 +4980,7 @@ class BridgeCore:
     def generate_strm_files(self, settings, log):
         strm_dir = settings.get("strm_output_dir", "/data/strm")
         port = int(settings.get("http_port", 8888))
-        host = settings.get("dashboard_host", "127.0.0.1")
+        host = _strip_scheme(settings.get("dashboard_host", "127.0.0.1"))
         os.makedirs(strm_dir, exist_ok=True)
 
         count = 0

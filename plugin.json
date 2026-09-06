@@ -1,6 +1,6 @@
 {
   "name": "VOD To Plex",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "Dispatcharr plugin that bridges VOD movies into Plex via rclone HTTP mount with 302 redirect streaming, web dashboard, and selective activation.",
   "author": "knmplace",
   "license": "MIT",
@@ -42,6 +42,13 @@
       "type": "string",
       "default": "",
       "help_text": "LAN IP of the Docker host (not the container). Used for dashboard URL and STRM file URLs."
+    },
+    {
+      "id": "auto_start_server",
+      "label": "Auto-Start Server",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Starts the HTTP server automatically whenever this plugin is loaded — on container boot, Celery worker startup, and every time the Plugins page reloads plugins (which stops and reconstructs this plugin, and otherwise leaves the server down until Start Server is clicked again). Leave off to keep the current manual Start Server behavior."
     },
     {
       "id": "_section_plex",

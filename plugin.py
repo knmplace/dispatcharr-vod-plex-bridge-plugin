@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -8,6 +9,16 @@ import logging
 logger = logging.getLogger("vod_plex_bridge")
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _strip_scheme(host):
+    """Strip a leading http:// or https:// from a configured host value.
+
+    dashboard_host has been stored both as a bare host and, after past host
+    migrations, as a full URL -- callers that prepend their own "http://"
+    must normalize first or the result is a malformed double-scheme URL.
+    """
+    return re.sub(r"^https?://", "", host or "", flags=re.IGNORECASE)
 
 
 def _load_manifest():
@@ -78,6 +89,88 @@ class Plugin:
     help_url = _manifest.get("help_url", "")
     fields = _manifest.get("fields", [])
     actions = _manifest.get("actions", [])
+
+    def __init__(self):
+        # Dispatcharr's plugin loader calls this bare constructor on every
+        # discover_plugins() pass -- container boot, Celery worker_ready,
+        # AND every manual "Reload Plugins" click (which stops the old
+        # instance, then constructs a fresh one). `start()` below is never
+        # actually invoked by the loader, so this constructor is the only
+        # lifecycle hook where the server can be brought back up
+        # automatically after a reload silently drops it (see GitHub #9).
+        #
+        # No settings are passed into plugin_cls() -- they have to be
+        # queried directly from the DB. That query (and everything else
+        # here) must never raise: an uncaught exception during construction
+        # gets caught by the loader's generic handler, which replaces the
+        # ENTIRE plugin with a non-functional placeholder, not just this
+        # feature. Mirrors the same defensive try/except Dispatcharr's own
+        # loader uses around its PluginConfig.objects.all() call at boot.
+        try:
+            # Real container boot calls this from Django's AppConfig.ready()
+            # (uWSGI workers, lazy-apps=true, each starting cold) -- at that
+            # point in the process lifecycle the DB/app registry is
+            # frequently not usable yet, so a single immediate query here
+            # fails every time and auto-start silently never fires on boot
+            # (confirmed live 2026-09-06: zero auto-start log lines across
+            # 5 uWSGI workers on a real restart, vs. success once Django was
+            # already warmed up for a later settings-save-triggered reload).
+            # Retry on a daemon thread so a cold DB doesn't block __init__
+            # (and therefore discover_plugins(), which every other plugin
+            # in the same pass is waiting on) for however long it takes.
+            threading.Thread(
+                target=self._auto_start_with_retry,
+                daemon=True,
+                name="vod-bridge-auto-start",
+            ).start()
+        except Exception:
+            logger.warning("VOD To Plex: auto-start check failed", exc_info=True)
+
+    def _auto_start_with_retry(self, attempts=5, delay_secs=2):
+        for attempt in range(1, attempts + 1):
+            try:
+                if self._maybe_auto_start():
+                    return
+            except Exception:
+                logger.warning("VOD To Plex: auto-start attempt failed", exc_info=True)
+                return
+            time.sleep(delay_secs)
+        logger.info(
+            f"VOD To Plex: auto-start gave up after {attempts} attempts "
+            f"(PluginConfig not available -- plugin likely not enabled yet)"
+        )
+
+    def _maybe_auto_start(self):
+        """Try once. Returns True if resolved (started, skipped, or errored
+        in a way that won't be fixed by retrying) -- False to retry."""
+        from apps.plugins.models import PluginConfig
+
+        try:
+            cfg = PluginConfig.objects.get(key=self._manifest_key())
+        except Exception:
+            # DB not migrated/ready yet at this point in boot, or the
+            # plugin has no PluginConfig row yet (first-ever discovery) --
+            # worth retrying a few times before giving up.
+            return False
+
+        settings = cfg.settings or {}
+        if not settings.get("auto_start_server", False):
+            return True
+
+        result = self._start_server(settings, logger)
+        if result.get("status") == "ok":
+            logger.info(f"VOD To Plex: auto-started server on plugin load ({result.get('message', '')})")
+        else:
+            logger.warning(f"VOD To Plex: auto-start did not start the server: {result.get('message', '')}")
+        return True
+
+    def _manifest_key(self):
+        # PluginConfig.key is Dispatcharr's plugin *folder name* on disk
+        # (lowercased, spaces->underscores) -- it is never read from
+        # plugin.json (loader.py: `plugin_key = entry.replace(" ", "_").lower()`).
+        # PLUGIN_DIR is this file's own directory, so this always matches
+        # regardless of what the deployed folder happens to be named.
+        return os.path.basename(PLUGIN_DIR).replace(" ", "_").lower()
 
     def start(self, context):
         log = context.get("logger", logger)
@@ -169,6 +262,12 @@ class Plugin:
                 candidate.bind()
             except OSError as e:
                 log.warning(f"VOD To Plex: failed to bind port {port}: {e}")
+                # bind() runs BridgeCore.initialize() (which starts the
+                # watchdog/job-worker/backfill threads) before make_server(),
+                # so a failed bind still leaves those threads running unless
+                # we tear them down here.
+                if candidate._bridge is not None:
+                    candidate._bridge.cleanup()
                 return {
                     "status": "error",
                     "message": f"Port {port} is already in use by another process. "
@@ -182,6 +281,8 @@ class Plugin:
                 # Start Server silently failed — always log it, regardless
                 # of the debug_connections toggle.
                 log.error(f"VOD To Plex: server start failed: {e}", exc_info=True)
+                if candidate._bridge is not None:
+                    candidate._bridge.cleanup()
                 return {
                     "status": "error",
                     "message": f"Server failed to start: {e}",
@@ -199,7 +300,7 @@ class Plugin:
                 candidate._bridge._log_event("info", f"Server started on port {port}")
             return {
                 "status": "ok",
-                "message": f"Server started on port {port}. Dashboard: http://{settings.get('dashboard_host', 'localhost')}:{port}/",
+                "message": f"Server started on port {port}. Dashboard: http://{_strip_scheme(settings.get('dashboard_host', 'localhost'))}:{port}/",
             }
 
     def _stop_server(self, settings, log):
@@ -282,7 +383,7 @@ class Plugin:
 
     def _open_dashboard(self, settings, log):
         port = int(settings.get("http_port", 8888))
-        host = settings.get("dashboard_host", "")
+        host = _strip_scheme(settings.get("dashboard_host", ""))
         if not host:
             host = "localhost"
         return {
