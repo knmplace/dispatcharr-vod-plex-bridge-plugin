@@ -3177,20 +3177,37 @@ class BridgeCore:
         from concurrent.futures import ThreadPoolExecutor
 
         def _delete_one(rating_key, title):
-            try:
-                resp = requests.delete(
-                    f"{plex_url}/library/metadata/{rating_key}",
-                    params={"X-Plex-Token": plex_token},
-                    timeout=10,
-                )
-                if resp.status_code in (200, 204):
-                    logger.info(f"Plex: deleted {label} {title} (key {rating_key})")
-                    return True
-                logger.warning(f"Plex delete {label} {title} returned {resp.status_code}")
-                return False
-            except Exception as e:
-                logger.warning(f"Plex delete {label} {title} failed: {e}")
-                return False
+            # One retry after a short delay: Plex has been observed returning a
+            # transient 400 on this endpoint right after its own scan/analyze
+            # activity (confirmed 2026-09-07, bead koh — an identical DELETE
+            # replayed a few seconds later succeeded with 200), so a single
+            # non-2xx isn't reliable evidence the item can't be deleted.
+            for attempt in (1, 2):
+                try:
+                    resp = requests.delete(
+                        f"{plex_url}/library/metadata/{rating_key}",
+                        params={"X-Plex-Token": plex_token},
+                        timeout=10,
+                    )
+                    if resp.status_code in (200, 204):
+                        logger.info(f"Plex: deleted {label} {title} (key {rating_key})")
+                        return True
+                    if attempt == 1:
+                        logger.warning(
+                            f"Plex delete {label} {title} returned {resp.status_code}, retrying"
+                        )
+                        time.sleep(2)
+                        continue
+                    logger.warning(f"Plex delete {label} {title} returned {resp.status_code}")
+                    return False
+                except Exception as e:
+                    if attempt == 1:
+                        logger.warning(f"Plex delete {label} {title} failed: {e}, retrying")
+                        time.sleep(2)
+                        continue
+                    logger.warning(f"Plex delete {label} {title} failed: {e}")
+                    return False
+            return False
 
         removed = 0
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -4664,6 +4681,124 @@ class BridgeCore:
                     logger.info(f"STRM removed: {folder_name}")
             except Exception as e:
                 logger.error(f"STRM removal error for {folder_name}: {e}")
+
+    # --- Orphaned STRM folder scan/removal (dashboard, Health tab) ---
+    #
+    # Detection only -- never deletes anything on its own. Compares what's
+    # on disk against the folder names tracked in self._activated /
+    # self._episodes_activated and returns the difference for the user to
+    # review; actual removal only happens via remove_orphan_strm_folders(),
+    # which only touches folder names the caller explicitly passed in (the
+    # ones the user checked in the dashboard).
+
+    def scan_orphan_strm_folders(self):
+        """Returns movie and series-show folders on disk under
+        strm_output_dir that aren't referenced by any tracked activation.
+        Movies: top-level folders directly under strm_output_dir (excluding
+        the series/ subtree) not in {activated[mid]["strm_folder"]}.
+        Series: for each known series category folder under
+        strm_output_dir/series/, each "Series Name (Year)" subfolder not
+        matched by any episodes_activated[eid]["strm_folder"] (which is
+        stored as "<category_folder>/<Series Name (Year)>/Season NN")."""
+        strm_dir = self.settings.get("strm_output_dir", "/data/plugin-strm")
+        orphans = []
+
+        active_movie_folders = {
+            entry.get("strm_folder") for entry in self._activated.values() if entry.get("strm_folder")
+        }
+        try:
+            for entry_name in sorted(os.listdir(strm_dir)):
+                if entry_name == "series":
+                    continue
+                full_path = os.path.join(strm_dir, entry_name)
+                if not os.path.isdir(full_path):
+                    continue
+                if entry_name not in active_movie_folders:
+                    orphans.append({
+                        "kind": "movie",
+                        "folder_name": entry_name,
+                        "path": full_path,
+                        "relative_path": entry_name,
+                    })
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error(f"Orphan scan (movies) failed: {e}")
+
+        active_series_show_dirs = set()
+        for entry in self._episodes_activated.values():
+            folder = entry.get("strm_folder")
+            if not folder:
+                continue
+            # folder is "<category_folder>/<Series Name (Year)>/Season NN" --
+            # keep everything up to (but not including) the Season NN part.
+            parent = os.path.dirname(folder.replace("\\", "/"))
+            if parent:
+                active_series_show_dirs.add(parent)
+
+        for category in self._series_categories:
+            cat_folder = category.get("strm_folder")
+            if not cat_folder:
+                continue
+            cat_path = self._series_category_path(cat_folder)
+            try:
+                for show_name in sorted(os.listdir(cat_path)):
+                    show_path = os.path.join(cat_path, show_name)
+                    if not os.path.isdir(show_path):
+                        continue
+                    relative = f"{cat_folder}/{show_name}"
+                    if relative not in active_series_show_dirs:
+                        orphans.append({
+                            "kind": "series",
+                            "folder_name": show_name,
+                            "path": show_path,
+                            "relative_path": os.path.join("series", relative),
+                        })
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logger.error(f"Orphan scan (series category {cat_folder}) failed: {e}")
+
+        return {"status": "ok", "items": orphans, "strm_output_dir": strm_dir}
+
+    def remove_orphan_strm_folders(self, body):
+        """Deletes ONLY the folders explicitly named in body["items"] (each
+        {"kind", "relative_path"} as returned by scan_orphan_strm_folders).
+        Never called automatically -- only reachable via the dashboard's
+        manual "Remove Selected" action. Re-validates each path is still an
+        untracked orphan and stays under strm_output_dir before deleting, to
+        guard against a stale selection or a path-traversal attempt."""
+        import shutil
+        strm_dir = self.settings.get("strm_output_dir", "/data/plugin-strm")
+        strm_dir_real = os.path.realpath(strm_dir)
+        requested = body.get("items") or []
+
+        current = {item["relative_path"]: item for item in self.scan_orphan_strm_folders().get("items", [])}
+
+        removed, errors = [], []
+        for req in requested:
+            relative_path = req.get("relative_path")
+            entry = current.get(relative_path)
+            if not entry:
+                errors.append({"relative_path": relative_path, "error": "no longer an orphan (already removed or reactivated)"})
+                continue
+
+            target_real = os.path.realpath(entry["path"])
+            if os.path.commonpath([strm_dir_real, target_real]) != strm_dir_real:
+                errors.append({"relative_path": relative_path, "error": "path outside strm_output_dir, refused"})
+                continue
+
+            try:
+                if os.path.isdir(target_real):
+                    shutil.rmtree(target_real)
+                    removed.append(relative_path)
+                    logger.info(f"Orphan STRM folder removed by user: {relative_path}")
+                    self._log_event("info", f"Orphan STRM folder removed by user: {relative_path}")
+            except Exception as e:
+                errors.append({"relative_path": relative_path, "error": str(e)})
+                logger.error(f"Orphan STRM removal failed for {relative_path}: {e}")
+
+        return {"status": "ok" if not errors else "partial", "removed": removed, "errors": errors}
 
     def _add_needs_attention(self, kind, ref_id, name, message, retry_context=None):
         """Records an outstanding failure the user can retry from the

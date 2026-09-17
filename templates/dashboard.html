@@ -729,6 +729,37 @@ select.search-input { flex: 0 0 auto; min-width: 140px; }
       </div>
     </div>
 
+    <div class="panel">
+      <div class="panel-header">
+        <span>Orphaned STRM Folders</span>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn btn-outline btn-sm" onclick="loadOrphanStrm()">Scan</button>
+          <button class="btn btn-primary btn-sm" id="orphanRemoveSelectedBtn" onclick="removeOrphanStrm()" disabled>Remove Selected</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <p style="font-size:0.8rem;color:var(--text2);margin:0 0 0.75rem;">
+          Movie and series folders on disk that are no longer tracked as activated (e.g. left behind after a
+          provider removed a title or a cleanup step failed). Nothing here is ever deleted automatically —
+          review the list and check the folders you want gone, then click Remove Selected.
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:0.82rem;" id="orphanTable">
+          <thead>
+            <tr style="text-align:left;border-bottom:1px solid var(--border);">
+              <th style="padding:0.4rem;width:24px;"><input type="checkbox" id="orphanSelectAll" onchange="toggleOrphanSelectAll(this)"></th>
+              <th style="padding:0.4rem;">Type</th>
+              <th style="padding:0.4rem;">Folder</th>
+              <th style="padding:0.4rem;">Path</th>
+            </tr>
+          </thead>
+          <tbody id="orphanBody">
+            <tr><td colspan="4" class="loading" style="padding:0.6rem;"><span class="spinner"></span> Loading...</td></tr>
+          </tbody>
+        </table>
+        <div id="orphanEmpty" style="display:none;font-size:0.85rem;color:var(--text2);padding:1rem 0;text-align:center;">No orphaned STRM folders found.</div>
+      </div>
+    </div>
+
   </div>
 
   <!-- Reports Tab -->
@@ -856,7 +887,7 @@ function switchTab(tab) {
 
   if (tab === 'streams') startStreamRefresh();
   else stopStreamRefresh();
-  if (tab === 'health') loadHealth();
+  if (tab === 'health') { loadHealth(); loadOrphanStrm(); }
   if (tab === 'reports') loadReports();
   if (tab === 'needsAttention') loadNeedsAttention();
   if (tab === 'logs') { loadProxyLog(); startLogAutoRefresh(); }
@@ -2474,6 +2505,78 @@ async function retryNeedsAttention(singleAttnId) {
   else showToast('Retry failed', results[0] && results[0].message, 'error');
 
   await loadNeedsAttention();
+}
+
+// Orphaned STRM folders (Health tab) -- scan is automatic/read-only;
+// removal is ALWAYS a manual, user-selected action, never triggered on
+// a timer or automatically after a scan.
+let orphanItems = [];
+
+async function loadOrphanStrm() {
+  const body = document.getElementById('orphanBody');
+  body.innerHTML = '<tr><td colspan="4" class="loading" style="padding:0.6rem;"><span class="spinner"></span> Scanning...</td></tr>';
+  const data = await api('/api/maintenance/orphan-strm');
+  orphanItems = data.items || [];
+  renderOrphanStrm();
+}
+
+function renderOrphanStrm() {
+  const body = document.getElementById('orphanBody');
+  const empty = document.getElementById('orphanEmpty');
+  const table = document.getElementById('orphanTable');
+  const selectAll = document.getElementById('orphanSelectAll');
+
+  if (!orphanItems.length) {
+    table.style.display = 'none';
+    empty.style.display = '';
+    updateOrphanRemoveButton();
+    return;
+  }
+  table.style.display = '';
+  empty.style.display = 'none';
+  selectAll.checked = false;
+
+  body.innerHTML = orphanItems.map((item, idx) => `
+    <tr style="border-bottom:1px solid var(--border);">
+      <td style="padding:0.4rem;"><input type="checkbox" class="orphanRowCheck" value="${idx}" onchange="updateOrphanRemoveButton()"></td>
+      <td style="padding:0.4rem;">${escapeHtml(item.kind === 'series' ? 'Series' : 'Movie')}</td>
+      <td style="padding:0.4rem;">${escapeHtml(item.folder_name || '')}</td>
+      <td style="padding:0.4rem;color:var(--text2);">${escapeHtml(item.relative_path || '')}</td>
+    </tr>
+  `).join('');
+  updateOrphanRemoveButton();
+}
+
+function toggleOrphanSelectAll(cb) {
+  document.querySelectorAll('.orphanRowCheck').forEach(el => el.checked = cb.checked);
+  updateOrphanRemoveButton();
+}
+
+function updateOrphanRemoveButton() {
+  const anyChecked = document.querySelectorAll('.orphanRowCheck:checked').length > 0;
+  document.getElementById('orphanRemoveSelectedBtn').disabled = !anyChecked;
+}
+
+async function removeOrphanStrm() {
+  const idxs = Array.from(document.querySelectorAll('.orphanRowCheck:checked')).map(el => parseInt(el.value, 10));
+  if (!idxs.length) return;
+  const selected = idxs.map(i => orphanItems[i]).filter(Boolean);
+
+  const names = selected.map(item => item.folder_name).join(', ');
+  if (!confirm(`Permanently delete ${selected.length} folder(s) from disk?\n\n${names}\n\nThis cannot be undone.`)) return;
+
+  const data = await api('/api/maintenance/orphan-strm/remove', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: selected.map(item => ({ kind: item.kind, relative_path: item.relative_path })) })
+  });
+
+  const removedCount = (data.removed || []).length;
+  const errCount = (data.errors || []).length;
+  if (removedCount) showToast('Folders removed', `${removedCount} removed${errCount ? `, ${errCount} failed` : ''}`, errCount ? 'error' : 'success');
+  else showToast('Removal failed', data.errors && data.errors[0] && data.errors[0].error, 'error');
+
+  await loadOrphanStrm();
 }
 
 // Activity Log

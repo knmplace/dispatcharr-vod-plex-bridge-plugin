@@ -293,6 +293,13 @@ def _dispatch(environ, start_response, server, bridge, settings):
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.retry_needs_attention(body))
 
+    if path == "/api/maintenance/orphan-strm" and method == "GET":
+        return _json_response(start_response, bridge.scan_orphan_strm_folders())
+
+    if path == "/api/maintenance/orphan-strm/remove" and method == "POST":
+        body = _read_json_body(environ)
+        return _json_response(start_response, bridge.remove_orphan_strm_folders(body))
+
     if path == "/api/movies/activate" and method == "POST":
         body = _read_json_body(environ)
         return _json_response(start_response, bridge.activate_movies(body))
@@ -585,6 +592,23 @@ def _dispatch(environ, start_response, server, bridge, settings):
             return _text_response(start_response, 403, "Forbidden (scan-time GET not allowed)")
 
         client_ip = environ.get("REMOTE_ADDR", "unknown")
+
+        # TEMP DIAGNOSTIC (bead koh): capture what these GETs actually look
+        # like on the wire so we can tell a real playback read from an
+        # automated re-probe. Remove once we have a sample and a fix.
+        bridge._log_event(
+            "debug",
+            "DIAG movie GET id=%s ip=%s ua=%r range=%r conn=%r xff=%r accept=%r"
+            % (
+                movie_id,
+                client_ip,
+                environ.get("HTTP_USER_AGENT"),
+                environ.get("HTTP_RANGE"),
+                environ.get("HTTP_CONNECTION"),
+                environ.get("HTTP_X_FORWARDED_FOR"),
+                environ.get("HTTP_ACCEPT"),
+            ),
+        )
 
         redirect_url, error, account_id, stream_id = bridge.get_redirect_url(movie_id)
         if error:
