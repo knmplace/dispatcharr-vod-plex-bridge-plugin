@@ -145,6 +145,13 @@
       "min": 0
     },
     {
+      "id": "untracked_orphan_dry_run",
+      "label": "Untracked Orphan Sweep: Dry Run Only",
+      "type": "boolean",
+      "default": true,
+      "help_text": "The reconcile cron also sweeps movie/series folders on disk that fell out of tracking (e.g. deactivated already, or predate STRM tracking) and are no longer in Dispatcharr's live catalog, removing their folder and matching Plex library entry. While this is ON, that sweep only logs what it WOULD remove (folder path + matched Plex entry) — nothing is actually deleted. Review the logged candidates, then uncheck this to let the sweep actually delete on its next cycle. No restart needed to take effect."
+    },
+    {
       "id": "_section_content_filtering",
       "label": "Content Filtering",
       "type": "info",

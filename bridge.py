@@ -72,6 +72,14 @@ class BridgeCore:
     # runs unattended and shouldn't disrupt Plex watch state on a schedule.
     DEFAULT_STREAM_REFRESH_INTERVAL_DAYS = 7
 
+    # Default for the "untracked_orphan_dry_run" plugin setting. True on
+    # first deploy so the untracked-orphan sweep (bead
+    # dispatcharr-vod-plex-bridge-plugin-1nrl, phase 3) only logs what it
+    # WOULD remove -- folder path + matched Plex entry -- without actually
+    # deleting anything, until the user reviews the dry-run output and
+    # flips this setting off from the dashboard (no redeploy needed).
+    DEFAULT_UNTRACKED_ORPHAN_DRY_RUN = True
+
     # Interval (seconds) between maintenance-cycle sweeps that backfill
     # confirmed_size (Plex's own recorded file size, read back via its API)
     # for any activated movie that doesn't have one yet — catches movies
@@ -235,6 +243,7 @@ class BridgeCore:
         self._tmdb_backfill_thread = None
         self._last_removed_check = 0.0
         self._last_removed_episode_check = 0.0
+        self._last_untracked_orphan_check = 0.0
         self._last_stream_refresh_check = 0.0
         self._last_size_reconcile = 0.0
         self._last_tmdb_reconcile = 0.0
@@ -266,6 +275,13 @@ class BridgeCore:
             "last_audio_check": None,     # {"ts", "movie_id", "name", "stream_id", "provider", "status"}
             "last_size_reconcile": None,  # {"ts", "checked", "confirmed", "names"}
         }
+        # Untracked-orphan sweep dry-run candidates (bead
+        # dispatcharr-vod-plex-bridge-plugin-1nrl, phase 3) -- each entry is
+        # {"kind", "folder_name", "folder_path", "plex_matches"} for a
+        # candidate the sweep WOULD have removed while
+        # untracked_orphan_dry_run is on. Not persisted -- cleared on
+        # restart, rebuilt by the next dry-run sweep pass.
+        self._maint_dry_run_candidates = []
         # Per-event history for the Reports tab (scrollable lists + charts),
         # separate from _maint_stats above (which only ever tracks totals +
         # the single most-recent event per category). Kept in its own file
@@ -563,6 +579,28 @@ class BridgeCore:
                 except Exception as e:
                     logger.error(f"Removed-episode reconciliation error: {e}")
 
+            # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: sweeps on-disk
+            # folders (movie + series show-level) that fell out of tracking
+            # BEFORE the two reconcile passes above ever saw them -- e.g.
+            # deactivated already, or predating strm_folder tracking. Runs
+            # on the same cadence/gate as the reconcile passes (no separate
+            # settings toggle, ships live directly per explicit direction).
+            if now - self._last_untracked_orphan_check >= interval:
+                self._last_untracked_orphan_check = now
+                try:
+                    dry_run = bool(self.settings.get(
+                        "untracked_orphan_dry_run", self.DEFAULT_UNTRACKED_ORPHAN_DRY_RUN,
+                    ))
+                    catalog_titles = self._build_catalog_titles()
+                    if dry_run:
+                        # Reflect only the latest pass -- stale candidates
+                        # from a prior tick would otherwise accumulate
+                        # forever since dry-run never removes anything.
+                        self._maint_dry_run_candidates = []
+                    self._sweep_untracked_orphans(catalog_titles, dry_run=dry_run)
+                except Exception as e:
+                    logger.error(f"Untracked-orphan sweep error: {e}")
+
             try:
                 refresh_days = float(self.settings.get(
                     "stream_refresh_interval_days",
@@ -782,27 +820,42 @@ class BridgeCore:
             f"Dispatcharr's VOD catalog — removing: {removed}"
         )
 
-        folder_hints = {mid: self._activated[mid].get("strm_folder") for mid in removed}
-        self._remove_strm_for_movies(removed, folder_hints=folder_hints)
-        self._plex_delete_movies(removed)
-
+        # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: routed through the
+        # shared _remove_title_fully() per-title (instead of one
+        # batch-wide _remove_strm_for_movies()/_plex_delete_movies() call)
+        # so a single title's folder-delete or Plex-delete failure is
+        # escalated to Needs Attention and doesn't get silently absorbed
+        # into (or block) the rest of the batch.
+        ok_count = 0
         for mid in removed:
+            name = self._activated[mid].get("strm_folder", f"#{mid}")
+            folder_hint = self._activated[mid].get("strm_folder")
+            result = self._remove_title_fully(
+                "movie", ref_id=mid, name=name,
+                plex_delete_fn=lambda m=mid: self._plex_delete_movies([m]),
+                folder_delete_fn=lambda m=mid, fh=folder_hint: self._remove_strm_for_movies(
+                    [m], folder_hints={m: fh}
+                ),
+                history_category="removed_movies",
+                stats_key="removed_total",
+                retry_context={"folder_hint": folder_hint},
+            )
+            if result["ok"]:
+                ok_count += 1
             self._activated.pop(mid, None)
 
-        self._maint_stats["removed_total"] += len(removed)
         self._maint_stats["last_removed_check"] = {
             "ts": time.time(), "checked": len(activated_ids), "removed": len(removed),
             "removed_names": removed_names,
         }
         self._save_state()
-        for name in removed_names:
-            self._append_history("removed_movies", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in removed_names)
         self._log_event(
             "warn",
             f"Cleanup check: {len(activated_ids)} activated movie(s) checked, "
-            f"{len(removed)} removed ({titles}) — no longer in Dispatcharr's catalog",
+            f"{len(removed)} removed ({ok_count} succeeded, {titles}) — no longer in "
+            f"Dispatcharr's catalog",
         )
 
     def _reconcile_removed_episodes(self):
@@ -898,39 +951,54 @@ class BridgeCore:
             f"Dispatcharr's VOD catalog — removing: {removed}"
         )
 
-        removal_info = {
-            eid: (
-                self._episodes_activated[eid].get("category_id"),
-                self._episodes_activated[eid].get("strm_folder"),
-                self._episodes_activated[eid].get("strm_stem"),
+        # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: routed through the
+        # shared _remove_title_fully() per-episode, same rationale as
+        # _reconcile_removed_movies() above -- one episode's folder/Plex
+        # delete failure is escalated to Needs Attention instead of being
+        # silently absorbed into (or blocking) the rest of the batch.
+        ok_count = 0
+        plex_removed = 0
+        for eid, name in zip(removed, removed_names):
+            entry = self._episodes_activated[eid]
+            removal_info = {
+                eid: (
+                    entry.get("category_id"),
+                    entry.get("strm_folder"),
+                    entry.get("strm_stem"),
+                )
+            }
+            plex_match_entry = entry
+
+            def _do_plex_delete(eid=eid, plex_match_entry=plex_match_entry):
+                nonlocal plex_removed
+                n = self._plex_delete_episodes({eid: plex_match_entry})
+                plex_removed += n
+                return n
+
+            result = self._remove_title_fully(
+                "episode", ref_id=eid, name=name,
+                plex_delete_fn=_do_plex_delete,
+                folder_delete_fn=lambda ri=removal_info: self._remove_strm_for_episodes(ri),
+                history_category="removed_episodes",
+                stats_key="removed_episode_total",
+                retry_context={"plex_match_entry": plex_match_entry},
             )
-            for eid in removed
-        }
-        plex_match_info = {eid: self._episodes_activated[eid] for eid in removed}
-
-        self._remove_strm_for_episodes(removal_info)
-        plex_removed = self._plex_delete_episodes(plex_match_info)
-
-        for eid in removed:
+            if result["ok"]:
+                ok_count += 1
             self._episodes_activated.pop(eid, None)
 
-        self._maint_stats["removed_episode_total"] = (
-            self._maint_stats.get("removed_episode_total", 0) + len(removed)
-        )
         self._maint_stats["last_removed_episode_check"] = {
             "ts": time.time(), "checked": len(activated_ids), "removed": len(removed),
             "removed_names": removed_names, "plex_removed": plex_removed,
         }
         self._save_state()
-        for name in removed_names:
-            self._append_history("removed_episodes", {"ts": time.time(), "name": name})
 
         titles = ", ".join(f'"{n}"' for n in removed_names)
         self._log_event(
             "warn",
             f"Cleanup check: {len(activated_ids)} activated episode(s) checked, "
-            f"{len(removed)} removed ({titles}) — no longer in Dispatcharr's catalog "
-            f"({plex_removed} removed from Plex)",
+            f"{len(removed)} removed ({ok_count} succeeded, {titles}) — no longer in "
+            f"Dispatcharr's catalog ({plex_removed} removed from Plex)",
         )
 
     def _auto_refresh_stream_picks(self, refresh_secs):
@@ -3149,8 +3217,9 @@ class BridgeCore:
 
         plex_removed = 0
         if deactivated:
-            self._remove_strm_for_episodes(removal_info)
-            plex_removed = self._plex_delete_episodes(plex_match_info)
+            # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: routed through the
+            # shared _remove_title_fully() per-episode, same rationale as
+            # deactivate_movies() above.
             for eid in deactivated:
                 entry = plex_match_info.get(eid, {})
                 name = (
@@ -3158,7 +3227,21 @@ class BridgeCore:
                     f'S{entry.get("season_number", "?")}'
                     f'E{entry.get("episode_number", "?")}'
                 )
-                self._append_history("deactivated_episodes", {"ts": time.time(), "name": name})
+                single_removal_info = {eid: removal_info[eid]}
+
+                def _do_plex_delete(eid=eid, entry=entry):
+                    nonlocal plex_removed
+                    n = self._plex_delete_episodes({eid: entry})
+                    plex_removed += n
+                    return n
+
+                self._remove_title_fully(
+                    "episode", ref_id=eid, name=name,
+                    plex_delete_fn=_do_plex_delete,
+                    folder_delete_fn=lambda ri=single_removal_info: self._remove_strm_for_episodes(ri),
+                    history_category="deactivated_episodes",
+                    retry_context={"plex_match_entry": entry},
+                )
             self._log_event(
                 "info",
                 f"Deactivated {len(deactivated)} episode(s) — removed {plex_removed} from Plex",
@@ -3215,6 +3298,91 @@ class BridgeCore:
                 if ok:
                     removed += 1
         return removed
+
+    def _plex_delete_by_title(self, section, titles, plex_type, label, dry_run=False):
+        """Unified title-based Plex match/delete, generalizing the pattern
+        _plex_delete_episodes() already uses successfully (self._clean_title()
+        applied symmetrically to both our side's titles and Plex's own
+        metadata). Used for untracked orphans (movie or series-show), which
+        by definition have no surviving tracking record to key an id-based
+        delete off of -- _plex_delete_movies()'s filename-embedded-id regex
+        and _plex_delete_episodes()'s (series, season, episode) key both
+        need state this sweep doesn't have.
+
+        section: the Plex library section to query.
+        titles: iterable of "Title (Year)"-style folder names (STRM naming
+        convention) -- cleaned with self._clean_title() the same way the
+        movie/series STRM folder name itself was produced, then matched
+        against Plex's own (equally cleaned) `title` field.
+        plex_type: Plex's `type` filter -- 1 for Movie, 2 for Show. Movies
+        and series-show deletes share this one method/one code path; the
+        type value is the only thing that differs between them.
+        label: for logging only ("movie" / "series").
+        dry_run: when True, still runs the live Plex query and match (so
+        the caller can see exactly what WOULD be deleted) but skips the
+        actual _plex_delete_batch() DELETE call. Returns the list of
+        matched (rating_key, title) tuples instead of a removed count --
+        first-deploy safety valve for the untracked-orphan sweep (bead
+        dispatcharr-vod-plex-bridge-plugin-1nrl, phase 3).
+
+        Returns the number of Plex items deleted (dry_run=False), or the
+        list of (rating_key, title) matches that would have been deleted
+        (dry_run=True).
+        """
+        plex_url = self.settings.get("plex_url", "")
+        plex_token = self.settings.get("plex_token", "")
+        if not plex_url or not plex_token:
+            return [] if dry_run else 0
+        if section in (None, "", self.PLEX_SECTION_UNSET):
+            return [] if dry_run else 0
+
+        wanted = {self._clean_title(t) for t in titles}
+        if not wanted:
+            return [] if dry_run else 0
+
+        try:
+            resp = requests.get(
+                f"{plex_url}/library/sections/{section}/all",
+                params={"X-Plex-Token": plex_token, "type": str(plex_type)},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
+                return [] if dry_run else 0
+
+            items = resp.json().get("MediaContainer", {}).get("Metadata", [])
+            to_delete = [
+                (item.get("ratingKey"), item.get("title", "?"))
+                for item in items
+                if self._clean_title(item.get("title", "")) in wanted
+            ]
+
+            if dry_run:
+                if not to_delete and wanted:
+                    logger.info(
+                        f"[DRY RUN] Plex title-based match: 0/{len(wanted)} matched in section "
+                        f"{section} -- wanted={wanted} not found among {len(items)} Plex item(s)"
+                    )
+                else:
+                    logger.info(
+                        f"[DRY RUN] Plex title-based match: would delete {len(to_delete)} {label}(s) "
+                        f"in section {section}: {to_delete}"
+                    )
+                return to_delete
+
+            removed = self._plex_delete_batch(plex_url, plex_token, to_delete, label)
+
+            if removed == 0 and wanted:
+                logger.warning(
+                    f"Plex title-based delete: 0/{len(wanted)} matched in section {section} -- "
+                    f"wanted={wanted} not found among {len(items)} Plex item(s); "
+                    f"these {label}(s) were NOT removed from Plex"
+                )
+            return removed
+        except Exception as e:
+            logger.error(f"Plex title-based delete failed for section {section}: {e}")
+            return [] if dry_run else 0
 
     def _plex_delete_episodes(self, plex_match_info):
         """Mirrors _plex_delete_movies() for episodes. Episode STRM filenames
@@ -4567,11 +4735,30 @@ class BridgeCore:
         plex_removed = 0
         names = []
         if deactivated:
-            self._remove_strm_for_movies(deactivated, folder_hints=folder_hints)
-            plex_removed = self._plex_delete_movies(deactivated)
+            # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: routed through the
+            # shared _remove_title_fully() per-title, same as the reconcile
+            # cron, so a folder/Plex delete failure here is escalated to
+            # Needs Attention instead of silently logged-and-forgotten (the
+            # root cause of the 27 orphaned movie folders found on .245).
             names = self._movie_names(deactivated)
-            for name in names:
-                self._append_history("deactivated_movies", {"ts": time.time(), "name": name})
+            for mid, name in zip(deactivated, names):
+                folder_hint = folder_hints.get(mid)
+
+                def _do_plex_delete(m=mid):
+                    nonlocal plex_removed
+                    n = self._plex_delete_movies([m])
+                    plex_removed += n
+                    return n
+
+                self._remove_title_fully(
+                    "movie", ref_id=mid, name=name,
+                    plex_delete_fn=_do_plex_delete,
+                    folder_delete_fn=lambda m=mid, fh=folder_hint: self._remove_strm_for_movies(
+                        [m], folder_hints={m: fh}
+                    ),
+                    history_category="deactivated_movies",
+                    retry_context={"folder_hint": folder_hint},
+                )
             titles = ", ".join(f'"{n}"' for n in names)
             self._log_event(
                 "info",
@@ -4682,6 +4869,105 @@ class BridgeCore:
             except Exception as e:
                 logger.error(f"STRM removal error for {folder_name}: {e}")
 
+    # --- Unified full-removal routine (folder delete + Plex API delete) ---
+    #
+    # Single shared routine used by EVERY automatic removal trigger --
+    # manual deactivate (deactivate_movies/deactivate_episodes) and the
+    # reconcile cron (_reconcile_removed_movies/_reconcile_removed_episodes,
+    # and _sweep_untracked_orphans below) -- so behavior is identical
+    # everywhere a title is confirmed no longer provided by the source.
+    # Bead dispatcharr-vod-plex-bridge-plugin-1nrl: previously each of these
+    # three call sites independently called _remove_strm_for_movies() (which
+    # only logs-and-continues on a delete failure, with no caller-visible
+    # signal) plus its own Plex-delete call, and the reconcile cron only
+    # ever swept titles still present in self._activated -- a title that
+    # fell out of tracking before reconcile caught it was invisible to
+    # every later pass, which is how 27 orphaned movie folders accumulated
+    # on the .245 test bed. This routine fixes both: one code path for
+    # folder+Plex removal, and failures are escalated to the existing
+    # Needs Attention mechanism (_add_needs_attention/retry_needs_attention)
+    # instead of being silently swallowed.
+    def _remove_title_fully(
+        self, kind, ref_id, name, plex_delete_fn,
+        folder_path=None, folder_delete_fn=None,
+        history_category=None, stats_key=None,
+        retry_context=None,
+    ):
+        """Removes one title's on-disk folder and its Plex library entry,
+        and returns {"ok", "folder_removed", "plex_removed"}.
+
+        kind: "movie" or "episode" -- used for Needs Attention bookkeeping
+        and to route retry_needs_attention() back through this same method.
+        ref_id: the movie/episode id (string) this removal is for.
+        name: human-readable title, for logging/history/Needs Attention.
+        plex_delete_fn: zero-arg callable that performs the Plex-side
+        delete and returns a count (matches _plex_delete_movies/
+        _plex_delete_episodes' per-batch signature, wrapped by the caller
+        for a single title so this method stays batch-size-agnostic).
+        folder_path: absolute path to delete with shutil.rmtree. Movies
+        always pass this. Episodes pass folder_delete_fn instead (episode
+        removal is season/show-folder cleanup via _remove_strm_for_episodes'
+        logic, not a single rmtree) when folder_path isn't a plain
+        directory delete.
+        folder_delete_fn: zero-arg callable returning True/False, used
+        instead of folder_path when the removal isn't a single rmtree.
+        history_category / stats_key: which _maint_history list and
+        _maint_stats counter to update on full success (skipped when
+        omitted, e.g. for a retry where the original caller will do its
+        own bookkeeping).
+        retry_context: extra data retry_needs_attention() needs to redrive
+        this exact removal (folder_path, plex ids, etc.) -- stored verbatim
+        on the Needs Attention entry if this call fails.
+        """
+        folder_removed = True
+        folder_error = None
+        if folder_delete_fn is not None:
+            try:
+                folder_removed = bool(folder_delete_fn())
+            except Exception as e:
+                folder_removed = False
+                folder_error = str(e)
+        elif folder_path:
+            try:
+                if os.path.exists(folder_path):
+                    shutil.rmtree(folder_path)
+                    logger.info(f"Removed folder for {kind} {ref_id} ({name}): {folder_path}")
+            except Exception as e:
+                folder_removed = False
+                folder_error = str(e)
+                logger.error(f"Folder removal failed for {kind} {ref_id} ({name}): {e}")
+
+        plex_removed = 0
+        plex_error = None
+        try:
+            plex_removed = plex_delete_fn() or 0
+        except Exception as e:
+            plex_error = str(e)
+            logger.error(f"Plex removal failed for {kind} {ref_id} ({name}): {e}")
+
+        ok = folder_removed and plex_error is None
+
+        if not ok:
+            messages = []
+            if folder_error:
+                messages.append(f"folder delete failed: {folder_error}")
+            if plex_error:
+                messages.append(f"Plex delete failed: {plex_error}")
+            ctx = dict(retry_context or {})
+            ctx.setdefault("removal_kind", kind)
+            ctx.setdefault("folder_path", folder_path)
+            self._add_needs_attention(
+                "removal", ref_id, name, "; ".join(messages) or "removal failed",
+                retry_context=ctx,
+            )
+        else:
+            if history_category:
+                self._append_history(history_category, {"ts": time.time(), "name": name})
+            if stats_key:
+                self._maint_stats[stats_key] = self._maint_stats.get(stats_key, 0) + 1
+
+        return {"ok": ok, "folder_removed": folder_removed, "plex_removed": plex_removed}
+
     # --- Orphaned STRM folder scan/removal (dashboard, Health tab) ---
     #
     # Detection only -- never deletes anything on its own. Compares what's
@@ -4760,6 +5046,170 @@ class BridgeCore:
                 logger.error(f"Orphan scan (series category {cat_folder}) failed: {e}")
 
         return {"status": "ok", "items": orphans, "strm_output_dir": strm_dir}
+
+    def _build_catalog_titles(self):
+        """Live-queries Dispatcharr's current Movie and Series catalogs and
+        returns the combined set of "Title (Year)"-style folder names --
+        built with the exact same formula STRM generation itself uses
+        (_generate_strm_for_movies / the series-STRM equivalent):
+        f"{self._clean_title(name)} ({year})" if year else self._clean_title(name).
+
+        Built once and shared between the movie and series untracked-orphan
+        sweep paths (both call this same method) rather than each
+        reimplementing its own title-normalization, per the user's explicit
+        "do this once and share" direction. Returns an empty set (sweep
+        becomes a no-op, per _sweep_untracked_orphans' "still in catalog ->
+        leave alone" default-safe behavior) if the Django models aren't
+        importable, same fallback _reconcile_removed_movies()/
+        _reconcile_removed_episodes() already use.
+        """
+        titles = set()
+
+        def _folder_name(name, year):
+            clean = self._clean_title(name)
+            return f"{clean} ({year})" if year else clean
+
+        try:
+            from apps.vod.models import Movie
+            for name, year in Movie.objects.values_list("name", "year"):
+                titles.add(_folder_name(name, year))
+        except Exception as e:
+            logger.error(f"Catalog title build (movies) failed: {e}")
+
+        try:
+            from apps.vod.models import Series
+            for name, year in Series.objects.values_list("name", "year"):
+                titles.add(_folder_name(name, year))
+        except Exception as e:
+            logger.error(f"Catalog title build (series) failed: {e}")
+
+        return titles
+
+    def _sweep_untracked_orphans(self, catalog_titles, movie_plex_section=None, dry_run=False):
+        """Reconcile-cron extension (bead dispatcharr-vod-plex-bridge-plugin-1nrl):
+        catches titles that fell out of self._activated/self._episodes_activated
+        tracking BEFORE _reconcile_removed_movies()/_reconcile_removed_episodes()
+        ever saw them -- e.g. deactivated already, or a folder that predates
+        strm_folder tracking -- which those reconcile passes can never reach
+        since they only iterate their own tracked-activation dict's keys.
+
+        Reuses scan_orphan_strm_folders()'s existing folder-naming/detection
+        logic (folders on disk not referenced by any tracked activation) for
+        the disk side -- no persisted "folders we've ever created" ledger is
+        introduced, per the user's explicit direction. For each such
+        untracked folder (movie top-level folder, or series show-level
+        folder), the folder's own name is checked against `catalog_titles`
+        (the caller's current live Dispatcharr title set, movies and series
+        combined): if the title is still in the catalog, it isn't a
+        provider-drop -- leave it alone (that's ycjh's manual panel's job,
+        not automatic removal). If it's not in the catalog, treat it as
+        confirmed provider-dropped and run it through the same shared
+        _remove_title_fully() routine deactivate/reconcile already use --
+        one mechanism for both kinds, not a forked series code path.
+
+        Plex-side deletion for both kinds goes through the shared
+        _plex_delete_by_title() title-match helper (movies: type=1 against
+        movie_plex_section; series: type=2 Show-level against each orphan's
+        own category's plex_library_section, resolved the same way
+        _plex_delete_episodes() resolves it). movie_plex_section defaults to
+        settings["plex_library_section"] (the same source _plex_delete_movies()
+        already reads), mirroring how every other movie Plex-delete call
+        picks its section.
+
+        dry_run: when True (first-deploy safety default -- see the
+        untracked_orphan_dry_run plugin setting), runs this exact same
+        detection pipeline for real -- catalog membership check, on-disk
+        folder scan, and the live Plex title-match query -- but skips the
+        destructive side effects: no shutil.rmtree (via _remove_title_fully)
+        and no Plex DELETE call (via _plex_delete_by_title(dry_run=True)).
+        Each candidate that WOULD have been removed is logged and appended
+        to self._maint_dry_run_candidates (folder kind/name/path + matched
+        Plex (rating_key, title) tuples) for the dashboard/user to review
+        before flipping to live deletion. Returns [] in this mode, since
+        nothing was actually removed.
+
+        Returns the list of folder names actually removed (movies and
+        series show-folders combined). Always [] when dry_run=True.
+        """
+        if movie_plex_section is None:
+            movie_plex_section = self.settings.get("plex_library_section", 7)
+
+        scan = self.scan_orphan_strm_folders()
+        removed_names = []
+        for item in scan.get("items", []):
+            folder_name = item["folder_name"]
+            if folder_name in catalog_titles:
+                continue  # still in the catalog -- not a provider-drop, leave for manual review
+
+            if item["kind"] == "movie":
+                plex_section = movie_plex_section
+                plex_type = 1
+                label = "movie"
+            elif item["kind"] == "series":
+                # relative_path is "series/<category_folder>/<Show (Year)>" --
+                # resolve the owning category the same way scan_orphan_strm_folders()
+                # built it, to look up this show's own plex_library_section
+                # (each Series Settings category can point at a different
+                # Plex TV library, same as _plex_delete_episodes()).
+                rel_parts = item["relative_path"].replace("\\", "/").split("/")
+                cat_folder = rel_parts[1] if len(rel_parts) > 1 else None
+                category = next(
+                    (c for c in self._series_categories if c.get("strm_folder") == cat_folder),
+                    None,
+                )
+                plex_section = category.get("plex_library_section") if category else None
+                plex_type = 2
+                label = "series"
+            else:
+                continue
+
+            if dry_run:
+                plex_matches = self._plex_delete_by_title(
+                    plex_section, [folder_name], plex_type=plex_type, label=label, dry_run=True,
+                )
+                logger.warning(
+                    f"[DRY RUN] Reconcile sweep: untracked {item['kind']} folder '{folder_name}' has "
+                    f"no matching live catalog entry -- would remove folder '{item['path']}' and "
+                    f"{len(plex_matches)} matched Plex {label}(s): {plex_matches}"
+                )
+                self._maint_dry_run_candidates.append({
+                    "kind": item["kind"],
+                    "folder_name": folder_name,
+                    "folder_path": item["path"],
+                    "plex_matches": plex_matches,
+                })
+                continue
+
+            logger.warning(
+                f"Reconcile sweep: untracked {item['kind']} folder '{folder_name}' has no "
+                f"matching live catalog entry -- treating as provider-dropped and removing"
+            )
+
+            if item["kind"] == "movie":
+                result = self._remove_title_fully(
+                    "movie", ref_id=f"untracked:{folder_name}", name=folder_name,
+                    plex_delete_fn=lambda fn=folder_name: self._plex_delete_by_title(
+                        plex_section, [fn], plex_type=1, label="movie",
+                    ),
+                    folder_path=item["path"],
+                    history_category="removed_movies",
+                    stats_key="removed_total",
+                )
+            else:
+                result = self._remove_title_fully(
+                    "episode", ref_id=f"untracked:{folder_name}", name=folder_name,
+                    plex_delete_fn=lambda fn=folder_name, s=plex_section: self._plex_delete_by_title(
+                        s, [fn], plex_type=2, label="series",
+                    ),
+                    folder_path=item["path"],
+                    history_category="removed_episodes",
+                    stats_key="removed_episode_total",
+                )
+
+            if result["ok"]:
+                removed_names.append(folder_name)
+
+        return removed_names
 
     def remove_orphan_strm_folders(self, body):
         """Deletes ONLY the folders explicitly named in body["items"] (each
@@ -4861,6 +5311,20 @@ class BridgeCore:
                 elif kind == "scan":
                     ok = self._trigger_plex_scan(section=ctx.get("section"))
                     result = {"status": "ok" if ok else "error"}
+                elif kind == "removal":
+                    removal_kind = ctx.get("removal_kind", "movie")
+                    if removal_kind == "movie":
+                        plex_fn = lambda: self._plex_delete_movies([entry["ref_id"]])
+                    else:
+                        plex_fn = lambda: self._plex_delete_episodes(
+                            {entry["ref_id"]: ctx.get("plex_match_entry", {})}
+                        )
+                    retry_result = self._remove_title_fully(
+                        removal_kind, entry["ref_id"], entry["name"], plex_fn,
+                        folder_path=ctx.get("folder_path"),
+                    )
+                    ok = retry_result["ok"]
+                    result = {"status": "ok" if ok else "error", "message": "Removal retry failed"}
                 else:
                     ok = False
                     result = {"status": "error", "message": f"Unknown kind: {kind}"}
