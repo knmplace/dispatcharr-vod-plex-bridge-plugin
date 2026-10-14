@@ -1,28 +1,23 @@
 # Components
 
-This project's deployment-tier inventory. See `_shared/deployment-tier.md` for tier definitions.
+This document lists the systems that work together in a VOD To Plex installation.
+
+For setup instructions, see [Deployment and Installation](INSTALL.md) and [Rclone Setup](RCLONE_SETUP.md). For faults between these components, see [Troubleshooting](TROUBLESHOOTING.md).
 
 ## Components
 
 | Component | Tier | Purpose |
 |-----------|------|---------|
-| VOD To Plex plugin (bridge.py / server.py / plugin.py) | home-lab | Core plugin logic — Django ORM queries, WSGI HTTP server, STRM/NFO generation, Plex API integration |
-| Web dashboard (templates/dashboard.html) | home-lab | Single-page UI for browsing/activating movies, health checks, now-playing |
-| rclone HTTP mount (host .109) | home-lab | Exposes plugin's /vod/ endpoint as a FUSE filesystem for Plex to scan |
-| Dispatcharr Postgres DB | home-lab | Owned by the host Dispatcharr application, not this plugin — read-only ORM consumer |
-| Plex Media Server | home-lab | Personal media server that plays the bridged VOD library |
+| VOD To Plex plugin (`bridge.py` / `server.py` / `plugin.py`) | home-lab | Core plugin logic: Dispatcharr catalog access, HTTP server, STRM/NFO generation, and Plex API integration |
+| Web dashboard (`templates/dashboard.html`) | home-lab | Browse and activate content, health checks, maintenance, and now-playing information |
+| rclone HTTP mount (Plex machine) | home-lab | Exposes the plugin's `/vod/` and `/vod-series/` endpoints as folders for Plex to scan |
+| Dispatcharr database | home-lab | Owned by Dispatcharr; the plugin reads its VOD catalog through Dispatcharr's Django environment |
+| Plex Media Server | home-lab | Scans the generated library and plays content through the plugin redirect |
 
-## Notes
+## Connection flow
 
-Confirmed by the user 2026-07-11 during `/onboard`. All 10 assessed personas (Security
-Engineer, IT Architect, Project Manager, Project Engineer, UX Designer, Code Reviewer,
-Database Engineer, SRE, QA Engineer, Technical Writer) independently proposed home-lab
-tier with no disagreement — single author, single household user, single container on
-a home LAN host, no CI/CD, no customers, no compliance scope, no revenue impact if it
-breaks (inconvenience for the operator only).
+```text
+Plex → rclone mount → VOD To Plex HTTP server → Dispatcharr VOD proxy → provider
+```
 
-Overall onboarding result: 7 GREEN, 3 YELLOW, 0 RED. YELLOWs were: Security Engineer
-(attack surface/secrets posture — normal for home-lab, no exploitable finding), Code
-Reviewer (a since-fixed duplicate `activate_movies` method in bridge.py), and QA
-Engineer (zero automated tests — below even the home-lab "smoke test" baseline, flagged
-as a cheap future win on `server.py`'s pure-Python `_parse_query()` logic, not urgent).
+The plugin's private STRM output directory is inside the Dispatcharr environment. Plex normally does not access that directory directly; it sees the HTTP endpoints through rclone.

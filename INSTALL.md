@@ -1,199 +1,187 @@
-<p align="center">
-  <img src="logo.png" alt="VOD To Plex logo" width="100">
-</p>
+# VOD To Plex: Deployment and Installation
 
-<h1 align="center">Installation Guide</h1>
-<p align="center">VOD To Plex — Dispatcharr Plugin</p>
+This guide explains how to install the VOD To Plex plugin in Dispatcharr, configure it, and connect it to Plex.
 
-Step-by-step setup: installing the plugin, configuring settings, exposing the port, setting up rclone on the Plex server, and creating your Plex library.
+If you are new to this setup, follow the guides in this order:
 
-See the main [README](README.md) for features, usage, and architecture.
+1. This deployment guide: install the plugin and configure its settings.
+2. [Rclone Setup](RCLONE_SETUP.md): make the plugin's library visible to Plex.
+3. [Troubleshooting](TROUBLESHOOTING.md): fix common connection and playback problems.
 
-## 📋 Before You Start
+For a short overview of the project, see the [README](README.md).
 
-| Requirement | Notes |
+## What you need
+
+| Item | Why it is needed |
 |---|---|
-| 🖥️ **Dispatcharr** | v0.24.0 or later |
-| 🎞️ **Plex Media Server** | Any recent version |
-| 🔌 **rclone** | Installed on the machine running **Plex** (not Dispatcharr) |
-| 🌐 **Network access** | The plugin's HTTP port must be reachable from the Plex server |
+| Dispatcharr 0.24.0 or newer | Runs the plugin and provides the VOD streams |
+| Plex Media Server | Displays the activated movies and series |
+| rclone on the Plex machine | Lets Plex see the plugin's online library as a normal folder |
+| Network access between Plex and Dispatcharr | Plex must be able to reach the plugin's port |
 
----
+You do not need to install Python packages for this plugin. Dispatcharr supplies the Python environment and the plugin uses Dispatcharr's own VOD proxy for playback.
 
-## Step 1 — Install the Plugin
+## Step 1: Prepare the release ZIP
 
-Copy the plugin folder into Dispatcharr's plugins directory so it looks like this:
-
-```
-/data/plugins/vod_plex_bridge/
-├── __init__.py
-├── plugin.json
-├── plugin.py
-├── server.py
-├── bridge.py
-└── templates/
-    └── dashboard.html
-```
-
-**If running Docker**, copy the files into the container:
-```bash
-docker cp vod_plex_bridge/ <dispatcharr-container>:/data/plugins/vod_plex_bridge/
-docker exec <dispatcharr-container> chown -R 1000:1000 /data/plugins/vod_plex_bridge/
-```
-
-Restart the Dispatcharr container, then enable the plugin from the Dispatcharr UI.
-
-> ⬆️ **Upgrading from v2.0.x or earlier?** If you see duplicate "VOD To Plex" cards after upgrading, uninstall the old card first: in Dispatcharr's **Plugins** panel, find the old card (may show as "UNMANAGED"), click **Uninstall**, then go to **Find Plugins**, search "VOD To Plex", and **Import Plugin** with the latest release zip. Releases from v2.2.0 onward package correctly, so this is a one-time fix.
-
----
-
-## Step 2 — Configure the Plugin
-
-Open the plugin's settings in Dispatcharr and fill these in:
-
-| Setting | Description | Example |
-|---|---|---|
-| **Dispatcharr URL** | LAN URL of Dispatcharr, reachable from Plex | `http://192.168.1.100:9191` |
-| **Dashboard Port** | HTTP port for the dashboard and VOD endpoint | `8888` |
-| **Dashboard Host IP** | LAN IP of the Docker host | `192.168.1.100` |
-| **Plex URL** | Full URL of your Plex server | `http://192.168.1.200:32400` |
-| **Plex Token** | X-Plex-Token for Plex API access | *(your token)* |
-| **Plex Library Section** | Library section ID for VOD movies | `7` |
-| **STRM Output Dir** | Where STRM/NFO files are written | `/data/plugin-strm` |
-| **TMDB API Key** | Optional — enables language detection | *(your key)* |
-| **TMDB Read Token** | Optional — alternative to API key | *(your token)* |
-
-After saving and starting the server, open the dashboard and go to **Health → rclone Endpoints** to see the exact URLs to use:
+When importing through the Dispatcharr GUI, use the release ZIP. The ZIP must contain one plugin folder at its top level:
 
 ```text
-Movies: http://<dashboard-host>:<dashboard-port>/vod/
-Series: http://<dashboard-host>:<dashboard-port>/vod-series/
+vod-to-plex-plugin-vX.Y.Z.zip
+└── vod_plex_bridge/
+    ├── plugin.json
+    ├── plugin.py
+    ├── bridge.py
+    ├── server.py
+    ├── streaming.py
+    ├── logo.png
+    └── templates/
+        └── dashboard.html
 ```
 
-Use the Movies URL for a Plex **Movies** library and the Series URL for a separate Plex **TV Shows** library. Series categories are subfolders under `/vod-series/`, not separate endpoints.
+The important details are:
 
----
+- The top-level folder must be named `vod_plex_bridge`.
+- `templates/dashboard.html` must remain inside the `templates` folder.
+- ZIP paths must use forward slashes (`/`), including on Windows.
+- Do not upload a ZIP containing the repository folder itself as the extra outer folder.
 
-## Step 3 — Expose the Port
+For maintainers packaging a release, see the [release packaging notes](README.md#release-packaging).
 
-The plugin's HTTP port needs a Docker port mapping. If Dispatcharr runs behind a VPN container (e.g. gluetun), add the mapping there instead:
+## Step 2: Import the plugin in Dispatcharr
+
+1. Open Dispatcharr in your browser.
+2. Open the **Plugins** page.
+3. Choose **Find Plugins** or **Import Plugin**.
+4. Select the release ZIP.
+5. After the import finishes, find **VOD To Plex** in the plugin list.
+6. Enable the plugin.
+
+If you are upgrading from a very old version and see two VOD To Plex cards, remove the old unmanaged card first, then import the current ZIP again.
+
+The normal GUI import installs the plugin under:
+
+```text
+/data/plugins/vod_plex_bridge/
+```
+
+Manual copying into the container is an administrator recovery method, not the normal installation path.
+
+## Step 3: Configure the plugin
+
+Open the VOD To Plex settings in Dispatcharr. Save the settings before starting the server.
+
+### Required connection settings
+
+| Setting | What to enter | Example |
+|---|---|---|
+| **Dispatcharr URL** | The Dispatcharr address that the Plex machine can reach. Include the port. Do not use `127.0.0.1` unless Plex and Dispatcharr are on the same machine. | `http://192.168.1.100:9191` |
+| **Dashboard / Streaming Port** | The port used by the plugin's dashboard and library endpoints. Keep `8888` unless it is already in use. | `8888` |
+| **Dashboard Host IP** | The LAN address of the machine running Dispatcharr. This address is written into the STRM files so Plex knows where to connect. | `192.168.1.100` |
+| **STRM Output Directory** | Where Dispatcharr stores the generated STRM and NFO files. The default is recommended. Plex does not need direct filesystem access to this directory. | `/data/plugin-strm` |
+
+### Plex settings
+
+| Setting | What to enter |
+|---|---|
+| **Plex URL** | The address of Plex as seen from the Dispatcharr container, such as `http://192.168.1.200:32400`. |
+| **Plex Token** | Your Plex authentication token. Keep this private. |
+| **Plex Library Section ID** | The number belonging to the VOD Movies library. The [Plex library section instructions](RCLONE_SETUP.md#find-the-plex-library-section-id) explain how to find it. |
+
+Plex settings are needed for automatic library scans, Plex confirmation, now-playing information, and deletion when content is deactivated.
+
+### Optional settings
+
+| Setting | Recommended starting point |
+|---|---|
+| **Auto-Start Server** | Enable this if the plugin should start after Dispatcharr reloads or restarts. |
+| **Debug: Log Connections & Server Errors** | Leave off normally. Enable only while troubleshooting. |
+| **Max Concurrent HEAD Probes** | Leave at `5` unless your provider allows fewer or more simultaneous connections. |
+| **Max Concurrent Connections Per Title** | Leave at `2`, or lower it when a provider has a strict connection limit. |
+| **Removed-Movie Check Interval** | The default `300` seconds is suitable for most installations. |
+| **Auto Stream Refresh Interval** | The default `7` days is suitable for most installations. Set to `0` to disable it. |
+| **Untracked Orphan Sweep: Dry Run Only** | Keep enabled until you have reviewed the dry-run log. Disable only when you want automatic cleanup of confirmed untracked content. |
+| **Hide Adult Categories** | Enabled by default. Disable only if those categories should appear in the dashboard. |
+| **TMDB API Key / Read Access Token** | Optional. Configure one if you want language detection and TMDB-assisted metadata. The Read Access Token takes priority if both are entered. |
+
+Series destination folders are configured from the dashboard under the series settings. Each category can have its own folder and Plex TV library section.
+
+## Step 4: Make the plugin port reachable
+
+The plugin listens on port `8888` by default. The Plex machine must be able to reach that port on the Dispatcharr host.
+
+If Dispatcharr runs in Docker, publish the same port on the host:
 
 ```yaml
 ports:
-  - "8888:8888"  # VOD To Plex plugin
+  - "8888:8888"
 ```
 
-> 💡 Running multiple instances? Each one needs its own unique port — update both the plugin setting and the Docker mapping to match.
+If Dispatcharr uses a VPN container such as gluetun, publish the port on the container that actually owns Dispatcharr's network connection.
 
----
+If you choose another plugin port, use that same number in all three places:
 
-## Step 4 — Set Up rclone on the Plex Server
+1. The plugin's **Dashboard / Streaming Port** setting.
+2. The Docker port mapping.
+3. The rclone URL in [Rclone Setup](RCLONE_SETUP.md).
 
-**4a. Install rclone** on the machine running Plex:
+## Step 5: Start the plugin server
 
-```bash
-# Linux/macOS
-curl https://rclone.org/install.sh | sudo bash
+1. In the Dispatcharr plugin card, click **Start Server**.
+2. Click **Status** and confirm that the server is running.
+3. Open the dashboard using:
+
+```text
+http://<dispatcharr-host-ip>:8888/
 ```
 
-Windows: download from [rclone.org/downloads](https://rclone.org/downloads/) and add it to your PATH.
+The dashboard also shows the exact Movies and Series endpoint URLs under **Health → rclone Endpoints**.
 
-Verify:
-```bash
-rclone version
+## Step 6: Connect Plex through rclone
+
+Complete the separate [Rclone Setup guide](RCLONE_SETUP.md). It explains the connection in plain language and gives instructions for Linux, Windows, and Docker-based Plex installations.
+
+Do not add the plugin's `/data/plugin-strm` directory directly to Plex unless you have deliberately created a separate shared filesystem. The normal setup is:
+
+```text
+Plex → rclone mount → plugin HTTP server → Dispatcharr VOD proxy
 ```
 
-**4b. Create an rclone remote** pointing at the plugin:
+## Step 7: Activate content
 
-```ini
-# Add to /root/.config/rclone/rclone.conf on the Plex server:
-[vodplugin]
-type = http
-url = http://<dispatcharr-host-ip>:8888/vod/
-```
+1. Open the plugin dashboard.
+2. Browse the **Movies** or **Series** tab.
+3. Select one or more items.
+4. Click **Activate**.
+5. Wait for the STRM/NFO files and Plex scan to complete.
+6. Confirm that the title appears in the matching Plex library.
 
-**4c. Mount it** as a FUSE filesystem:
+For providers with strict connection limits, activate one season or a small group first. Plex may inspect new files during a scan, and each inspection can briefly use a provider connection.
 
-```bash
-mkdir -p /mnt/vod-plugin
-rclone mount vodplugin: /mnt/vod-plugin \
-  --allow-other \
-  --vfs-cache-mode off \
-  --dir-cache-time 30s \
-  --poll-interval 0 \
-  --read-only
-```
+## Updating the plugin
 
-**4d. (Recommended) Make it persistent** with a systemd service:
+1. Download the newer release ZIP.
+2. Confirm it has the same `vod_plex_bridge/` wrapper described above.
+3. Import it through Dispatcharr's plugin interface.
+4. If Dispatcharr does not reload the new code, restart the Dispatcharr container through your normal container-management tool.
+5. Confirm the displayed plugin version and click **Status**.
 
-```ini
-# /etc/systemd/system/rclone-vodplugin.service
-[Unit]
-Description=rclone VOD Plugin mount
-After=network-online.target
-Wants=network-online.target
+For problems after an update, use the [Troubleshooting guide](TROUBLESHOOTING.md).
 
-[Service]
-Type=notify
-ExecStart=/usr/bin/rclone mount vodplugin: /mnt/vod-plugin \
-  --allow-other \
-  --vfs-cache-mode off \
-  --dir-cache-time 30s \
-  --poll-interval 0 \
-  --read-only
-ExecStop=/bin/fusermount -uz /mnt/vod-plugin
-Restart=on-failure
-RestartSec=10
+## Release packaging
 
-[Install]
-WantedBy=multi-user.target
-```
+This section is for the person creating release ZIPs.
 
-```bash
-systemctl daemon-reload
-systemctl enable --now rclone-vodplugin
-```
+The release must be built from a staging folder containing the plugin files under `vod_plex_bridge/`. Do not use PowerShell `Compress-Archive` for this project: it can create backslash-separated ZIP paths, which Linux-based Dispatcharr imports may not treat as real folders.
 
----
+After creating the ZIP, verify that:
 
-## Step 5 — Create a Plex Library
+- `vod_plex_bridge/plugin.json` exists;
+- `vod_plex_bridge/templates/dashboard.html` exists as a nested file;
+- every ZIP path uses `/` separators; and
+- extracting the ZIP produces exactly one top-level `vod_plex_bridge` folder.
 
-1. In Plex, add a new **Movies** library
-2. Point it to the rclone mount path (e.g. `/mnt/vod-plugin`)
-3. Set the agent to **Plex Movie** (or your preferred agent)
-4. 🎯 **Recommended**: under Advanced, set library scan to **Manual** or disable automatic media analysis, to avoid unnecessary provider connections during scans
-5. ✅ Enable **Allow media deletion** in Plex Settings → Troubleshooting — required for real-time removal on deactivation
+## Next steps
 
-**Finding your Plex Library Section ID** (needed for the plugin's settings, so it can trigger scans and delete items):
-
-1. Get your Plex token (`X-Plex-Token`): open Plex Web, play any item, click **⋮** → **Get Info** → **View XML**, and copy the `X-Plex-Token=...` value from the resulting URL.
-2. Visit this URL in a browser (fill in your own server IP and token):
-   ```
-   http://<plex-server-ip>:32400/library/sections?X-Plex-Token=<your-token>
-   ```
-   **Example**: server IP `192.168.1.20`, token `abc123XYZ` →
-   ```
-   http://192.168.1.20:32400/library/sections?X-Plex-Token=abc123XYZ
-   ```
-3. This returns XML listing every library. Find the `<Directory>` entry whose `title` matches your new library, and use its `key` attribute — that's the Section ID:
-   ```xml
-   <Directory key="7" type="movie" title="Stream-Movies-Bridge" .../>
-   ```
-
----
-
-## Step 6 — Enable the Plugin
-
-In Dispatcharr's plugin panel, enable the plugin, then click **Start Server**. Open the dashboard at `http://<host-ip>:8888/`.
-
-To confirm it's running, click **Status** — you should see:
-```
-✓ Server running on port 8888 | 11 activated | 38,534 in catalog
-```
-
----
-
-## ✅ Next Steps
-
-- See [README.md](README.md#usage) for how to browse, activate, and manage your library from the dashboard.
-- Having trouble? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+- [Rclone Setup](RCLONE_SETUP.md)
+- [Troubleshooting](TROUBLESHOOTING.md)
+- [README](README.md)

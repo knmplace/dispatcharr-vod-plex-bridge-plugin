@@ -1,147 +1,114 @@
+# VOD To Plex
+
 <p align="center">
   <img src="logo.png" alt="VOD To Plex logo" width="120">
 </p>
 
-<h1 align="center">VOD To Plex</h1>
 <p align="center"><strong>Dispatcharr Plugin</strong></p>
 
-<p align="center">
-A <a href="https://github.com/Dispatcharr/Dispatcharr">Dispatcharr</a> plugin that bridges VOD movies and series into Plex via rclone HTTP mount with 302 redirect streaming.
-</p>
+VOD To Plex lets you choose movies and series from Dispatcharr and make them appear in Plex. It creates small STRM and NFO files, exposes them through an HTTP server, and sends playback to Dispatcharr's native VOD proxy.
 
----
+## How it works
 
-## 🚀 How It Works
-
-```
-Plex → rclone HTTP mount → Plugin HTTP server → 302 redirect → Dispatcharr VOD proxy → Provider
+```text
+Plex → rclone mount → VOD To Plex HTTP server → Dispatcharr VOD proxy → Provider
 ```
 
-1. Plugin runs an HTTP server inside the Dispatcharr container
-2. You activate movies and series from the web dashboard — the plugin generates STRM/NFO files
-3. rclone mounts the plugin's HTTP endpoint as a FUSE filesystem on your Plex server
-4. Plex scans the mount and sees your library with metadata (from NFO) and posters (from TMDB)
-5. On playback, the plugin issues a 302 redirect straight to Dispatcharr's native VOD proxy
-6. Dispatcharr handles the streaming connection natively — persistent connections, Range requests, session management
+In plain language:
 
-> ⚡ **No streaming proxy needed.** Dispatcharr's VOD proxy already does everything. The plugin just bridges the metadata and redirects.
+1. Dispatcharr runs the plugin.
+2. You activate titles in the plugin dashboard.
+3. The plugin creates library information for Plex.
+4. rclone, running on the Plex machine, makes the online library look like a normal folder.
+5. Plex scans that folder.
+6. When you press Play, the plugin sends Plex to Dispatcharr's normal VOD stream.
 
-## ✨ Features
+The plugin does not replace Dispatcharr's streaming system. Dispatcharr continues to manage provider connections, range requests, sessions, and playback.
 
-**📚 Movies & Series**
-- Full Movies and Series/Season/Episode browsing, side by side in one dashboard
-- Selective activation — choose exactly what shows up in Plex, individually or in bulk
-- Select All / Clear All with full filter awareness
-- Reactivate — regenerate STRM/NFO in place without a destructive deactivate/reactivate cycle
+## Main features
 
-**🔍 Browse & Filter**
-- Multi-select provider and category filters
-- Language filter, powered by optional TMDB language detection
-- Search across your whole catalog
-- Trailer previews (YouTube) right from the card
+- Movies and series browsing with selective activation.
+- Provider, category, language, search, and duplicate filtering.
+- STRM/NFO generation with TMDB-assisted metadata options.
+- Plex library scans after activation.
+- Plex deletion when content is deactivated.
+- Provider capacity checks and fallback handling.
+- Health, activity, now-playing, and maintenance tools.
+- Manual review of orphaned STRM folders.
 
-**🎬 Plex Integration**
-- 302 redirect playback — zero overhead, Dispatcharr streams natively
-- NFO metadata + TMDB posters for clean Plex matching
-- Real-time Plex delete on deactivation — no waiting on a scan
-- Automatic library scan trigger after activation
-- Plex Now Playing panel — see active sessions from the dashboard
+## Requirements
 
-**🩺 Health & Reliability**
-- Per-provider health dashboard with manual refresh
-- Automatic cleanup of movies/episodes removed upstream by a provider
-- Connection-capacity gating so bulk activation doesn't blow past your provider's concurrent-stream limit
-- Catalog summary with clickable category chips
-
-## 📋 Requirements
-
-| Requirement | Notes |
+| Requirement | Purpose |
 |---|---|
-| 🖥️ **Dispatcharr** | v0.24.0 or later |
-| 🎞️ **Plex Media Server** | Any recent version |
-| 🔌 **rclone** | Installed on the machine running Plex, for the HTTP mount |
-| 🌐 **Network access** | The plugin's HTTP port must be reachable from the Plex server |
-| 🐍 **`requests`** | Already bundled in Dispatcharr's container — nothing extra to install |
+| Dispatcharr 0.24.0 or newer | Runs the plugin and supplies the VOD streams |
+| Plex Media Server | Displays and plays the activated content |
+| rclone on the Plex machine | Connects Plex to the plugin's HTTP library |
+| Network access | Lets Plex reach the plugin's HTTP port |
 
-## 📦 Installation
+## Start here
 
-👉 See **[INSTALL.md](INSTALL.md)** for the full step-by-step setup guide — installing the plugin, configuring settings, exposing the port, setting up rclone, and creating your Plex library.
+- [Deployment and Installation](INSTALL.md): install the plugin, configure settings, publish the port, and start the server.
+- [Rclone Setup](RCLONE_SETUP.md): connect the Plex machine to the plugin in plain language.
+- [Troubleshooting](TROUBLESHOOTING.md): diagnose setup, scanning, mounting, and playback problems.
+- [Components](COMPONENTS.md): see how the plugin fits into the surrounding systems.
 
-## 🕹️ Usage
+## Using the plugin
 
-1. Open the dashboard at `http://<host-ip>:<port>/`
-2. Switch between **Movies** and **Series** mode at the top of the dashboard
-3. Optionally pick a **provider** to narrow the catalog to one M3U account, then a **category**
-4. Browse, search, and filter — click **Select All** to grab everything matching your current filters
-5. Click the activate icon on individual items, or use **Activate Selected** for bulk
-6. The plugin generates STRM + NFO files and triggers a Plex library scan
-7. Your content appears in Plex with posters and metadata — hit Play and the plugin redirects to Dispatcharr for streaming
-8. **Deactivating** removes the STRM file(s) and deletes the item from Plex immediately via API
+After installation:
 
-### 🌍 Language Detection (Optional)
+1. Open the dashboard at `http://<dispatcharr-host-ip>:8888/`.
+2. Choose **Movies** or **Series**.
+3. Filter or search for the content you want.
+4. Select a title and click **Activate**.
+5. Wait for the Plex scan to finish.
+6. Play the title from Plex.
 
-Configure a TMDB API key or Read Access Token in plugin settings to unlock this:
+For provider accounts with low connection limits, activate a small group first. Plex may inspect new files during a scan, and those inspections can briefly use provider connections.
 
-1. In the Browse tab, use the **Language Detection** bar above the movie grid
-2. Choose a scope from the dropdown (default: 1,000 movies, roughly 8 minutes)
-3. Click **Detect Now** — runs in the background at a safe rate within TMDB's limits
-4. A language badge appears on each card once detected, and the **All Languages** filter populates
+## Architecture details
 
-## 🏗️ Architecture
+### Playback
 
-### Playback Flow
-```
-Plex GET /vod/12345.mkv
-  → rclone forwards to plugin HTTP server
-  → Plugin looks up the item in Dispatcharr's DB (Django ORM)
-  → Resolves the stream ID from the M3U relation
-  → Returns a 302 redirect to Dispatcharr's native VOD proxy
-  → Plex follows the redirect
-  → Dispatcharr streams natively (persistent connection, Range support)
+```text
+Plex requests a file
+  → rclone forwards the request to the plugin
+  → the plugin finds the selected Dispatcharr stream
+  → the plugin returns a 302 redirect
+  → Dispatcharr's VOD proxy streams the content
 ```
 
-### File Size Estimation
-rclone uses HEAD requests to determine file sizes. The plugin estimates size from duration, then reconciles against Plex's own confirmed size once known — so Plex never sees a mismatched or 0-byte file, which it would otherwise skip or endlessly re-analyze.
+### File size handling
 
-### Plex Delete on Deactivation
-Deactivating an item removes its STRM/NFO files from disk, then queries Plex's library and sends a delete request for the matching entry — no scan wait required. This requires **Allow media deletion** to be enabled in Plex Settings → Troubleshooting.
+Plex and rclone ask for file information before playback. The plugin provides an estimate and later reconciles it with Plex's confirmed size so Plex does not repeatedly re-analyze a title because its reported size changed.
 
-### Why 302 Redirect?
-Dispatcharr's VOD proxy already provides persistent streaming connections, HTTP Range support, session management, and stop detection. The 302 approach reuses that same proven code path instead of reinventing it.
+### Deactivation
 
-## 📁 File Structure
+When a title is deactivated, the plugin removes its generated library files and requests deletion of the matching Plex entry. Plex must have media deletion enabled for the Plex-side removal to succeed.
 
-```
-vod_plex_bridge/
-├── __init__.py         # Exports Plugin class
-├── plugin.json         # Plugin manifest (fields, actions, metadata)
-├── plugin.py           # Plugin lifecycle — auto-start, start/stop, status
-├── server.py           # WSGI HTTP server (stdlib wsgiref, threaded)
-├── bridge.py           # Django ORM queries, 302 URL builder, STRM/NFO gen, Plex API
-├── logo.png             # Plugin logo
-└── templates/
-    └── dashboard.html  # Web dashboard (Browse, Series, Health tabs)
+## Release packaging
+
+Release ZIPs are imported by Dispatcharr's plugin manager. They must contain one top-level `vod_plex_bridge/` folder, and `templates/dashboard.html` must remain nested inside it:
+
+```text
+vod-to-plex-plugin-vX.Y.Z.zip
+└── vod_plex_bridge/
+    ├── plugin.json
+    └── templates/
+        └── dashboard.html
 ```
 
-## ⚠️ Known Limitations
+ZIP entry names must use forward slashes. See the full [release packaging instructions](INSTALL.md#release-packaging) before publishing a package.
 
-- **Connection gating is partial** — activation and playback check for free provider capacity before picking a stream, and stall detection auto-advances on repeated failures. A bulk activation plus a Plex library scan can still momentarily burst past comfortable levels before gating catches up — setting Plex library analysis to Manual is recommended for large batches.
-- **Series/episode batch activation needs care** — activating a large batch of episodes at once means Plex will probe every new file on its next scan, each opening a real provider connection. Activate a season or a handful of episodes at a time for providers with low concurrent-connection limits, not an entire multi-season series in one shot.
-- **Provider fallback is capacity-driven, not preference-ordered** — the plugin switches to another stream if the preferred provider has no room or stalls out, but doesn't rank providers by quality.
-- **No error screens** — provider errors return HTTP status codes, not user-friendly video messages.
+## Known limitations
 
-## 🙏 Acknowledgments
+- Large series activations can cause Plex to inspect many episodes at once. Activate a season or smaller batch when provider limits are low.
+- Provider fallback is based on capacity and playback health, not a permanent provider preference.
+- Provider failures are reported through the dashboard and HTTP status codes rather than a custom video error screen.
 
-This plugin wouldn't exist without the incredible work of the Dispatcharr community. A huge thank you to the developers whose plugins paved the way and served as the foundation for this project:
+## Acknowledgments
 
-- **[vod2strm](https://github.com/cmc0619/vod2strm)** by [cmc0619](https://github.com/cmc0619) — A brilliant high-performance plugin that exports VOD libraries into .strm/.nfo files. Our file size estimation approach (`duration * bitrate` with 2 GiB fallback) and 302 redirect playback pattern were directly inspired by this plugin's elegant implementation. Thank you for showing the way.
-- **[VOD2MLIB](https://github.com/shedunraid/VOD2MLIB)** by [shedunraid](https://github.com/shedunraid) — The original Dispatcharr VOD-to-media-library plugin that proved the concept of scanning VOD catalogs and generating STRM files for media server import. We referenced this extensively for STRM generation patterns and plugin architecture. Thank you for pioneering this approach.
-- **[VOD2MLIB fork](https://github.com/OneHotTake/VOD2MLIB)** by [OneHotTake](https://github.com/OneHotTake) — An actively maintained fork of VOD2MLIB with continued improvements and contributions to the VOD plugin ecosystem. Thank you for keeping the momentum going.
-- **[Dispatcharr](https://github.com/Dispatcharr/Dispatcharr)** — The platform this plugin runs on. Its native VOD proxy endpoint handles all the heavy lifting for streaming — persistent connections, Range requests, Redis sessions, and stop detection. None of this would be possible without the Dispatcharr team's outstanding work.
-- **[PiratesIRC](https://github.com/PiratesIRC)** — Contributed the provider category-tag stripping fix (v2.4.4) that lets Plex correctly match titles that IPTV providers prefix with tags like `EN -` or `4K-EN -`.
+This project builds on ideas and patterns from the Dispatcharr community, [vod2strm](https://github.com/cmc0619/vod2strm), [VOD2MLIB](https://github.com/shedunraid/VOD2MLIB), and the [Dispatcharr project](https://github.com/Dispatcharr/Dispatcharr).
 
-We're grateful to everyone in the Dispatcharr community who shares their work openly — it makes projects like this possible.
-
-## 📄 License
+## License
 
 MIT
