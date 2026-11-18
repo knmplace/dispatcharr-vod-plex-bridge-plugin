@@ -473,6 +473,11 @@ def _dispatch(environ, start_response, server, bridge, settings):
                     info = bridge.get_episode_info(episode_id)
                     if not info:
                         return _text_response(start_response, 404, "Not found")
+                    if not info.get("file_size"):
+                        start_response("503 Service Unavailable", [
+                            ("Retry-After", "60"), ("Content-Length", "0"),
+                        ])
+                        return [b""]
                     headers = [
                         ("Accept-Ranges", "bytes"),
                         ("Content-Type", info.get("content_type", "video/x-matroska")),
@@ -525,6 +530,11 @@ def _dispatch(environ, start_response, server, bridge, settings):
                 info = bridge.get_episode_info(episode_id)
                 if not info:
                     return _text_response(start_response, 404, "Not found")
+                if not info.get("file_size"):
+                    start_response("503 Service Unavailable", [
+                        ("Retry-After", "60"), ("Content-Length", "0"),
+                    ])
+                    return [b""]
                 headers = [
                     ("Accept-Ranges", "bytes"),
                     ("Content-Type", info.get("content_type", "video/x-matroska")),
