@@ -3537,17 +3537,19 @@ class BridgeCore:
             return None
 
         entry = self._episodes_activated.get(eid, {})
-        has_confirmed = entry.get("confirmed_size") is not None
-        file_size = self._estimate_episode_size(episode)
-
+        relations = list(episode.m3u_relations.all())
+        selected = entry.get("stream_pick")
+        relation = next((r for r in relations if str(r.stream_id) == str(selected)), None)
+        if selected is None and relations:
+            relation = relations[0]
+        file_size = self._get_episode_stream_size(episode, relation) if relation else None
+        has_confirmed = file_size is not None
         info = {
             "name": episode.name,
             "uuid": str(episode.uuid),
             "content_type": "video/x-matroska",
             "file_size": file_size,
         }
-
-        relation = episode.m3u_relations.first()
         if relation:
             info["stream_id"] = relation.stream_id
             ext = getattr(relation, "container_extension", None) or "mkv"
@@ -3558,25 +3560,131 @@ class BridgeCore:
         self._log_diagnostic("debug", f"Episode {eid}: HEAD probe OK (size={info.get('file_size')} bytes, confirmed={has_confirmed})")
         return info
 
-    def _estimate_episode_size(self, episode):
-        # Same three-tier, ground-truth-first pattern as movies' _estimate_size():
-        # once Plex has analyzed the episode and reported back its own size, serve
-        # that back so Content-Length never mismatches what Plex already
-        # recorded, which is what triggers an unwanted re-analysis pass. Until
-        # then, serve the bitrate-based estimate cached at activation time
-        # (see _resolve_estimated_episode_size) rather than falling straight to
-        # the crude duration guess.
-        entry = self._episodes_activated.get(str(episode.id))
-        if entry:
-            if entry.get("confirmed_size"):
-                return int(entry["confirmed_size"])
-            if entry.get("estimated_size"):
-                return int(entry["estimated_size"])
+    def _probe_episode_size_response(self, url):
+        """Use HEAD where supported, otherwise a private, bounded range probe."""
+        from contextlib import contextmanager
+        from urllib.parse import urlsplit, urlunsplit
+        import uuid
 
-        duration = getattr(episode, "duration_secs", None)
-        if duration and duration > 0:
-            return int(duration) * 250000
-        return 2 * 1024 * 1024 * 1024
+        @contextmanager
+        def probe():
+            with requests.head(url, allow_redirects=True, timeout=(5, 35),
+                               headers={"Accept-Encoding": "identity"}) as response:
+                if response.status_code not in (405, 501):
+                    yield response
+                    return
+            # A session we minted ourselves cannot be an existing viewer's
+            # session. Do not let this metadata request adopt a playback slot.
+            session_id = "vod_size_" + uuid.uuid4().hex
+            parsed = urlsplit(url)
+            probe_url = urlunsplit((parsed.scheme, parsed.netloc,
+                                   parsed.path.rstrip("/") + "/" + session_id,
+                                   parsed.query, parsed.fragment))
+            try:
+                with requests.get(
+                    probe_url, headers={"Range": "bytes=0-1", "Accept-Encoding": "identity"},
+                    stream=True, allow_redirects=True, timeout=(5, 35),
+                ) as response:
+                    # Only headers are needed. Never consume a full body even
+                    # when a provider ignores the Range request and returns 200.
+                    yield response
+            finally:
+                self._cleanup_episode_size_probe(session_id)
+        return probe()
+
+    def _cleanup_episode_size_probe(self, session_id):
+        """Release only our closed metadata probe, never a viewer's session."""
+        try:
+            from apps.proxy.vod_proxy.multi_worker_connection_manager import (
+                MultiWorkerVODConnectionManager, RedisBackedVODConnection,
+            )
+            manager = MultiWorkerVODConnectionManager.get_instance()
+            conn = RedisBackedVODConnection(session_id, manager.redis_client)
+            if conn._acquire_lock():
+                try:
+                    state = conn._get_connection_state()
+                    if state and state.active_streams > 0:
+                        state.active_streams = 0
+                        conn._save_connection_state(state)
+                finally:
+                    conn._release_lock()
+            manager.cleanup_persistent_connection(session_id)
+        except Exception as exc:
+            self._log_diagnostic("warn", f"Size probe cleanup failed ({type(exc).__name__})")
+
+    def _get_episode_stream_size(self, episode, relation):
+        """Measure length through Dispatcharr HEAD; never treat estimates as bytes.
+
+        Dispatcharr HEAD probes provider headers without retaining a playback
+        stream. Serialize with redirects, cache by stream ID, and back off for
+        60 seconds after an unsuccessful probe. Never log stream URLs/errors.
+        """
+        eid = str(episode.id)
+        stream_id = str(relation.stream_id)
+        with self._get_episode_redirect_lock(eid):
+            entry = self._episodes_activated.get(eid)
+            if entry is None:
+                return None
+            if str(entry.get("measured_size_stream_id")) == stream_id:
+                size = entry.get("measured_size")
+                if isinstance(size, int) and size > 0:
+                    return size
+            now = time.time()
+            if (entry.get("size_probe_stream_id") == stream_id
+                    and now - entry.get("size_probe_at", 0) < 60):
+                return None
+            url = self._build_episode_proxy_url(episode, relation)
+            if not url:
+                self._log_diagnostic("warn", f"Episode {eid}: size HEAD skipped, Dispatcharr URL unavailable")
+                return None
+            if not self._account_has_capacity(relation.m3u_account_id):
+                self._log_diagnostic("warn", f"Episode {eid}: size HEAD deferred, provider has no free connection")
+                return None
+            entry["size_probe_stream_id"] = stream_id
+            entry["size_probe_at"] = now
+            try:
+                with self._probe_episode_size_response(url) as response:
+                    self._log_diagnostic("debug", f"Episode {eid}: size HEAD HTTP {response.status_code}, length={response.headers.get('Content-Length', '(absent)')}")
+                    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                        return None
+                    if response.status_code == 206:
+                        value = response.headers.get("Content-Range", "")
+                        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", value.strip())
+                        if not match:
+                            return None
+                        start, end, size = map(int, match.groups())
+                        if not (0 <= start <= end < size):
+                            return None
+                    elif response.status_code == 200:
+                        value = response.headers.get("Content-Length", "")
+                        if not re.fullmatch(r"[0-9]+", value):
+                            return None
+                        size = int(value)
+                    else:
+                        return None
+                    if size <= 0:
+                        return None
+            except Exception as exc:
+                self._log_diagnostic("warn", f"Episode {eid}: size HEAD failed ({type(exc).__name__})")
+                return None
+            # Do not resurrect an episode deactivated while HEAD was in flight.
+            if self._episodes_activated.get(eid) is not entry:
+                return None
+            entry["measured_size"] = size
+            entry["measured_size_stream_id"] = stream_id
+            entry["mtime"] = now
+            self._save_state()
+            self._log_diagnostic("info", f"Episode {eid}: measured stream size {size} bytes")
+            return size
+
+    def _estimate_episode_size(self, episode):
+        # Kept for callers, but only an independently measured length is exact.
+        entry = self._episodes_activated.get(str(episode.id), {})
+        if str(entry.get("measured_size_stream_id")) == str(entry.get("stream_pick")):
+            size = entry.get("measured_size")
+            if isinstance(size, int) and size > 0:
+                return size
+        return None
 
     def _fetch_plex_episode_sizes(self, episode_ids=None):
         """Mirrors _fetch_plex_movie_sizes() for episodes. Episode STRM
