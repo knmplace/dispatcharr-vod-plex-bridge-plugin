@@ -1465,7 +1465,11 @@ class BridgeCore:
     def _store_audio_check(self, movie_id, stream_id, result):
         mid = str(movie_id)
         sid = str(stream_id)
-        entry = self._activated.get(mid, {})
+        entry = self._activated.get(mid)
+        # Probe statistics must not create an activation. The activation paths
+        # keep their checks locally until a provider passes validation.
+        if not entry or not entry.get("activated_at"):
+            return
         checks = self._audio_checks(entry)
         checks[sid] = result
         entry["audio_checks"] = checks
@@ -6231,7 +6235,7 @@ class BridgeCore:
 
         for mid in movie_ids:
             mid = str(mid)
-            if mid in self._activated:
+            if self._activated.get(mid, {}).get("activated_at"):
                 continue
 
             try:
@@ -6382,7 +6386,10 @@ class BridgeCore:
         if not movie_ids:
             return {"status": "error", "message": "No movie_ids provided"}
 
-        pending_ids = [str(mid) for mid in movie_ids if str(mid) not in self._activated]
+        pending_ids = [
+            str(mid) for mid in movie_ids
+            if not self._activated.get(str(mid), {}).get("activated_at")
+        ]
         if not pending_ids:
             return {"status": "ok", "activated": 0, "strm_generated": 0, "names": [], "failed": [], "failed_names": []}
 
@@ -6530,7 +6537,7 @@ class BridgeCore:
 
         for mid in movie_ids:
             mid = str(mid)
-            if mid in self._activated:
+            if self._activated.get(mid, {}).get("activated_at"):
                 continue
 
             try:
