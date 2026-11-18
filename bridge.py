@@ -3384,138 +3384,150 @@ class BridgeCore:
             logger.error(f"Plex title-based delete failed for section {section}: {e}")
             return [] if dry_run else 0
 
+    def _match_plex_episode_for_removal(self, episode_id, entry, items):
+        """Match one Plex item without deleting unrelated versions or Parts.
+
+        A Plex DELETE removes the entire metadata item, not just the matched
+        Part. Every Part must therefore belong to this saved episode folder
+        and ID. Legacy filenames may use title/season/episode within that folder.
+        """
+        folder = (entry.get("strm_folder") or "").replace("\\", "/").strip("/")
+        if not folder:
+            raise ValueError(f"Episode {episode_id}: missing folder for safe Plex matching")
+        wanted = (self._clean_title(entry.get("series_name", "")),
+                  str(entry.get("season_number", "")), str(entry.get("episode_number", "")))
+        identified = []
+        legacy = []
+        for item in items:
+            parts = [part for media in item.get("Media") or []
+                     for part in media.get("Part") or []]
+            if not parts:
+                continue
+            matches = []
+            legacy_paths = []
+            for part in parts:
+                path = (part.get("file") or "").replace("\\", "/")
+                parent, _, filename = path.rpartition("/")
+                same_folder = parent == folder or parent.endswith("/" + folder)
+                match = re.search(r"\[(\d+)\]\.mkv$", filename)
+                matches.append(bool(match and match.group(1) == str(episode_id) and same_folder))
+                legacy_paths.append(bool(not match and filename and same_folder))
+            if any(matches):
+                if not all(matches):
+                    raise ValueError(f"Episode {episode_id}: Plex item contains unrelated media Parts")
+                identified.append(item)
+            else:
+                key = (self._clean_title(item.get("grandparentTitle", "")),
+                       str(item.get("parentIndex", "")), str(item.get("index", "")))
+                if key == wanted and all(legacy_paths):
+                    legacy.append(item)
+        candidates = identified if identified else legacy
+        if len(candidates) > 1:
+            raise ValueError(f"Episode {episode_id}: multiple Plex items match; refusing deletion")
+        if not candidates:
+            return None
+        item = candidates[0]
+        if not str(item.get("ratingKey") or "").isdigit():
+            raise ValueError(f"Episode {episode_id}: invalid Plex rating key")
+        return item
+
     def _plex_delete_episodes(self, plex_match_info):
-        """Mirrors _plex_delete_movies() for episodes. Episode STRM filenames
-        don't embed the episode id (unlike movies' {id}.mkv), so matching is
-        by series name + season/episode number against Plex's own episode
-        metadata (grandparentTitle/parentIndex/index) instead of filename
-        regex. Grouped per plex_library_section since each Series Settings
-        category can point at a different Plex TV library."""
+        """Delete episodes by file identity, scoped to their configured library.
+
+        HTTP and deletion failures propagate to the shared removal handler.
+        A successful query with no matching item is an idempotent no-op.
+        """
         plex_url = self.settings.get("plex_url", "")
         plex_token = self.settings.get("plex_token", "")
         if not plex_url or not plex_token:
-            return 0
-
+            raise ValueError("Plex URL and token are required for episode removal")
         by_section = {}
         for eid, entry in plex_match_info.items():
             category = self._resolve_series_category(entry.get("category_id"))
             section = category["plex_library_section"] if category else None
             if section in (None, "", self.PLEX_SECTION_UNSET):
-                continue
-            by_section.setdefault(section, []).append(entry)
+                raise ValueError(f"Episode {eid}: Plex library section is not configured")
+            by_section.setdefault(section, []).append((eid, entry))
 
         removed = 0
         for section, entries in by_section.items():
-            try:
-                # v2.4.1 fix: this must be type=4 (Episode), not type=2 (Show).
-                # Querying with type=2 returned Show-level objects lacking
-                # grandparentTitle/parentIndex/index, so `key` below never
-                # matched `wanted` and every episode delete silently no-opped
-                # -- both on manual deactivation and the background reconcile
-                # sweep. Net effect: episodes removed from Dispatcharr/disk
-                # stayed live in Plex indefinitely, and rclone's
-                # vod-series mount kept retrying to warm-cache files Plex
-                # still referenced but that no longer existed locally
-                # (observed as a sustained HTTP 503 storm on
-                # rclone-vod-series.service, ~1,800 error lines/48h).
-                resp = requests.get(
-                    f"{plex_url}/library/sections/{section}/all",
-                    params={"X-Plex-Token": plex_token, "type": "4"},
-                    headers={"Accept": "application/json"},
-                    timeout=15,
+            resp = requests.get(
+                f"{plex_url}/library/sections/{section}/all",
+                params={"X-Plex-Token": plex_token, "type": "4"},
+                headers={"Accept": "application/json"}, timeout=15,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Plex episode query for section {section} returned HTTP {resp.status_code}")
+            payload = resp.json()
+            container = payload.get("MediaContainer")
+            if not isinstance(container, dict):
+                raise ValueError("Plex episode query returned an invalid MediaContainer")
+            items = container.get("Metadata", [])
+            if not isinstance(items, list):
+                raise ValueError("Plex episode query returned invalid Metadata")
+            to_delete = {}
+            for eid, entry in entries:
+                item = self._match_plex_episode_for_removal(eid, entry, items)
+                if item is not None:
+                    to_delete[str(item["ratingKey"])] = item.get("title", "?")
+            if not to_delete:
+                continue
+            section_removed = self._plex_delete_batch(
+                plex_url, plex_token, list(to_delete.items()), "episode",
+            )
+            removed += section_removed
+            if section_removed != len(to_delete):
+                raise RuntimeError(
+                    f"Plex removed {section_removed}/{len(to_delete)} matched episode(s) in section {section}"
                 )
-                if resp.status_code != 200:
-                    logger.warning(f"Plex library query failed for section {section}: {resp.status_code}")
-                    continue
-
-                items = resp.json().get("MediaContainer", {}).get("Metadata", [])
-                # series_name is frozen at activation time -- if _clean_title()'s
-                # rules changed since then (e.g. PR #2's category-prefix strip),
-                # a pre-change stored name no longer matches grandparentTitle
-                # below (which is always cleaned with TODAY's rules), so the
-                # Plex delete silently matches 0 items. Re-clean here so both
-                # sides always use the same, current logic.
-                wanted = {
-                    (self._clean_title(e.get("series_name", "")), str(e.get("season_number", "")), str(e.get("episode_number", "")))
-                    for e in entries
-                }
-                logger.info(f"Plex episode delete: wanted={wanted}")
-                logger.info(
-                    "Plex episode delete: available="
-                    + str([(it.get("grandparentTitle", ""), it.get("parentIndex"), it.get("index")) for it in items])
-                )
-
-                to_delete = []
-                for item in items:
-                    # series_name in `wanted` is filesystem-sanitized (STRM
-                    # folder naming strips ':' etc.), so sanitize Plex's raw
-                    # grandparentTitle the same way -- same fix as
-                    # _fetch_plex_episode_sizes's colon-title matching bug.
-                    key = (
-                        self._clean_title(item.get("grandparentTitle", "")),
-                        str(item.get("parentIndex", "")),
-                        str(item.get("index", "")),
-                    )
-                    if key in wanted:
-                        to_delete.append((item.get("ratingKey"), item.get("title", "?")))
-
-                # v2.4.2: parallelized -- was one sequential requests.delete()
-                # per episode (each up to timeout=10s), so deactivating a
-                # 30-60 episode series took 5-10 minutes. A small thread pool
-                # cuts that to roughly the slowest single call.
-                section_removed = self._plex_delete_batch(plex_url, plex_token, to_delete, "episode")
-                removed += section_removed
-
-                # v2.4.1: added diagnostic -- a total match failure here (the
-                # exact symptom of the type=2/type=4 bug above) previously
-                # logged nothing, so it went unnoticed until Plex accumulated
-                # months of orphaned episodes. Now surfaced as a WARNING with
-                # enough context (wanted keys vs. what Plex actually returned)
-                # to diagnose a recurrence without re-adding print debugging.
-                if section_removed == 0 and wanted:
-                    logger.warning(
-                        f"Plex episode delete: 0/{len(wanted)} matched in section {section} -- "
-                        f"wanted={wanted} not found among {len(items)} Plex item(s); "
-                        "these episodes were NOT removed from Plex"
-                    )
-            except Exception as e:
-                logger.error(f"Plex episode removal failed for section {section}: {e}")
-
         logger.info(f"Plex cleanup: removed {removed} episode(s)")
         return removed
 
     def _remove_strm_for_episodes(self, removal_info):
-        import shutil as _shutil
+        """Return success for completed/already-absent cleanup; propagate errors.
+
+        Nonempty parent directories belong to other episodes and are retained.
+        Permission and I/O errors must reach the shared removal status handler.
+        """
+        import errno
+
+        def prune_empty(path):
+            try:
+                os.rmdir(path)
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError as exc:
+                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    return False
+                raise
 
         for eid, (category_id, folder_rel, file_stem) in removal_info.items():
             category = self._resolve_series_category(category_id)
-            if not category or not folder_rel:
-                logger.warning(f"Episode STRM removal skipped for {eid}: no known folder/category")
-                continue
+            if not category or not folder_rel or not file_stem:
+                raise ValueError(f"Episode {eid}: missing cleanup folder, category, or filename")
+            series_root = self._series_category_path("")
+            category_base = os.path.realpath(self._series_category_path(category["strm_folder"]))
+            folder = os.path.realpath(os.path.join(series_root, folder_rel))
+            if os.path.commonpath([category_base, folder]) != category_base or folder == category_base:
+                raise ValueError(f"Episode {eid}: cleanup folder is outside the category")
+            nfo_path = os.path.join(folder, f"{file_stem}.nfo")
+            if os.path.dirname(os.path.abspath(nfo_path)) != folder:
+                raise ValueError(f"Episode {eid}: invalid cleanup filename")
             try:
-                series_root = self._series_category_path("")
-                category_base = self._series_category_path(category["strm_folder"])
-                folder = os.path.join(series_root, folder_rel)
-                if file_stem:
-                    nfo_path = os.path.join(folder, f"{file_stem}.nfo")
-                    if os.path.exists(nfo_path):
-                        os.remove(nfo_path)
-                    # Clean up the season/series folders if now empty, but
-                    # never delete the shared category base_dir itself.
-                    try:
-                        season_dir = folder
-                        os.rmdir(season_dir)
-                        series_dir = os.path.dirname(season_dir)
-                        if os.path.abspath(series_dir) != os.path.abspath(category_base):
-                            tvshow_nfo = os.path.join(series_dir, "tvshow.nfo")
-                            if os.path.exists(tvshow_nfo):
-                                os.remove(tvshow_nfo)
-                            os.rmdir(series_dir)
-                    except OSError:
-                        pass  # not empty -- other episodes still activated
-                logger.info(f"Episode STRM removed: {file_stem}")
-            except Exception as e:
-                logger.error(f"Episode STRM removal error for {eid}: {e}")
+                os.remove(nfo_path)
+            except FileNotFoundError:
+                pass
+            if prune_empty(folder):
+                series_dir = os.path.dirname(folder)
+                if series_dir != category_base and os.path.isdir(series_dir):
+                    # Keep show metadata while another season or file remains.
+                    remaining = os.listdir(series_dir)
+                    if remaining == ["tvshow.nfo"]:
+                        os.remove(os.path.join(series_dir, "tvshow.nfo"))
+                    prune_empty(series_dir)
+            logger.info(f"Episode STRM removed: {file_stem}")
+        return True
 
     def get_episode_info(self, episode_id):
         """Mirrors get_movie_info() -- Plex's analyzer HEAD-probes this URL
@@ -5319,9 +5331,19 @@ class BridgeCore:
                         plex_fn = lambda: self._plex_delete_episodes(
                             {entry["ref_id"]: ctx.get("plex_match_entry", {})}
                         )
+                    folder_fn = None
+                    if removal_kind == "episode":
+                        saved = ctx.get("plex_match_entry", {})
+                        removal_info = {entry["ref_id"]: (
+                            saved.get("category_id"), saved.get("strm_folder"),
+                            saved.get("strm_stem"),
+                        )}
+                        folder_fn = lambda: self._remove_strm_for_episodes(removal_info)
                     retry_result = self._remove_title_fully(
                         removal_kind, entry["ref_id"], entry["name"], plex_fn,
                         folder_path=ctx.get("folder_path"),
+                        folder_delete_fn=folder_fn,
+                        retry_context=ctx,
                     )
                     ok = retry_result["ok"]
                     result = {"status": "ok" if ok else "error", "message": "Removal retry failed"}
