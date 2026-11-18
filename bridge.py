@@ -3578,12 +3578,59 @@ class BridgeCore:
             return int(duration) * 250000
         return 2 * 1024 * 1024 * 1024
 
+    def _match_plex_episode_part(self, episode_id, entry, items):
+        """Return one unambiguous (Part, updatedAt), preferring file identity.
+
+        Mount roots are user-configurable. Match the saved relative category /
+        show / season directory as a suffix, not a hardcoded absolute path.
+        Legacy filenames without IDs may fall back to title/season/episode.
+        Multi-part media cannot supply a whole-episode size from one Part.
+        """
+        folder = (entry.get("strm_folder") or "").replace("\\", "/").strip("/")
+        expected_key = (
+            self._clean_title(entry.get("series_name", "")),
+            entry.get("season_number"), entry.get("episode_number"),
+        )
+        identified = []
+        legacy = []
+        for item in items:
+            key = (
+                self._clean_title(item.get("grandparentTitle", "")),
+                item.get("parentIndex"), item.get("index"),
+            )
+            for media in item.get("Media") or []:
+                parts = media.get("Part") or []
+                for part in parts:
+                    path = (part.get("file") or "").replace("\\", "/")
+                    parent, _, filename = path.rpartition("/")
+                    match = re.search(r"\[(\d+)\]\.mkv$", filename)
+                    same_folder = bool(folder) and (
+                        parent == folder or parent.endswith("/" + folder)
+                    )
+                    candidate = (part, item.get("updatedAt"), len(parts))
+                    if match:
+                        # An explicit different ID must never fall back to titles.
+                        if match.group(1) == str(episode_id) and same_folder:
+                            identified.append(candidate)
+                    elif key == expected_key and (not folder or same_folder):
+                        legacy.append(candidate)
+        candidates = identified if identified else legacy
+        if len(candidates) != 1 or candidates[0][2] != 1:
+            return None
+        part, updated_at, _ = candidates[0]
+        try:
+            size = int(part.get("size") or 0)
+        except (ValueError, TypeError):
+            return None
+        if size <= 0:
+            return None
+        return part, updated_at
+
     def _fetch_plex_episode_sizes(self, episode_ids=None):
-        """Mirrors _fetch_plex_movie_sizes() for episodes. Episode STRM
-        filenames don't embed the episode id, so matching is by series name +
-        season/episode number (grandparentTitle/parentIndex/index) against
-        Plex's own episode metadata, grouped per plex_library_section since
-        each Series Settings category can point at a different Plex library.
+        """Fetch episode sizes by embedded file ID and saved relative folder.
+        Legacy filenames without IDs fall back to title/season/episode.
+        Queries are grouped per plex_library_section since each Series Settings
+        category can point at a different Plex library.
 
         episode_ids=None fetches sizes for every matched episode across all
         known categories (maintenance sweep); pass a list to limit the match
@@ -3634,30 +3681,16 @@ class BridgeCore:
                     continue
 
                 items = resp.json().get("MediaContainer", {}).get("Metadata", [])
-                by_key = {}
-                for it in items:
-                    # entry["series_name"] is filesystem-sanitized (STRM
-                    # folder naming strips characters like ':' that Plex's
-                    # raw grandparentTitle keeps -- e.g. "Alert: Missing
-                    # Persons Unit" vs "Alert Missing Persons Unit"), so
-                    # sanitize Plex's title the same way here to keep the
-                    # match symmetric, rather than ever matching raw.
-                    key = (self._clean_title(it.get("grandparentTitle", "")), it.get("parentIndex"), it.get("index"))
-                    by_key[key] = it
-
                 found_count = 0
                 for eid, entry in pairs:
-                    key = (entry.get("series_name", ""), entry.get("season_number"), entry.get("episode_number"))
-                    item = by_key.get(key)
-                    if not item:
+                    match = self._match_plex_episode_part(eid, entry, items)
+                    if match is None:
                         continue
-                    parts = item.get("Media", [{}])[0].get("Part", [])
-                    if parts and parts[0].get("size"):
-                        size = int(parts[0]["size"])
-                        updated_at = item.get("updatedAt")
-                        sizes[eid] = (size, updated_at)
-                        found_count += 1
-                        self._log_diagnostic("debug", f"_fetch_plex_episode_sizes: Episode {eid} size confirmed {size} bytes (updatedAt={updated_at})")
+                    part, updated_at = match
+                    size = int(part["size"])
+                    sizes[eid] = (size, updated_at)
+                    found_count += 1
+                    self._log_diagnostic("debug", f"_fetch_plex_episode_sizes: Episode {eid} size confirmed {size} bytes (updatedAt={updated_at})")
 
                 self._log_diagnostic("info", f"_fetch_plex_episode_sizes: Section {section} complete: {found_count}/{len(pairs)} episodes size confirmed")
             except Exception as e:
